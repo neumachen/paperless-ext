@@ -1,0 +1,31 @@
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+.tmp/
+tmp/
+
+# Rust
+/target/
+**/target/
+
+# Go
+/bin/
+**/bin/
+coverage.out
+
+# JavaScript and TypeScript
+node_modules/
+**/node_modules/
+dist/
+**/dist/
