@@ -67,7 +67,7 @@ type Metrics struct {
 }
 
 // New builds the registry for one process.
-func New(app, instance string) *Metrics {
+func New(app, instance, policyIdentity string) *Metrics {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -213,7 +213,7 @@ func New(app, instance string) *Metrics {
 
 	m.BuildInfo.WithLabelValues(
 		app, buildinfo.Version, buildinfo.Revision, buildinfo.GoVersion(),
-		buildinfo.PolicyVersion, contractVersionLabel(), buildinfo.SourceDigest,
+		policyIdentity, contractVersionLabel(), buildinfo.SourceDigest,
 	).Set(1)
 
 	m.preinitialise()

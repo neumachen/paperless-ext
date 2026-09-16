@@ -25,7 +25,7 @@ func gather(t *testing.T, m *Metrics) map[string]*dto.MetricFamily {
 }
 
 func TestEveryLabelValueIsASafeIdentifier(t *testing.T) {
-	m := New("watcher", "watcher-1")
+	m := New("watcher", "watcher-1", "v1-candidate-test")
 
 	// Exercise the paths the applications actually take, so the assertion
 	// covers the labels that really get written.
@@ -55,7 +55,7 @@ func TestEveryLabelValueIsASafeIdentifier(t *testing.T) {
 }
 
 func TestNoMetricCarriesADocumentIdentifyingLabel(t *testing.T) {
-	m := New("renamer", "renamer-1")
+	m := New("renamer", "renamer-1", "v1-candidate-test")
 	forbidden := map[string]bool{
 		"job_id": true, "job": true, "filename": true, "file": true,
 		"name": true, "path": true, "source_name": true, "fingerprint": true,
@@ -77,7 +77,7 @@ func TestNoMetricCarriesADocumentIdentifyingLabel(t *testing.T) {
 }
 
 func TestClosedLabelSpaceIsPreInitialised(t *testing.T) {
-	m := New("watcher", "watcher-1")
+	m := New("watcher", "watcher-1", "v1-candidate-test")
 	families := gather(t, m)
 
 	// A scraper must be able to tell "nothing happened yet" from "this series
@@ -120,8 +120,12 @@ func TestDeliveryOutcomesNeverClaimDelivery(t *testing.T) {
 	}
 }
 
-func TestBuildInfoReportsAnUnimplementedPolicy(t *testing.T) {
-	m := New("watcher", "watcher-1")
+// TestBuildInfoReportsTheRuntimePolicyIdentity: the label used to be the
+// build constant "unimplemented". A policy exists now, and two processes built
+// from the same source can still run different configured policies, so the
+// label carries the runtime identity the process was given.
+func TestBuildInfoReportsTheRuntimePolicyIdentity(t *testing.T) {
+	m := New("watcher", "watcher-1", "v1-candidate-test")
 	families := gather(t, m)
 	f := families["fn_build_info"]
 	if f == nil {
@@ -134,8 +138,11 @@ func TestBuildInfoReportsAnUnimplementedPolicy(t *testing.T) {
 	for _, pair := range f.GetMetric()[0].GetLabel() {
 		labels[pair.GetName()] = pair.GetValue()
 	}
-	if labels["policy_version"] != "unimplemented" {
-		t.Errorf("policy_version = %q; no naming policy is implemented in this build", labels["policy_version"])
+	if labels["policy_version"] != "v1-candidate-test" {
+		t.Errorf("policy_version = %q, want the identity the process was given", labels["policy_version"])
+	}
+	if labels["policy_version"] == "unimplemented" {
+		t.Error("the build still reports an unimplemented naming policy")
 	}
 	if labels["contract_version"] != "1" {
 		t.Errorf("contract_version = %q", labels["contract_version"])
@@ -148,8 +155,8 @@ func TestBuildInfoReportsAnUnimplementedPolicy(t *testing.T) {
 func TestRegistryHasNoDuplicateRegistrations(t *testing.T) {
 	// Registering the same collector twice would panic at startup; building
 	// two registries proves the constructor is self-contained.
-	_ = New("watcher", "a")
-	_ = New("renamer", "b")
+	_ = New("watcher", "a", "v1-candidate-test")
+	_ = New("renamer", "b", "v1-candidate-test")
 
 	reg := prometheus.NewRegistry()
 	if err := reg.Register(prometheus.NewGauge(prometheus.GaugeOpts{Name: "probe"})); err != nil {

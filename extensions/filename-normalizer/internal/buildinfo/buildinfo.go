@@ -26,13 +26,25 @@ var (
 	SourceDigest = "unknown"
 )
 
-// PolicyVersion identifies the naming policy the binaries implement.
+// PolicyVersion is intentionally absent from this package.
 //
-// The normalization policy itself is not implemented in this increment, so the
-// value is deliberately "unimplemented" rather than "v1". It must only move to
-// a real policy identifier once the transformation is implemented and the
-// owner has accepted the visible naming behaviour.
-const PolicyVersion = "unimplemented"
+// It used to live here as the constant "unimplemented", because no naming
+// policy existed. A policy exists now, so there are two different questions
+// and they deserve two different answers:
+//
+//   - Which policy CODE does this build contain? naming.PolicyVersion.
+//   - Which policy is this PROCESS running, including its configured rules
+//     and bounds? config.Policy.Identity, which is naming.PolicyVersion plus
+//     a fingerprint of every name-affecting setting.
+//
+// Only the second one belongs on a job row, because two processes built from
+// the same source can still be configured to produce different names. Keeping
+// a build-level constant here would have made it too easy to stamp the wrong
+// one.
+//
+// The implemented policy is a documented CANDIDATE for local synthetic
+// testing. Implementation is not owner acceptance; see
+// docs/filename-normalizer-requirements.md.
 
 // GoVersion reports the toolchain the binary was compiled with.
 func GoVersion() string { return runtime.Version() }

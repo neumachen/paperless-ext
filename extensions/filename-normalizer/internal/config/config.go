@@ -36,6 +36,10 @@ type Common struct {
 	Database        Database
 	Broker          Broker
 	Storage         Storage
+	// Policy is the compiled naming policy and its identity.
+	Policy Policy
+	// ConfigFile is the configuration file this process read, or "".
+	ConfigFile string
 }
 
 // Database describes the PostgreSQL cluster endpoints.
@@ -129,14 +133,15 @@ type Role struct {
 // WatcherConfig is the watcher application's configuration.
 type WatcherConfig struct {
 	Common
-	// DiscoveryEnabled must be false in this increment. Discovery of completed
-	// submissions is not implemented, and enabling the flag is a hard startup
-	// error rather than a silently inert setting.
-	DiscoveryEnabled    bool
+	// Discovery is the compiled discovery and completion configuration.
+	Discovery           Discovery
 	DispatchInterval    time.Duration
 	DispatchBatch       int
 	DispatchClaimMaxAge time.Duration
 	AccountingInterval  time.Duration
+	// ReconcileOnStart re-examines the incoming root at startup so work that
+	// arrived while the watcher was down is picked up.
+	ReconcileOnStart bool
 }
 
 // RenamerConfig is the renamer application's configuration.
@@ -147,6 +152,10 @@ type RenamerConfig struct {
 	// Prefetch is the AMQP QoS window; it defaults to Concurrency so an
 	// instance never buffers work it has no capacity to process.
 	Prefetch int
+	// MaxDeliveryAttempts bounds redelivery before a job is held.
+	MaxDeliveryAttempts int
+	// DryRun computes and records outcomes without touching the filesystem.
+	DryRun bool
 }
 
 // ValidationError collects every configuration problem at once so an operator
@@ -159,6 +168,10 @@ func (e *ValidationError) Error() string {
 
 type loader struct {
 	problems []string
+	// fileDefaults holds values supplied by the configuration file. They sit
+	// beneath the environment: lookup consults them only when neither VAR nor
+	// VAR_FILE is set. See file.go for the full precedence contract.
+	fileDefaults map[string]string
 }
 
 func (l *loader) fail(format string, args ...any) {
@@ -175,8 +188,13 @@ func (l *loader) lookup(key string) (string, bool) {
 		}
 		return strings.TrimRight(string(data), "\r\n"), true
 	}
-	v, ok := os.LookupEnv(key)
-	return v, ok
+	if v, ok := os.LookupEnv(key); ok {
+		return v, true
+	}
+	if v, ok := l.fileDefaults[key]; ok {
+		return v, true
+	}
+	return "", false
 }
 
 func (l *loader) str(key, def string) string {
@@ -336,39 +354,105 @@ var levelNames = map[string]struct{}{
 	"debug": {}, "info": {}, "warn": {}, "warning": {}, "error": {},
 }
 
-// LoadWatcher reads the watcher configuration from the environment.
-func LoadWatcher() (WatcherConfig, error) {
-	l := &loader{}
-	cfg := WatcherConfig{Common: l.common(AppWatcher)}
-	cfg.DiscoveryEnabled = l.boolVal("FN_WATCHER_DISCOVERY_ENABLED", false)
-	if cfg.DiscoveryEnabled {
-		l.fail("FN_WATCHER_DISCOVERY_ENABLED is not supported in this build: incoming discovery is not implemented")
+// newLoader reads the configuration file, if one is named, and returns a
+// loader primed with its values as the layer beneath the environment.
+func newLoader() (*loader, FileConfig, string) {
+	l := &loader{fileDefaults: map[string]string{}}
+	path, ok := ConfigFilePath()
+	if !ok {
+		return l, FileConfig{Version: FileConfigVersion}, ""
 	}
+	fc, err := LoadFileConfig(path)
+	if err != nil {
+		// A named-but-unusable configuration file is a hard failure. Falling
+		// back to defaults would run the deployment under a policy nobody
+		// declared, which is exactly the silent reinterpretation the contract
+		// forbids.
+		l.fail("%v", err)
+		return l, FileConfig{Version: FileConfigVersion}, path
+	}
+	applyStorageFile(fc.Storage, l.fileDefaults)
+	return l, fc, path
+}
+
+// LoadWatcher reads the watcher configuration.
+func LoadWatcher() (WatcherConfig, error) {
+	l, fc, path := newLoader()
+	cfg := WatcherConfig{Common: l.common(AppWatcher)}
+	cfg.ConfigFile = path
+	cfg.Policy = compilePolicy(l, fc.Normalization)
+	cfg.Discovery = compileDiscovery(l, fc.Discovery)
+	validateStorageRoots(l, cfg.Storage)
+
 	cfg.DispatchInterval = l.duration("FN_WATCHER_DISPATCH_INTERVAL", time.Second, 50*time.Millisecond, 5*time.Minute)
 	cfg.DispatchBatch = l.intVal("FN_WATCHER_DISPATCH_BATCH", 32, 1, 1000)
 	cfg.DispatchClaimMaxAge = l.duration("FN_WATCHER_DISPATCH_CLAIM_MAX_AGE", 60*time.Second, 5*time.Second, time.Hour)
 	cfg.AccountingInterval = l.duration("FN_WATCHER_ACCOUNTING_INTERVAL", 5*time.Second, time.Second, 5*time.Minute)
+	cfg.ReconcileOnStart = l.boolVal("FN_WATCHER_RECONCILE_ON_START", true)
+
 	if len(l.problems) > 0 {
 		sort.Strings(l.problems)
-		return WatcherConfig{}, &ValidationError{Problems: l.problems}
+		return WatcherConfig{}, &ValidationError{Problems: dedupe(l.problems)}
 	}
 	return cfg, nil
 }
 
-// LoadRenamer reads the renamer configuration from the environment.
+// LoadRenamer reads the renamer configuration.
 func LoadRenamer() (RenamerConfig, error) {
-	l := &loader{}
+	l, fc, path := newLoader()
 	cfg := RenamerConfig{Common: l.common(AppRenamer)}
-	cfg.Concurrency = l.intVal("FN_RENAMER_CONCURRENCY", 1, 1, 64)
-	cfg.Prefetch = l.intVal("FN_RENAMER_PREFETCH", cfg.Concurrency, 1, 1000)
-	if cfg.Prefetch < cfg.Concurrency {
-		l.fail("FN_RENAMER_PREFETCH must be at least FN_RENAMER_CONCURRENCY")
+	cfg.ConfigFile = path
+	cfg.Policy = compilePolicy(l, fc.Normalization)
+	validateStorageRoots(l, cfg.Storage)
+
+	concurrency, prefetch, attempts, dryRun := 1, 0, 5, false
+	if fc.Processing != nil {
+		if fc.Processing.Concurrency != 0 {
+			concurrency = fc.Processing.Concurrency
+		}
+		if fc.Processing.Prefetch != 0 {
+			prefetch = fc.Processing.Prefetch
+		}
+		if fc.Processing.MaxDeliveryAttempts != 0 {
+			attempts = fc.Processing.MaxDeliveryAttempts
+		}
+		if fc.Processing.DryRun != nil {
+			dryRun = *fc.Processing.DryRun
+		}
 	}
+	cfg.Concurrency = l.intVal("FN_RENAMER_CONCURRENCY", concurrency, 1, 64)
+	if prefetch == 0 {
+		prefetch = cfg.Concurrency
+	}
+	cfg.Prefetch = l.intVal("FN_RENAMER_PREFETCH", prefetch, 1, 1000)
+	if cfg.Prefetch < cfg.Concurrency {
+		l.fail("FN_RENAMER_PREFETCH (%d) must be at least FN_RENAMER_CONCURRENCY (%d); "+
+			"they may also come from processing.prefetch and processing.concurrency",
+			cfg.Prefetch, cfg.Concurrency)
+	}
+	cfg.MaxDeliveryAttempts = l.intVal("FN_RENAMER_MAX_DELIVERY_ATTEMPTS", attempts, 1, 100)
+	cfg.DryRun = l.boolVal("FN_RENAMER_DRY_RUN", dryRun)
+
 	if len(l.problems) > 0 {
 		sort.Strings(l.problems)
-		return RenamerConfig{}, &ValidationError{Problems: l.problems}
+		return RenamerConfig{}, &ValidationError{Problems: dedupe(l.problems)}
 	}
 	return cfg, nil
+}
+
+// dedupe removes repeated problems, which the two policy compilations can
+// otherwise produce for the same underlying mistake.
+func dedupe(in []string) []string {
+	out := in[:0]
+	var prev string
+	for i, s := range in {
+		if i > 0 && s == prev {
+			continue
+		}
+		out = append(out, s)
+		prev = s
+	}
+	return out
 }
 
 // DSN renders the primary connection string, with every value quoted.
