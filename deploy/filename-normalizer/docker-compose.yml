@@ -280,6 +280,33 @@ services:
       start_period: 10s
 
   # -------------------------------------------------------------------------
+  # The gRPC inspection client. Run on demand:
+  #
+  #   docker compose --profile tools run --rm fnctl status
+  #   docker compose --profile tools run --rm fnctl preview "Bank Statement.PDF"
+  #
+  # It joins the application network so it can reach the API, and holds no
+  # credentials and no document mounts: everything it can do is read-only.
+  # -------------------------------------------------------------------------
+  fnctl:
+    profiles: [tools]
+    build:
+      context: ../../extensions/filename-normalizer
+      dockerfile: Dockerfile
+      target: fnctl
+      args: *app-build-args
+    image: ${FN_IMAGE_PREFIX:-filename-normalizer}/fnctl:${FN_VERSION:-0.1.0-foundation}
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      FN_GRPC_TARGET: ${FN_GRPC_TARGET:-watcher:9090}
+    volumes:
+      - ./config:/etc/fn:ro
+    networks: [fn]
+
+  # -------------------------------------------------------------------------
   # Two independent renamer containers, declared as separate services rather
   # than replicas so each has a stable identity and its own readiness
   # endpoint. Starting two establishes deployment capability; it does not by

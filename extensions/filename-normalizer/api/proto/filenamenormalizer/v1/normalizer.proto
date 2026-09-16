@@ -1,0 +1,241 @@
+syntax = "proto3";
+
+// Package filenamenormalizer.v1 is the File Normalizer inspection API.
+//
+// # What this API is for
+//
+// Inspection, validation and preview. It is deliberately read-only with
+// respect to the operational ledger and the filesystem.
+//
+// RabbitMQ remains the only way work is distributed, and the ledger remains
+// the only record of it. No RPC here enqueues a job, claims a file, reserves a
+// destination, or writes a ledger row, so there is no second processing path
+// that could bypass the durability and recovery guarantees the queue-based one
+// provides. A preview tells you what a name WOULD become; it is not a
+// reservation, and the name it reports can still be taken by a real submission
+// a moment later.
+//
+// # Privacy
+//
+// Document identities -- names, paths, fingerprints -- are restricted. The
+// default job view carries none of them: it reports an opaque job id, a state,
+// a category, counters and timestamps. A caller that genuinely needs the names
+// must ask for them explicitly with include_restricted_detail, and the server
+// records that disclosure in its own log. PreviewName is different in kind:
+// the caller supplies the name, so the response reveals nothing the caller did
+// not already have.
+//
+// # Access boundary
+//
+// The server binds to the application network only and is not published to the
+// host by default. There is no authentication here, which is exactly why it
+// must not be exposed: anyone who can reach the port can read restricted job
+// detail. See deploy/filename-normalizer/README.md.
+package filenamenormalizer.v1;
+
+option go_package = "github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/grpcapi/gen/filenamenormalizerv1";
+
+service Normalizer {
+  // GetStatus reports liveness, readiness and application identity.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // GetProcessingState reports aggregate counts. It contains no document
+  // identities and is safe for ordinary monitoring.
+  rpc GetProcessingState(GetProcessingStateRequest) returns (GetProcessingStateResponse);
+
+  // GetEffectiveConfig reports the non-secret configuration and the policy
+  // identity this process is running.
+  rpc GetEffectiveConfig(GetEffectiveConfigRequest) returns (GetEffectiveConfigResponse);
+
+  // InspectJob returns one job by its opaque id. Sanitized by default.
+  rpc InspectJob(InspectJobRequest) returns (InspectJobResponse);
+
+  // ValidateConfig checks a configuration document without applying it.
+  // Nothing is activated: applying a configuration requires a restart.
+  rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
+
+  // PreviewName applies the naming policy to a supplied filename. It claims
+  // nothing, reserves nothing and enqueues nothing.
+  rpc PreviewName(PreviewNameRequest) returns (PreviewNameResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  string application = 1;
+  string instance = 2;
+  string version = 3;
+  string revision = 4;
+  string build_date = 5;
+  string go_version = 6;
+  string source_digest = 7;
+  // policy_identity is the naming policy this process is running.
+  string policy_identity = 8;
+  // policy_status says plainly that the policy is a candidate rather than an
+  // owner-accepted production policy.
+  string policy_status = 9;
+  int32 contract_version = 10;
+
+  bool alive = 11;
+  bool ready = 12;
+  bool draining = 13;
+  repeated DependencyState dependencies = 14;
+}
+
+message DependencyState {
+  string name = 1;
+  bool required = 2;
+  bool ok = 3;
+  // category is a closed-set reason code, never free text from a dependency.
+  string category = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate processing state
+// ---------------------------------------------------------------------------
+
+message GetProcessingStateRequest {}
+
+message GetProcessingStateResponse {
+  // jobs_by_state is keyed by the closed set of job states.
+  map<string, int64> jobs_by_state = 1;
+  // holds_by_category is keyed by the closed set of hold categories.
+  map<string, int64> holds_by_category = 2;
+  int64 delivered_total = 3;
+  int64 reservations_total = 4;
+  // oldest_pending_age_seconds is 0 when nothing is pending.
+  double oldest_pending_age_seconds = 5;
+  // discovery_last_run_unix is 0 when discovery has not completed a scan.
+  // A watcher that is up with a stale value here is not merely idle.
+  int64 discovery_last_run_unix = 6;
+  bool discovery_enabled = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Effective configuration
+// ---------------------------------------------------------------------------
+
+message GetEffectiveConfigRequest {}
+
+message GetEffectiveConfigResponse {
+  // effective_json is the same document `check-config` prints, from the same
+  // code path, so the two can never disagree. It carries no credentials.
+  string effective_json = 1;
+  string config_file = 2;
+  string policy_identity = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Job inspection
+// ---------------------------------------------------------------------------
+
+message InspectJobRequest {
+  // job_id is the opaque identifier. It is the only job handle this API takes:
+  // there is deliberately no lookup by filename.
+  string job_id = 1;
+  // include_restricted_detail adds the original and normalized names. The
+  // server logs the disclosure. Default output has no document identities.
+  bool include_restricted_detail = 2;
+  bool include_events = 3;
+}
+
+message InspectJobResponse {
+  string job_id = 1;
+  string state = 2;
+  string category = 3;
+  string policy_identity = 4;
+  int32 dispatch_attempts = 5;
+  int32 delivery_attempts = 6;
+  int64 size_bytes = 7;
+  string created_at = 8;
+  string updated_at = 9;
+  string terminal_at = 10;
+  bool has_receipt = 11;
+
+  // Present only when include_restricted_detail was set.
+  RestrictedJobDetail restricted = 12;
+  repeated JobEvent events = 13;
+}
+
+// RestrictedJobDetail holds the document identities.
+message RestrictedJobDetail {
+  string source_root = 1;
+  string source_name = 2;
+  string normalized_name = 3;
+  string reserved_name = 4;
+  string delivered_name = 5;
+  string content_fingerprint_hex = 6;
+}
+
+message JobEvent {
+  string occurred_at = 1;
+  string event_type = 2;
+  string from_state = 3;
+  string to_state = 4;
+  string category = 5;
+  string actor = 6;
+  int32 attempt = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration validation
+// ---------------------------------------------------------------------------
+
+message ValidateConfigRequest {
+  // config_json is a candidate configuration document. It is parsed and
+  // checked; it is never written anywhere and never becomes active.
+  string config_json = 1;
+}
+
+message ValidateConfigResponse {
+  bool valid = 1;
+  // problems lists every problem at once, not just the first.
+  repeated string problems = 2;
+  // policy_identity is what the candidate WOULD produce, so an operator can
+  // see in advance whether a change strands queued work.
+  string policy_identity = 3;
+  // differs_from_running is true when applying this document would change the
+  // policy identity, and therefore require attention for in-flight jobs.
+  bool differs_from_running = 4;
+  // activation explains how to apply it. Hot reload is not supported.
+  string activation = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Name preview
+// ---------------------------------------------------------------------------
+
+message PreviewNameRequest {
+  // filenames are the names to preview. They are caller-supplied, so echoing
+  // them back discloses nothing new.
+  repeated string filenames = 1;
+  // config_json optionally previews against a candidate policy instead of the
+  // running one, so a rule change can be checked before a restart.
+  string config_json = 2;
+}
+
+message PreviewNameResponse {
+  repeated PreviewResult results = 1;
+  string policy_identity = 2;
+  // disclaimer states that a preview is not a destination reservation.
+  string disclaimer = 3;
+}
+
+message PreviewResult {
+  string original = 1;
+  // normalized is empty when the policy refuses the name.
+  string normalized = 2;
+  bool accepted = 3;
+  // category is the closed-set hold reason when accepted is false.
+  string category = 4;
+  bool used_fallback = 5;
+  bool shortened = 6;
+  repeated string rules_applied = 7;
+  // collision_candidates shows the first few names the allocator would try.
+  // They are possibilities, not reservations.
+  repeated string collision_candidates = 8;
+}

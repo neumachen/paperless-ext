@@ -535,3 +535,104 @@ func within(child, parent string) bool {
 	}
 	return rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".."
 }
+
+// ValidateDocument checks a candidate configuration document.
+//
+// It is used by the gRPC validation RPC and it deliberately does not touch the
+// environment, the filesystem or any running state: the document is parsed and
+// compiled in isolation, and the policy identity it would produce is returned
+// so an operator can see in advance whether applying it would strand queued
+// work. Nothing is activated; activation is a restart.
+func ValidateDocument(body []byte) (policyIdentity string, problems []string) {
+	fc, err := parseDocument(body)
+	if err != nil {
+		return "", []string{err.Error()}
+	}
+	l := &loader{fileDefaults: map[string]string{}}
+	policy := compilePolicy(l, fc.Normalization)
+	// Discovery is compiled too, so a bad selection pattern is reported by
+	// validation rather than at the next restart. The environment overrides it
+	// consults are the validating process's own, which is the honest answer to
+	// "would this document work here?".
+	compileDiscovery(l, fc.Discovery)
+	validateDocumentShape(l, fc)
+
+	if len(l.problems) > 0 {
+		sort.Strings(l.problems)
+		return policy.Identity, dedupe(l.problems)
+	}
+	return policy.Identity, nil
+}
+
+// PolicyFromDocument compiles just the naming policy from a document, for a
+// preview against a candidate configuration.
+func PolicyFromDocument(body []byte) (Policy, []string) {
+	fc, err := parseDocument(body)
+	if err != nil {
+		return Policy{}, []string{err.Error()}
+	}
+	l := &loader{fileDefaults: map[string]string{}}
+	policy := compilePolicy(l, fc.Normalization)
+	if len(l.problems) > 0 {
+		sort.Strings(l.problems)
+		return Policy{}, dedupe(l.problems)
+	}
+	return policy, nil
+}
+
+// parseDocument applies the same strict parse LoadFileConfig uses.
+func parseDocument(body []byte) (FileConfig, error) {
+	var fc FileConfig
+	if len(body) > maxConfigBytes {
+		return fc, fmt.Errorf("configuration document is larger than %d bytes", maxConfigBytes)
+	}
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&fc); err != nil {
+		return fc, fmt.Errorf("configuration document: %w", err)
+	}
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		return fc, errors.New("configuration document: unexpected trailing content after the object")
+	}
+	if fc.Version != FileConfigVersion {
+		return fc, fmt.Errorf("configuration document: version %d is not supported; this build accepts version %d",
+			fc.Version, FileConfigVersion)
+	}
+	return fc, nil
+}
+
+// validateDocumentShape checks the parts that do not need the environment.
+func validateDocumentShape(l *loader, fc FileConfig) {
+	if fc.Storage != nil {
+		for name, p := range map[string]string{
+			"incoming": fc.Storage.Incoming, "queued": fc.Storage.Queued,
+			"staging": fc.Storage.Staging, "consume": fc.Storage.Consume,
+			"failed": fc.Storage.Failed,
+		} {
+			if p == "" {
+				continue
+			}
+			if !filepath.IsAbs(p) {
+				l.fail("storage.%s must be an absolute path", name)
+			}
+			if p != filepath.Clean(p) {
+				l.fail("storage.%s must be a clean path", name)
+			}
+		}
+	}
+	if fc.Processing != nil {
+		if c := fc.Processing.Concurrency; c != 0 && (c < 1 || c > 64) {
+			l.fail("processing.concurrency must be between 1 and 64")
+		}
+		if pf := fc.Processing.Prefetch; pf != 0 && (pf < 1 || pf > 1000) {
+			l.fail("processing.prefetch must be between 1 and 1000")
+		}
+		if a := fc.Processing.MaxDeliveryAttempts; a != 0 && (a < 1 || a > 100) {
+			l.fail("processing.max_delivery_attempts must be between 1 and 100")
+		}
+		if fc.Processing.Concurrency > 0 && fc.Processing.Prefetch > 0 &&
+			fc.Processing.Prefetch < fc.Processing.Concurrency {
+			l.fail("processing.prefetch must be at least processing.concurrency")
+		}
+	}
+}

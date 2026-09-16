@@ -1,11 +1,11 @@
 // Package renamer is the renamer application: an independently scalable
 // consumer of the work queue.
 //
-// Scope note for this increment: normalization is not implemented. A delivery
-// is therefore taken through the real path — decode, durable ownership record,
-// durable outcome, acknowledge — and the outcome recorded is an honest hold
-// with the category normalization_unimplemented. No file is touched, no
-// destination is reserved, and no delivery is ever claimed.
+// A delivery is taken through the real path: decode, durable ownership record,
+// normalize, verified working copy, exclusive destination reservation, atomic
+// publication, durable receipt, acknowledge. Every outcome is committed before
+// the delivery is settled, and no path overwrites a file. See pipeline.go for
+// the ordering that makes an interrupted publication recoverable.
 package renamer
 
 import (
@@ -14,6 +14,7 @@ import (
 
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/app"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/config"
+	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/grpcapi"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/runtime"
 )
 
@@ -54,12 +55,32 @@ func (a *App) Run(ctx context.Context) int {
 
 	log.Info("renamer configured",
 		slog.String("event", "renamer_configured"),
+		slog.String("policy_version", a.cfg.Policy.Identity),
 		slog.Int("concurrency", a.cfg.Concurrency),
 		slog.Int("prefetch", a.cfg.Prefetch),
 		slog.String("queue", a.cfg.Broker.Queue))
-	log.Warn("filename normalization is not implemented in this build",
-		slog.String("event", "normalization_unimplemented"),
-		slog.String("category", "normalization_unimplemented"))
+	if a.cfg.DryRun {
+		log.Warn("dry run: names are computed and recorded, nothing is published",
+			slog.String("event", "dry_run_enabled"))
+	}
+
+	if a.cfg.GRPCAddr != "" {
+		api := grpcapi.New(a.cfg.GRPCAddr, grpcapi.Deps{
+			Common:    a.cfg.Common,
+			Effective: a.cfg.Effective(),
+			Ledger:    a.base.Ledger,
+			Health:    a.base.Health,
+			Metrics:   a.base.Metrics,
+			Logger:    log,
+		})
+		sup.Add("grpc", func(ctx context.Context) {
+			if err := api.Serve(ctx); err != nil {
+				log.Error("the grpc api stopped with an error",
+					slog.String("event", "grpc_failed"),
+					slog.String("error_kind", "unclassified"))
+			}
+		})
+	}
 
 	sup.OnDrain(func(context.Context) {
 		a.base.Health.SetNotReady("shutting_down")

@@ -262,6 +262,12 @@ func (s *Server) Draining() bool {
 	return s.draining
 }
 
+// Snapshot returns the current readiness and the per-check states.
+//
+// It is a read: it never evaluates a probe, so an inspection call cannot
+// perturb the readiness the process is reporting.
+func (s *Server) Snapshot() (bool, []State) { return s.snapshot() }
+
 func (s *Server) snapshot() (bool, []State) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
