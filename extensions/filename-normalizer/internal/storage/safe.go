@@ -93,12 +93,16 @@ type Entry struct {
 // the root would satisfy Stat, and following it would publish a document the
 // operator never placed in the incoming directory.
 func Inspect(root, name string) (Entry, error) {
-	if strings.HasPrefix(name, ".") {
-		return Entry{}, ErrHidden
-	}
+	// Containment is checked BEFORE the dotfile rule. "../escape.pdf" starts
+	// with a dot and would otherwise be reported as a hidden file, which is
+	// true but useless: the reason that matters is that it tried to leave the
+	// root, and an operator reading "hidden_file" would not learn that.
 	path, err := SafeJoin(root, name)
 	if err != nil {
 		return Entry{}, err
+	}
+	if strings.HasPrefix(filepath.Base(name), ".") {
+		return Entry{}, ErrHidden
 	}
 	fi, err := os.Lstat(path)
 	if err != nil {

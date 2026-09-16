@@ -350,3 +350,23 @@ func (l *Ledger) LastDiscoveryRun(ctx context.Context) (time.Time, error) {
 	}
 	return *ts, nil
 }
+
+// JobBySource returns the most recent job for a source root and name.
+//
+// It exists for tests and operator diagnostics. The running system never looks
+// a job up by name: dispatch and delivery carry the opaque job id, precisely so
+// that a filename never has to travel through the broker or a log line.
+func (l *Ledger) JobBySource(ctx context.Context, root, name string) (Job, error) {
+	row := l.primary.QueryRow(ctx, `
+		SELECT `+jobColumns+`
+		  FROM jobs WHERE source_root = $1 AND source_name = $2
+		 ORDER BY created_at DESC LIMIT 1`, root, name)
+	job, err := scanJob(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Job{}, ErrNotFound
+	}
+	if err != nil {
+		return Job{}, fmt.Errorf("look up job by source: %w", err)
+	}
+	return job, nil
+}
