@@ -1,0 +1,33 @@
+{
+  "version": 1,
+
+  "discovery": {
+    "enabled": true,
+    "interval": "1s",
+    "stability_interval": "2s",
+    "completion": "stability",
+    "recursive": false,
+    "batch": 200,
+
+    "include": ["\\.(pdf|jpe?g|png|tiff?|txt|md|docx?|odt)$"],
+    "exclude": ["^~\\$", "^\\.#"],
+    "match_case_insensitive": true,
+
+    "temporary_suffixes": [".part", ".tmp", ".crdownload", ".partial", ".filepart"]
+  },
+
+  "normalization": {
+    "max_name_bytes": 200,
+    "max_extension_length": 16,
+    "max_collision_suffix": 9999,
+    "require_extension": true,
+    "rules": []
+  },
+
+  "processing": {
+    "concurrency": 2,
+    "prefetch": 2,
+    "max_delivery_attempts": 5,
+    "dry_run": false
+  }
+}

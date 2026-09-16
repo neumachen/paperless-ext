@@ -36,6 +36,14 @@ func init() {
 		"category", "outcome", "reason", "error_kind", "storage_role",
 		"storage_status", "http_status", "addr", "path", "count",
 		"oldest_pending_age_ms", "lag_bytes", "migration", "applied",
+		// discovery and publication counters. These are aggregate numbers and
+		// booleans about the run, never document-derived text: a size in bytes
+		// is a property of a submission, not an identifier of it, and the four
+		// scan counters say how much work a scan saw rather than what it saw.
+		"size_bytes", "limit_bytes", "examined", "registered", "reconciling",
+		"collision_sequence", "used_fallback", "shortened", "recursive",
+		"completion_contract", "interval_seconds", "stability_seconds",
+		"max_sequence", "job_policy", "process_policy",
 	}
 	for _, k := range keys {
 		safeKeys[k] = struct{}{}

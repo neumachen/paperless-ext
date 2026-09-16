@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/config"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/jobs"
@@ -192,7 +193,11 @@ func (p *Pipeline) sourceMatchesRegistration(job ledger.Job, e storage.Entry) bo
 	if job.SourceDevice != nil && *job.SourceDevice != int64(e.Device) {
 		return false
 	}
-	if job.SourceModifiedAt != nil && !job.SourceModifiedAt.Equal(e.ModTime) {
+	// PostgreSQL stores timestamptz at microsecond resolution, so the value
+	// read back is a truncation of the nanosecond modification time that was
+	// written. Comparing them directly reports every source as mutated.
+	if job.SourceModifiedAt != nil &&
+		!job.SourceModifiedAt.Truncate(time.Microsecond).Equal(e.ModTime.Truncate(time.Microsecond)) {
 		return false
 	}
 	return true
