@@ -70,6 +70,10 @@ const (
 	// watcher, broker, renamers and destination.
 	PhaseNormalization Phase = "normalization"
 
+	// PhaseWatcherRestarted asserts that submissions which arrived while the
+	// watcher container was stopped are picked up after it comes back.
+	PhaseWatcherRestarted Phase = "watcher_restarted"
+
 	PhaseStackPrivacy Phase = "stack_privacy"
 	// PhaseFinalPrivacy runs last, after every outage, recovery and
 	// termination in the run, with every stack log re-collected again. The

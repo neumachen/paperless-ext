@@ -48,6 +48,29 @@ run_phase normalization "" || true
 log "recording the public commands' exit statuses"
 record_public_command_evidence
 
+# --- Watcher restart reconciliation ---------------------------------------
+# Documents are placed while the watcher container is stopped, so nothing is
+# watching when they arrive. The next scan after it restarts must pick them up.
+log "stopping the watcher, then submitting documents while nothing is watching"
+compose stop watcher >/dev/null 2>&1 || true
+
+_offline=""
+for i in 1 2 3; do
+    _name="offline-${FN_TEST_RUN_ID}-${i}.pdf"
+    compose run --rm --no-deps --entrypoint sh storage-init -c \
+        "printf '%%PDF-1.4 arrived while the watcher was down\n' > '/srv/fn/incoming/.wip-${i}' && \
+         mv '/srv/fn/incoming/.wip-${i}' '/srv/fn/incoming/${_name}'" >/dev/null 2>&1 || true
+    _offline="${_offline}${_offline:+,}${_name}"
+done
+save_state offline-submissions "$_offline"
+note "submitted while the watcher was down: $_offline"
+
+# Older than the stability interval by the time the watcher returns.
+sleep 4
+compose start watcher >/dev/null 2>&1 || true
+wait_healthy watcher || true
+run_phase watcher_restarted "" || true
+
 # --- F6: log assertions, with the logs baseline produced now collected -----
 # run_phase re-collects logs before it runs, so this phase sees the records the
 # baseline phase caused the applications to emit.
