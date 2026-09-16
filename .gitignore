@@ -29,3 +29,10 @@ node_modules/
 **/node_modules/
 dist/
 **/dist/
+
+# Integration evidence produced by the containerized test suite
+.evidence/
+**/.evidence/
+
+# Local-only credentials for the File Normalizer foundation stack
+deploy/filename-normalizer/secrets/
