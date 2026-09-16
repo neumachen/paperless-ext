@@ -56,12 +56,25 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
       -X github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/buildinfo.BuildDate=${BUILD_DATE} \
       -X github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/buildinfo.SourceDigest=$(cat /source-digest)" && \
     go build -trimpath -buildvcs=false -ldflags "${LDFLAGS}" -o /out/fn-watcher ./cmd/watcher && \
-    go build -trimpath -buildvcs=false -ldflags "${LDFLAGS}" -o /out/fn-renamer ./cmd/renamer
+    go build -trimpath -buildvcs=false -ldflags "${LDFLAGS}" -o /out/fn-renamer ./cmd/renamer && \
+    go build -trimpath -buildvcs=false -ldflags "${LDFLAGS}" -o /out/fnctl ./cmd/fnctl
 
 # The runtime account. UID/GID 65532 is the conventional unprivileged
 # "nonroot" identity; it is created here so the scratch image can name it.
 RUN printf 'nonroot:x:65532:65532:nonroot:/nonexistent:/sbin/nologin\n' > /out/passwd && \
     printf 'nonroot:x:65532:\n' > /out/group
+
+# ---------------------------------------------------------------------------
+# The inspection client. It is a separate image so the gRPC API is exercised
+# by a real client over the network, from a container that holds no
+# credentials and mounts no document storage.
+# ---------------------------------------------------------------------------
+FROM scratch AS fnctl
+COPY --from=build /out/passwd /out/group /etc/
+COPY --from=toolchain /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/fnctl /usr/local/bin/fnctl
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/fnctl"]
 
 # ---------------------------------------------------------------------------
 # Verification stage: formatting, vet and unit tests run inside the image

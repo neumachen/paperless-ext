@@ -17,6 +17,7 @@ import (
 
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/app"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/config"
+	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/grpcapi"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/runtime"
 )
 
@@ -66,6 +67,25 @@ func (a *App) Run(ctx context.Context) int {
 
 	discoverer := NewDiscoverer(a.base, a.cfg)
 	sup.Add("discovery", discoverer.Run)
+
+	if a.cfg.GRPCAddr != "" {
+		api := grpcapi.New(a.cfg.GRPCAddr, grpcapi.Deps{
+			Common:           a.cfg.Common,
+			Effective:        a.cfg.Effective(),
+			Ledger:           a.base.Ledger,
+			Health:           a.base.Health,
+			Metrics:          a.base.Metrics,
+			Logger:           log,
+			DiscoveryEnabled: a.cfg.Discovery.Enabled,
+		})
+		sup.Add("grpc", func(ctx context.Context) {
+			if err := api.Serve(ctx); err != nil {
+				log.Error("the grpc api stopped with an error",
+					slog.String("event", "grpc_failed"),
+					slog.String("error_kind", "unclassified"))
+			}
+		})
+	}
 
 	sup.OnDrain(func(context.Context) {
 		a.base.Health.SetNotReady("shutting_down")

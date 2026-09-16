@@ -705,13 +705,14 @@ func (l *Ledger) Events(ctx context.Context, jobID string) ([]Event, error) {
 // oldest job still owing a publication.
 type Counts struct {
 	ByState          map[jobs.State]int
+	ByCategory       map[jobs.Category]int
 	OldestPendingAge time.Duration
 	Total            int
 }
 
 // Snapshot aggregates the ledger for the accounting worker and the metrics.
 func (l *Ledger) Snapshot(ctx context.Context) (Counts, error) {
-	out := Counts{ByState: map[jobs.State]int{}}
+	out := Counts{ByState: map[jobs.State]int{}, ByCategory: map[jobs.Category]int{}}
 	for _, s := range jobs.States() {
 		out.ByState[s] = 0
 	}
@@ -743,6 +744,28 @@ func (l *Ledger) Snapshot(ctx context.Context) (Counts, error) {
 		return Counts{}, err
 	}
 	rows.Close()
+
+	// Hold reasons, so a caller can tell one kind of stuck job from another
+	// without reading any document identity.
+	catRows, err := l.primary.Query(ctx, `
+		SELECT failure_category, count(*) FROM jobs
+		 WHERE failure_category IS NOT NULL GROUP BY 1`)
+	if err != nil {
+		return Counts{}, err
+	}
+	for catRows.Next() {
+		var cat string
+		var n int
+		if err := catRows.Scan(&cat, &n); err != nil {
+			catRows.Close()
+			return Counts{}, err
+		}
+		out.ByCategory[jobs.Category(cat)] = n
+	}
+	catRows.Close()
+	if err := catRows.Err(); err != nil {
+		return Counts{}, err
+	}
 
 	var oldest *time.Duration
 	var secs *float64

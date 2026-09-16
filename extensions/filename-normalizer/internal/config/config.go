@@ -28,10 +28,15 @@ const (
 
 // Common holds settings both applications share.
 type Common struct {
-	Application     Application
-	Instance        string
-	LogLevel        string
-	HTTPAddr        string
+	Application Application
+	Instance    string
+	LogLevel    string
+	HTTPAddr    string
+	// GRPCAddr is the inspection API's listen address. It is bound on the
+	// application network only and is deliberately not published to the host
+	// by default: the API has no authentication, and restricted job detail is
+	// reachable from it. Empty disables the server entirely.
+	GRPCAddr        string
 	ShutdownTimeout time.Duration
 	Database        Database
 	Broker          Broker
@@ -284,6 +289,7 @@ func (l *loader) common(app Application) Common {
 		Instance:        l.str("FN_INSTANCE", host),
 		LogLevel:        l.str("FN_LOG_LEVEL", "info"),
 		HTTPAddr:        l.str("FN_HTTP_ADDR", ":8080"),
+		GRPCAddr:        l.str("FN_GRPC_ADDR", ":9090"),
 		ShutdownTimeout: l.duration("FN_SHUTDOWN_TIMEOUT", 20*time.Second, time.Second, 5*time.Minute),
 	}
 

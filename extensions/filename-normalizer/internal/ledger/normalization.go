@@ -321,3 +321,32 @@ func (l *Ledger) JobsInState(ctx context.Context, state jobs.State, limit int) (
 	}
 	return out, rows.Err()
 }
+
+// CountReservations reports how many destination names are reserved.
+//
+// Reservations are never removed, so this number only grows. It is the
+// retained consumed-name history: a name handed to one submission is never
+// handed to another, even after Paperless removes the file.
+func (l *Ledger) CountReservations(ctx context.Context) (int64, error) {
+	var n int64
+	if err := l.primary.QueryRow(ctx, `SELECT count(*) FROM name_reservations`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count reservations: %w", err)
+	}
+	return n, nil
+}
+
+// LastDiscoveryRun reports when a submission was most recently registered.
+//
+// It is a proxy for discovery liveness that survives a process restart, which
+// the in-process metric does not: a watcher that has been restarted reports a
+// zero gauge but the ledger still knows when work last arrived.
+func (l *Ledger) LastDiscoveryRun(ctx context.Context) (time.Time, error) {
+	var ts *time.Time
+	if err := l.primary.QueryRow(ctx, `SELECT max(discovered_at) FROM jobs`).Scan(&ts); err != nil {
+		return time.Time{}, fmt.Errorf("read last discovery: %w", err)
+	}
+	if ts == nil {
+		return time.Time{}, nil
+	}
+	return *ts, nil
+}
