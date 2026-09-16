@@ -19,7 +19,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/buildinfo"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/config"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/jobs"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/logging"
@@ -222,6 +221,11 @@ type RegisterInput struct {
 	SizeBytes       *int64
 	FingerprintAlgo *string
 	Fingerprint     []byte
+	// PolicyIdentity is the naming policy this submission is accepted under.
+	// It is recorded once, at registration, and never recomputed: a renamer
+	// running a different policy must refuse the job rather than rename it
+	// under rules the job was not accepted with.
+	PolicyIdentity string
 }
 
 // RegisterJob makes a submission durable and writes its first history row.
@@ -239,7 +243,7 @@ func (l *Ledger) RegisterJob(ctx context.Context, in RegisterInput) (Job, error)
 			RETURNING `+jobColumns,
 			id, jobs.ContractVersion, string(jobs.StatePendingDispatch),
 			in.SourceRoot, in.SourceName, in.SizeBytes, in.FingerprintAlgo,
-			in.Fingerprint, buildinfo.PolicyVersion)
+			in.Fingerprint, in.PolicyIdentity)
 		var scanErr error
 		job, scanErr = scanJob(row)
 		if scanErr != nil {

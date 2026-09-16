@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // minimalEnv sets the variables every application requires.
@@ -44,8 +45,20 @@ func TestLoadWatcherAppliesDocumentedDefaults(t *testing.T) {
 	if !cfg.Database.ApplyMigrations {
 		t.Error("the watcher should apply migrations by default")
 	}
-	if cfg.DiscoveryEnabled {
-		t.Error("discovery must default to disabled while it is unimplemented")
+	// Discovery is implemented now, but it stays off unless a deployment
+	// declares it: a watcher that starts scanning a root nobody configured is
+	// a surprise, not a default.
+	if cfg.Discovery.Enabled {
+		t.Error("discovery must default to disabled")
+	}
+	if cfg.Discovery.Completion != CompletionStability {
+		t.Errorf("default completion contract = %q", cfg.Discovery.Completion)
+	}
+	if cfg.Discovery.StabilityInterval != 30*time.Second {
+		t.Errorf("default stability interval = %s", cfg.Discovery.StabilityInterval)
+	}
+	if cfg.Policy.Identity == "" {
+		t.Error("the watcher must carry a policy identity")
 	}
 }
 
@@ -147,16 +160,16 @@ func TestUnreadableSecretFileIsAnError(t *testing.T) {
 	}
 }
 
-func TestEnablingDiscoveryIsAStartupError(t *testing.T) {
+func TestDiscoveryCanBeEnabledFromTheEnvironment(t *testing.T) {
 	minimalEnv(t)
-	t.Setenv("FN_WATCHER_DISCOVERY_ENABLED", "true")
+	t.Setenv("FN_DISCOVERY_ENABLED", "true")
 
-	_, err := LoadWatcher()
-	if err == nil {
-		t.Fatal("enabling an unimplemented worker must fail rather than be silently inert")
+	cfg, err := LoadWatcher()
+	if err != nil {
+		t.Fatalf("LoadWatcher: %v", err)
 	}
-	if !strings.Contains(err.Error(), "not implemented") {
-		t.Errorf("error does not explain that discovery is unimplemented: %v", err)
+	if !cfg.Discovery.Enabled {
+		t.Error("FN_DISCOVERY_ENABLED=true did not enable discovery")
 	}
 }
 

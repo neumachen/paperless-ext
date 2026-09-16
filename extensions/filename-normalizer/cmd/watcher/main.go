@@ -8,6 +8,7 @@ import (
 
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/buildinfo"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/config"
+	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/naming"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/probe"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/watcher"
 )
@@ -49,14 +50,22 @@ func handleSubcommand() (bool, int) {
 	case "version":
 		fmt.Printf("fn-watcher %s revision=%s source=%s built=%s go=%s policy=%s contract=%d\n",
 			buildinfo.Version, buildinfo.Revision, buildinfo.SourceDigest,
-			buildinfo.BuildDate, buildinfo.GoVersion(), buildinfo.PolicyVersion, 1)
+			buildinfo.BuildDate, buildinfo.GoVersion(), naming.PolicyVersion, 1)
 		return true, 0
 	case "check-config":
-		if _, err := config.LoadWatcher(); err != nil {
+		// Validation and the effective-configuration view are the same code
+		// path, so "it validates" and "this is what it means" can never
+		// disagree. The output carries no credentials.
+		cfg, err := config.LoadWatcher()
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
 			return true, 2
 		}
-		fmt.Println("configuration is valid")
+		fmt.Fprintln(os.Stderr, "configuration is valid")
+		if err := cfg.Effective().WriteJSON(os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			return true, 1
+		}
 		return true, 0
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand: expected version, check-config, healthcheck or probe\n")

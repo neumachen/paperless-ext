@@ -46,6 +46,7 @@ type Server struct {
 	addr    string
 	app     string
 	inst    string
+	policy  string
 	log     *slog.Logger
 	reg     *prometheus.Registry
 	checks  []Check
@@ -74,14 +75,18 @@ type Server struct {
 
 // Options configures the server.
 type Options struct {
-	Addr         string
-	Application  string
-	Instance     string
-	Logger       *slog.Logger
-	Registry     *prometheus.Registry
-	Checks       []Check
-	ProbeTimeout time.Duration
-	OnReadiness  func(ready bool, states []State)
+	Addr        string
+	Application string
+	Instance    string
+	// PolicyIdentity is the naming policy this process is running, reported
+	// by /healthz so an operator can tell two differently configured
+	// instances apart.
+	PolicyIdentity string
+	Logger         *slog.Logger
+	Registry       *prometheus.Registry
+	Checks         []Check
+	ProbeTimeout   time.Duration
+	OnReadiness    func(ready bool, states []State)
 }
 
 // New builds a server. It does not listen until Start is called.
@@ -94,6 +99,7 @@ func New(opts Options) *Server {
 		addr:        opts.Addr,
 		app:         opts.Application,
 		inst:        opts.Instance,
+		policy:      opts.PolicyIdentity,
 		log:         opts.Logger,
 		reg:         opts.Registry,
 		checks:      opts.Checks,
@@ -279,7 +285,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		"build_date":     buildinfo.BuildDate,
 		"source_digest":  buildinfo.SourceDigest,
 		"go_version":     buildinfo.GoVersion(),
-		"policy_version": buildinfo.PolicyVersion,
+		"policy_version": s.policy,
 		"draining":       s.Draining(),
 	})
 }

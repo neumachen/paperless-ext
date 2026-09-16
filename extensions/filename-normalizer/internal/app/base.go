@@ -45,7 +45,7 @@ func NewBase(ctx context.Context, cfg config.Common) (*Base, error) {
 		Instance:    cfg.Instance,
 	})
 
-	metrics := telemetry.New(string(cfg.Application), cfg.Instance)
+	metrics := telemetry.New(string(cfg.Application), cfg.Instance, cfg.Policy.Identity)
 
 	led, err := ledger.Open(ctx, ledger.Options{
 		Config:    cfg.Database,
@@ -80,13 +80,14 @@ func NewBase(ctx context.Context, cfg config.Common) (*Base, error) {
 	}
 
 	b.Health = health.New(health.Options{
-		Addr:         cfg.HTTPAddr,
-		Application:  string(cfg.Application),
-		Instance:     cfg.Instance,
-		Logger:       log.With(slog.String("component", "http")),
-		Registry:     metrics.Registry,
-		ProbeTimeout: 3 * time.Second,
-		Checks:       b.checks(),
+		Addr:           cfg.HTTPAddr,
+		Application:    string(cfg.Application),
+		Instance:       cfg.Instance,
+		PolicyIdentity: cfg.Policy.Identity,
+		Logger:         log.With(slog.String("component", "http")),
+		Registry:       metrics.Registry,
+		ProbeTimeout:   3 * time.Second,
+		Checks:         b.checks(),
 		OnReadiness: func(ready bool, _ []health.State) {
 			metrics.Ready.Set(boolGauge(ready))
 		},
@@ -98,7 +99,7 @@ func NewBase(ctx context.Context, cfg config.Common) (*Base, error) {
 		slog.String("revision", buildinfo.Revision),
 		slog.String("build_date", buildinfo.BuildDate),
 		slog.String("go_version", buildinfo.GoVersion()),
-		slog.String("policy_version", buildinfo.PolicyVersion),
+		slog.String("policy_version", cfg.Policy.Identity),
 		slog.Int("pid", os.Getpid()),
 		slog.Any("state", summaryAttrs(cfg)))
 

@@ -1,0 +1,42 @@
+{
+  "version": 1,
+
+  "discovery": {
+    "enabled": true,
+    "interval": "5s",
+    "stability_interval": "2s",
+    "completion": "stability",
+    "include": ["\\.(pdf|jpe?g|png|txt)$"],
+    "exclude": ["^draft-"],
+    "match_case_insensitive": true
+  },
+
+  "normalization": {
+    "rules": [
+      {
+        "name": "strip-scanner-prefix",
+        "pattern": "^scan[_-]?\\d*[_-]",
+        "replacement": "",
+        "case_insensitive": true
+      },
+      {
+        "name": "drop-copy-marker",
+        "pattern": "\\s*\\((?:copy|kopie)\\s*\\d*\\)",
+        "replacement": "",
+        "all": true,
+        "case_insensitive": true
+      },
+      {
+        "name": "expand-inv",
+        "pattern": "\\bInv\\b",
+        "replacement": "Invoice",
+        "all": true
+      }
+    ]
+  },
+
+  "processing": {
+    "concurrency": 2,
+    "prefetch": 2
+  }
+}
