@@ -122,9 +122,16 @@ func (p *Pipeline) Process(ctx context.Context, job ledger.Job, attempt int) Out
 		return p.recoverPublishing(ctx, job, attempt, log)
 	}
 
-	if attempt > p.cfg.MaxDeliveryAttempts {
+	// The bound is the ledger's own delivery counter, which BeginDelivery
+	// increments on every delivery, NOT the attempt field carried in the
+	// message. That field is set by the publisher and does not advance when a
+	// consumer returns a delivery, and RabbitMQ's x-delivery-count does not
+	// advance on an explicit requeue either -- so bounding on either of those
+	// lets a persistently failing job requeue forever.
+	if job.DeliveryAttempts > p.cfg.MaxDeliveryAttempts {
 		log.Warn("delivery budget exhausted",
 			slog.String("event", "retry_exhausted"),
+			slog.Int("attempts", job.DeliveryAttempts),
 			slog.Int("max_attempts", p.cfg.MaxDeliveryAttempts))
 		return p.hold(ctx, job, jobs.CategoryRetryExhausted, attempt)
 	}
@@ -379,9 +386,16 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Job, root, candidate, key, final string, attempt int, log *slog.Logger) (Outcome, bool) {
 	sum, size, err := storage.Fingerprint(final)
 	if err != nil {
-		cat := jobs.Category(storage.RejectionCategory(err))
-		out, _ := p.holdOr(ctx, job, cat, attempt, err)
-		return out, true
+		// The name is taken by something this process cannot read, so it
+		// cannot be established as this job's own work. Taking the name would
+		// risk overwriting a document; retrying would spin forever against a
+		// condition that will not change by itself. The conflict is recorded
+		// and preserved for investigation, which is what the contract asks for.
+		log.Error("the destination is occupied by a file this process cannot read",
+			slog.String("event", "destination_unreadable"),
+			slog.String("category", string(jobs.CategoryDestinationConflict)),
+			slog.String("error_kind", storage.RejectionCategory(err)))
+		return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt), true
 	}
 
 	if job.Fingerprint != nil && bytes.Equal(sum, job.Fingerprint) {
@@ -502,7 +516,10 @@ func (p *Pipeline) hold(ctx context.Context, job ledger.Job, cat jobs.Category, 
 func (p *Pipeline) holdOr(ctx context.Context, job ledger.Job, cat jobs.Category, attempt int, cause error) (Outcome, bool) {
 	switch cat {
 	case jobs.CategoryStorageUnavailable, jobs.CategoryStorageError, jobs.CategoryPermissionDenied:
-		if attempt <= p.cfg.MaxDeliveryAttempts {
+		// Retryable only while the durable budget lasts. Using the message's
+		// attempt field here made a permanently failing storage condition
+		// requeue without limit, because that field never advances.
+		if job.DeliveryAttempts <= p.cfg.MaxDeliveryAttempts {
 			return unsettled(cause), false
 		}
 	}

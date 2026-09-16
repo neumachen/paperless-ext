@@ -493,6 +493,7 @@ services:
       FN_TEST_EVIDENCE_DIR: /evidence
     secrets: [fn_db_password, fn_amqp_password]
     volumes:
+      - ./config:/etc/fn:ro
       - fn-incoming:/srv/fn/incoming
       - fn-queued:/srv/fn/queued
       - fn-staging:/srv/fn/staging

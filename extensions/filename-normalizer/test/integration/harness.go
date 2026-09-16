@@ -65,6 +65,11 @@ const (
 	PhaseWatcherDrained Phase = "watcher_drained"
 	// PhaseStackPrivacy runs after the telemetry phase has produced a slow
 	// database statement, with every stack log re-collected.
+	// PhaseNormalization runs the end-to-end document tests: real synthetic
+	// files placed in the real incoming volume and taken through the real
+	// watcher, broker, renamers and destination.
+	PhaseNormalization Phase = "normalization"
+
 	PhaseStackPrivacy Phase = "stack_privacy"
 	// PhaseFinalPrivacy runs last, after every outage, recovery and
 	// termination in the run, with every stack log re-collected again. The

@@ -34,6 +34,13 @@ sleep 8
 # --- F1, F2, F3, F4, F6 steady state --------------------------------------
 run_phase baseline "" || true
 
+# --- A1, A3, A4, A10: real documents through the real pipeline -------------
+# Placed early, on a healthy stack, because these are the acceptance criteria
+# about ordinary correct operation. The fault phases that follow deliberately
+# run against a system that has already published real documents, so their
+# recovery assertions have something to recover.
+run_phase normalization "" || true
+
 # --- FN-F004: the public entry points' own exit statuses ------------------
 # Executed here because the suite's container holds the test binary, not the
 # application binaries. Both the positive and the negative outcome are
