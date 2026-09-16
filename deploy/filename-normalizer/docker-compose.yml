@@ -1,0 +1,466 @@
+# File Normalizer local foundation stack.
+#
+# Everything runs in containers: the two applications, the PostgreSQL cluster,
+# RabbitMQ, the storage initialiser and the integration-test runner. No host Go
+# installation is required.
+#
+# Isolation. The project name (COMPOSE_PROJECT_NAME, default fnfoundation)
+# prefixes every container, network and volume, so `down -v` removes only this
+# project's resources and leaves unrelated containers, volumes and development
+# data untouched. No database or broker port is published to the host; only the
+# applications' HTTP surfaces are, on high ports, so readiness and metrics can
+# be inspected from outside the network.
+
+name: ${COMPOSE_PROJECT_NAME:-fnfoundation}
+
+# Settings shared by both applications. Credentials are never inlined: each
+# password arrives as a file under /run/secrets.
+x-app-env: &app-env
+  FN_LOG_LEVEL: ${FN_LOG_LEVEL:-info}
+  FN_SHUTDOWN_TIMEOUT: ${FN_SHUTDOWN_TIMEOUT:-20s}
+
+  FN_DB_PRIMARY_HOST: postgres-primary
+  FN_DB_PRIMARY_PORT: "5432"
+  FN_DB_REPLICA_HOST: postgres-replica
+  FN_DB_REPLICA_PORT: "5432"
+  FN_DB_REPLICA_REQUIRED: ${FN_DB_REPLICA_REQUIRED:-false}
+  FN_DB_NAME: ${FN_DB_NAME:-filename_normalizer}
+  FN_DB_USER: ${FN_DB_USER:-fn_app}
+  FN_DB_PASSWORD_FILE: /run/secrets/fn_db_password
+  FN_DB_SSLMODE: disable
+
+  FN_AMQP_HOST: rabbitmq
+  FN_AMQP_PORT: "5672"
+  FN_AMQP_VHOST: ${FN_AMQP_VHOST:-filename-normalizer}
+  FN_AMQP_USER: ${FN_AMQP_USER:-fn_app}
+  FN_AMQP_PASSWORD_FILE: /run/secrets/fn_amqp_password
+  FN_AMQP_DELIVERY_LIMIT: ${FN_AMQP_DELIVERY_LIMIT:-5}
+
+  FN_STORAGE_INCOMING: /srv/fn/incoming
+  FN_STORAGE_QUEUED: /srv/fn/queued
+  FN_STORAGE_STAGING: /srv/fn/staging
+  FN_STORAGE_CONSUME: /srv/fn/consume
+  FN_STORAGE_FAILED: /srv/fn/failed
+  FN_STORAGE_REQUIRED: "true"
+
+x-app-hardening: &app-hardening
+  user: "65532:65532"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+x-app-build-args: &app-build-args
+  VERSION: ${FN_VERSION:-0.1.0-foundation}
+  REVISION: ${FN_REVISION:-unknown}
+  BUILD_DATE: ${FN_BUILD_DATE:-unknown}
+
+x-pg-image: &pg-image
+  image: postgres:17.11-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+
+# Secrets arrive as files, which is what the applications' *_FILE indirection
+# expects and what lets the application containers keep a read-only root
+# filesystem. `make secrets` writes them from .env; in a real deployment they
+# would come from outside the repository entirely.
+#
+# Permissions. Compose bind-mounts each file and ignores the `uid`, `gid` and
+# `mode` keys outside Swarm, so the host file's own mode is what the container
+# sees. `make secrets` therefore writes the files 0644 inside a 0700 directory:
+# the directory keeps them private on the host, while the file mode lets the
+# containers' unprivileged account read the mount, which resolves the path
+# without traversing the directory.
+secrets:
+  fn_db_password:
+    file: ./secrets/fn_db_password
+  fn_amqp_password:
+    file: ./secrets/fn_amqp_password
+
+networks:
+  fn:
+    driver: bridge
+
+volumes:
+  # Cluster state. Separate volumes so the standby can be rebuilt without
+  # touching the primary, and vice versa.
+  pg-primary-data:
+  pg-replica-data:
+  rabbitmq-data:
+  # Document storage roles, one volume each, so incoming and consume are
+  # genuinely distinct filesystems from the containers' point of view.
+  fn-incoming:
+  fn-queued:
+  fn-staging:
+  fn-consume:
+  fn-failed:
+
+services:
+  # -------------------------------------------------------------------------
+  # PostgreSQL cluster: one primary with one asynchronous streaming standby.
+  # -------------------------------------------------------------------------
+  postgres-primary:
+    <<: *pg-image
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    environment:
+      POSTGRES_DB: ${FN_DB_NAME:-filename_normalizer}
+      POSTGRES_USER: ${FN_DB_USER:-fn_app}
+      POSTGRES_PASSWORD: ${FN_DB_PASSWORD:?FN_DB_PASSWORD must be set in .env}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256 --data-checksums"
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      FN_REPLICATION_USER: ${FN_REPLICATION_USER:-fn_repl}
+      FN_REPLICATION_PASSWORD: ${FN_REPLICATION_PASSWORD:?FN_REPLICATION_PASSWORD must be set in .env}
+      FN_REPLICATION_SLOT: ${FN_REPLICATION_SLOT:-fn_standby_1}
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./postgres/primary/postgresql.primary.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/primary/10-replication.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+    networks: [fn]
+    healthcheck:
+      # Healthy means "accepting connections and not in recovery". A promoted
+      # standby answering here would be a misconfiguration, not health.
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -q && PGPASSWORD="$$POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -tAc 'SELECT NOT pg_is_in_recovery()' | grep -q t
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  postgres-replica:
+    <<: *pg-image
+    entrypoint: ["/bin/sh", "/usr/local/bin/fn-standby-entrypoint.sh"]
+    user: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_USER: ${FN_DB_USER:-fn_app}
+      POSTGRES_DB: ${FN_DB_NAME:-filename_normalizer}
+      # Used by the healthcheck's psql only; the base backup authenticates as
+      # the replication role from the entrypoint.
+      FN_DB_PASSWORD: ${FN_DB_PASSWORD:?FN_DB_PASSWORD must be set in .env}
+      FN_PRIMARY_HOST: postgres-primary
+      FN_REPLICATION_USER: ${FN_REPLICATION_USER:-fn_repl}
+      FN_REPLICATION_PASSWORD: ${FN_REPLICATION_PASSWORD:?FN_REPLICATION_PASSWORD must be set in .env}
+      FN_REPLICATION_SLOT: ${FN_REPLICATION_SLOT:-fn_standby_1}
+    volumes:
+      - pg-replica-data:/var/lib/postgresql/data
+      - ./postgres/replica/entrypoint.sh:/usr/local/bin/fn-standby-entrypoint.sh:ro
+    networks: [fn]
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      # A standby is healthy when it answers queries while still in recovery.
+      # Leaving recovery means it was promoted; that is reported by the
+      # application's readiness output rather than silently treated as healthy.
+      test:
+        - CMD-SHELL
+        - pg_isready -q -U "$$FN_REPLICATION_USER" && PGPASSWORD="$$FN_DB_PASSWORD" psql -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -tAc 'SELECT pg_is_in_recovery()' | grep -q t
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # RabbitMQ: single node, durable topology, quorum queues, persistent
+  # messages. Clustering is deliberately out of scope for this increment.
+  # -------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:4.3.6-management-alpine@sha256:0057f1a70160f6cfb9bddbb3e3da91da5dbde4fefbcd6454f7e158d6937fea38
+    # A stable hostname keeps the node name stable, which is what lets the
+    # persisted quorum-queue state survive a container restart.
+    hostname: fn-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${FN_AMQP_USER:-fn_app}
+      RABBITMQ_DEFAULT_PASS: ${FN_AMQP_PASSWORD:?FN_AMQP_PASSWORD must be set in .env}
+      RABBITMQ_DEFAULT_VHOST: ${FN_AMQP_VHOST:-filename-normalizer}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    networks: [fn]
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 5s
+      timeout: 15s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Storage initialiser.
+  #
+  # Docker creates a fresh named volume owned by root, which the unprivileged
+  # applications cannot write. This one-shot service hands each role to the
+  # runtime account and generates the synthetic documents used as fixtures. It
+  # is the only container in the stack that needs root, and it touches nothing
+  # outside this project's volumes.
+  # -------------------------------------------------------------------------
+  storage-init:
+    <<: *pg-image
+    entrypoint: ["/bin/sh", "/usr/local/bin/fn-storage-init.sh"]
+    user: "0:0"
+    environment:
+      FN_FIXTURE_COUNT: ${FN_FIXTURE_COUNT:-12}
+      FN_RUNTIME_UID: "65532"
+      FN_RUNTIME_GID: "65532"
+      FN_STORAGE_ROOT: /srv/fn
+    volumes:
+      - ./scripts/storage-init.sh:/usr/local/bin/fn-storage-init.sh:ro
+      - fn-incoming:/srv/fn/incoming
+      - fn-queued:/srv/fn/queued
+      - fn-staging:/srv/fn/staging
+      - fn-consume:/srv/fn/consume
+      - fn-failed:/srv/fn/failed
+    networks: [fn]
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # The watcher application. Hosts dispatch and completion accounting.
+  # Discovery is the third worker it is intended to host; it is not
+  # implemented, and enabling it is a startup error.
+  # -------------------------------------------------------------------------
+  watcher:
+    <<: *app-hardening
+    build:
+      context: ../../extensions/filename-normalizer
+      dockerfile: Dockerfile
+      target: watcher
+      args: *app-build-args
+    image: ${FN_IMAGE_PREFIX:-filename-normalizer}/watcher:${FN_VERSION:-0.1.0-foundation}
+    environment:
+      <<: *app-env
+      FN_INSTANCE: watcher-1
+      FN_DB_APPLY_MIGRATIONS: "true"
+      FN_WATCHER_DISPATCH_INTERVAL: ${FN_WATCHER_DISPATCH_INTERVAL:-500ms}
+      FN_WATCHER_DISPATCH_BATCH: ${FN_WATCHER_DISPATCH_BATCH:-32}
+      FN_WATCHER_DISPATCH_CLAIM_MAX_AGE: ${FN_WATCHER_DISPATCH_CLAIM_MAX_AGE:-30s}
+      FN_WATCHER_ACCOUNTING_INTERVAL: ${FN_WATCHER_ACCOUNTING_INTERVAL:-2s}
+    secrets: [fn_db_password, fn_amqp_password]
+    volumes:
+      - fn-incoming:/srv/fn/incoming:ro
+      - fn-queued:/srv/fn/queued
+      - fn-staging:/srv/fn/staging
+      # Publication belongs to the renamer, so the watcher gets the consumer's
+      # directory read-only. The application's probe expects exactly this.
+      - fn-consume:/srv/fn/consume:ro
+      - fn-failed:/srv/fn/failed
+    ports:
+      - "${FN_WATCHER_PORT:-18080}:8080"
+    networks: [fn]
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # The scratch image has no shell, so the healthcheck is the binary's own
+      # subcommand in exec form. It queries the *running* process over the HTTP
+      # surface that process is serving, so a dead or wedged server fails the
+      # check. Running `version` instead would only have proved that a fresh
+      # copy of the binary can start.
+      #
+      # Liveness, not readiness: a dependency outage must leave the container
+      # running and reporting not-ready, not be treated as a dead container.
+      test: ["CMD", "/usr/local/bin/fn-watcher", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # Two independent renamer containers, declared as separate services rather
+  # than replicas so each has a stable identity and its own readiness
+  # endpoint. Starting two establishes deployment capability; it does not by
+  # itself demonstrate concurrent document processing.
+  # -------------------------------------------------------------------------
+  renamer-1: &renamer
+    <<: *app-hardening
+    build:
+      context: ../../extensions/filename-normalizer
+      dockerfile: Dockerfile
+      target: renamer
+      args: *app-build-args
+    image: ${FN_IMAGE_PREFIX:-filename-normalizer}/renamer:${FN_VERSION:-0.1.0-foundation}
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-1
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: ${FN_RENAMER_CONCURRENCY:-2}
+    secrets: [fn_db_password, fn_amqp_password]
+    volumes:
+      - fn-incoming:/srv/fn/incoming:ro
+      - fn-queued:/srv/fn/queued
+      - fn-staging:/srv/fn/staging
+      - fn-consume:/srv/fn/consume
+      - fn-failed:/srv/fn/failed
+    ports:
+      - "${FN_RENAMER1_PORT:-18081}:8080"
+    networks: [fn]
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # Queries the running process over its own HTTP surface; see the
+      # watcher's healthcheck for why `version` is not enough.
+      test: ["CMD", "/usr/local/bin/fn-renamer", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  renamer-2:
+    <<: *renamer
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-2
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: ${FN_RENAMER_CONCURRENCY:-2}
+    ports:
+      - "${FN_RENAMER2_PORT:-18082}:8080"
+
+  # -------------------------------------------------------------------------
+  # A watcher whose incoming root was never mounted.
+  #
+  # Its database and broker are the healthy ones, so storage is the only thing
+  # that can be at fault. F5 uses it to show that unavailable storage produces
+  # a truthful not-ready application rather than a process that reads the root
+  # as empty. It lives behind its own profile so it is not part of the normal
+  # stack.
+  # -------------------------------------------------------------------------
+  watcher-storage-fault:
+    <<: *app-hardening
+    restart: "no"
+    build:
+      context: ../../extensions/filename-normalizer
+      dockerfile: Dockerfile
+      target: watcher
+      args: *app-build-args
+    image: ${FN_IMAGE_PREFIX:-filename-normalizer}/watcher:${FN_VERSION:-0.1.0-foundation}
+    environment:
+      <<: *app-env
+      FN_INSTANCE: watcher-storage-fault
+      FN_DB_APPLY_MIGRATIONS: "false"
+      # This path is deliberately not mounted.
+      FN_STORAGE_INCOMING: /srv/fn/never-mounted
+      FN_WATCHER_DISPATCH_INTERVAL: 5s
+      FN_WATCHER_ACCOUNTING_INTERVAL: 5s
+    secrets: [fn_db_password, fn_amqp_password]
+    volumes:
+      - fn-queued:/srv/fn/queued
+      - fn-staging:/srv/fn/staging
+      - fn-consume:/srv/fn/consume:ro
+      - fn-failed:/srv/fn/failed
+    networks: [fn]
+    profiles: [fault]
+
+  # -------------------------------------------------------------------------
+  # A renamer pointed at a reachable database that has no ledger schema.
+  #
+  # It connects to the "postgres" maintenance database, which exists and
+  # authenticates but has never had a migration applied, with migrations
+  # disabled. F4 uses it to show that connectivity is not readiness: a
+  # reachable database whose migration never ran must produce a truthful
+  # not-ready application rather than one that advertises itself as ready and
+  # then fails on its first durable write. Its own profile keeps it out of the
+  # normal stack.
+  # -------------------------------------------------------------------------
+  renamer-no-schema:
+    <<: *app-hardening
+    restart: "no"
+    build:
+      context: ../../extensions/filename-normalizer
+      dockerfile: Dockerfile
+      target: renamer
+      args: *app-build-args
+    image: ${FN_IMAGE_PREFIX:-filename-normalizer}/renamer:${FN_VERSION:-0.1.0-foundation}
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-no-schema
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_DB_NAME: postgres
+      FN_RENAMER_CONCURRENCY: "1"
+    secrets: [fn_db_password, fn_amqp_password]
+    volumes:
+      - fn-incoming:/srv/fn/incoming:ro
+      - fn-queued:/srv/fn/queued
+      - fn-staging:/srv/fn/staging
+      - fn-consume:/srv/fn/consume
+      - fn-failed:/srv/fn/failed
+    networks: [fn]
+    profiles: [fault]
+
+  # -------------------------------------------------------------------------
+  # Readiness sampler.
+  #
+  # Runs the renamer binary purely for its `probe` subcommand, and mounts the
+  # evidence directory so it can append observations. The application services
+  # deliberately do not mount evidence, and a scratch image has no wget, so the
+  # sampling needs its own service rather than an entrypoint override.
+  #
+  # It exists because /readyz answers 503 while an instance drains, and busybox
+  # wget discards the body of a non-2xx response — the readiness document
+  # during a drain is exactly what has to be captured.
+  # -------------------------------------------------------------------------
+  readiness-probe:
+    build:
+      context: ../../extensions/filename-normalizer
+      dockerfile: Dockerfile
+      target: renamer
+      args: *app-build-args
+    image: ${FN_IMAGE_PREFIX:-filename-normalizer}/renamer:${FN_VERSION:-0.1.0-foundation}
+    entrypoint: ["/usr/local/bin/fn-renamer"]
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    volumes:
+      - ../../extensions/filename-normalizer/.evidence:/evidence
+    networks: [fn]
+    profiles: [test]
+
+  # -------------------------------------------------------------------------
+  # Integration-test runner. Built from the same source tree and linked
+  # against the same packages as the applications, so the suite exercises the
+  # applications' real integration code rather than the stock images.
+  #
+  # It runs as root only so it can construct the permission-denied storage
+  # fixture F5 requires, and it writes only into this project's volumes.
+  # -------------------------------------------------------------------------
+  integration:
+    build:
+      context: ../../extensions/filename-normalizer
+      dockerfile: Dockerfile
+      target: integration
+      args: *app-build-args
+    image: ${FN_IMAGE_PREFIX:-filename-normalizer}/integration:${FN_VERSION:-0.1.0-foundation}
+    environment:
+      <<: *app-env
+      FN_INSTANCE: integration
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_TEST_PHASE: ${FN_TEST_PHASE:-baseline}
+      FN_TEST_WATCHER_URL: http://watcher:8080
+      FN_TEST_RENAMER_URLS: http://renamer-1:8080,http://renamer-2:8080
+      FN_TEST_FAULT_URL: http://watcher-storage-fault:8080
+      FN_TEST_RABBITMQ_MGMT_URL: http://rabbitmq:15672
+      # Must match log_min_duration_statement in the primary's configuration.
+      FN_TEST_SLOW_STATEMENT_MS: "1000"
+      FN_TEST_NO_SCHEMA_URL: http://renamer-no-schema:8080
+      FN_TEST_EVIDENCE_DIR: /evidence
+    secrets: [fn_db_password, fn_amqp_password]
+    volumes:
+      - fn-incoming:/srv/fn/incoming
+      - fn-queued:/srv/fn/queued
+      - fn-staging:/srv/fn/staging
+      - fn-consume:/srv/fn/consume
+      - fn-failed:/srv/fn/failed
+      - ../../extensions/filename-normalizer/.evidence:/evidence
+    networks: [fn]
+    profiles: [test]
+    restart: "no"

@@ -1,0 +1,487 @@
+// Package config loads and validates both applications' runtime configuration.
+//
+// Configuration comes only from the environment. Every secret may instead be
+// supplied through a "<VAR>_FILE" indirection so that credentials arrive as a
+// mounted file rather than an inherited environment variable, and no secret is
+// ever placed in the loggable summary produced by Summary.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Application distinguishes the two executables.
+type Application string
+
+const (
+	// AppWatcher hosts dispatch and completion-accounting workers.
+	AppWatcher Application = "watcher"
+	// AppRenamer consumes jobs and is independently scalable.
+	AppRenamer Application = "renamer"
+)
+
+// Common holds settings both applications share.
+type Common struct {
+	Application     Application
+	Instance        string
+	LogLevel        string
+	HTTPAddr        string
+	ShutdownTimeout time.Duration
+	Database        Database
+	Broker          Broker
+	Storage         Storage
+}
+
+// Database describes the PostgreSQL cluster endpoints.
+//
+// The primary is required. The replica is a distinct endpoint because the
+// deployed topology is a streaming primary/standby pair: the applications must
+// be able to observe the standby without treating it as interchangeable with
+// the primary.
+type Database struct {
+	PrimaryHost     string
+	PrimaryPort     int
+	ReplicaHost     string
+	ReplicaPort     int
+	ReplicaRequired bool
+	Name            string
+	User            string
+	Password        string
+	SSLMode         string
+	MaxConns        int
+	ConnectTimeout  time.Duration
+	ApplyMigrations bool
+}
+
+// Broker describes the RabbitMQ endpoint and the durable topology.
+type Broker struct {
+	Host           string
+	Port           int
+	VHost          string
+	User           string
+	Password       string
+	Exchange       string
+	Queue          string
+	RoutingKey     string
+	DeadLetterX    string
+	DeadLetterQ    string
+	DeliveryLimit  int
+	ConfirmTimeout time.Duration
+	DialTimeout    time.Duration
+	Heartbeat      time.Duration
+	ReconnectDelay time.Duration
+}
+
+// Storage lists the configured filesystem roles.
+//
+// Roles are probed for availability, never merely listed. An unreadable or
+// unmounted root must be reported as unavailable storage and must never be
+// interpreted as an empty directory.
+type Storage struct {
+	Incoming string
+	Queued   string
+	Staging  string
+	Consume  string
+	Failed   string
+	Required bool
+}
+
+// RolesFor returns the configured roots with the access each application
+// actually needs, in a stable order.
+//
+// The split is least privilege, and it is behavioural rather than cosmetic:
+// the watcher must not be able to write into the consumer's directory, because
+// publication belongs to the renamer. The deployment mounts consume read-only
+// for the watcher, and the probe below expects exactly that.
+func (s Storage) RolesFor(app Application) []Role {
+	write := func(name, path string) Role { return Role{Name: name, Path: path, WriteRequired: true} }
+	read := func(name, path string) Role { return Role{Name: name, Path: path} }
+
+	roles := []Role{
+		read("incoming", s.Incoming),
+		write("queued", s.Queued),
+		write("staging", s.Staging),
+		write("failed", s.Failed),
+	}
+	switch app {
+	case AppRenamer:
+		roles = append(roles, write("consume", s.Consume))
+	default:
+		roles = append(roles, read("consume", s.Consume))
+	}
+	return roles
+}
+
+// Role is one configured storage role.
+type Role struct {
+	Name string
+	Path string
+	// WriteRequired marks a role this application must be able to write.
+	WriteRequired bool
+}
+
+// WatcherConfig is the watcher application's configuration.
+type WatcherConfig struct {
+	Common
+	// DiscoveryEnabled must be false in this increment. Discovery of completed
+	// submissions is not implemented, and enabling the flag is a hard startup
+	// error rather than a silently inert setting.
+	DiscoveryEnabled    bool
+	DispatchInterval    time.Duration
+	DispatchBatch       int
+	DispatchClaimMaxAge time.Duration
+	AccountingInterval  time.Duration
+}
+
+// RenamerConfig is the renamer application's configuration.
+type RenamerConfig struct {
+	Common
+	// Concurrency bounds simultaneous in-flight deliveries per instance.
+	Concurrency int
+	// Prefetch is the AMQP QoS window; it defaults to Concurrency so an
+	// instance never buffers work it has no capacity to process.
+	Prefetch int
+}
+
+// ValidationError collects every configuration problem at once so an operator
+// sees the whole list instead of fixing one variable per restart.
+type ValidationError struct{ Problems []string }
+
+func (e *ValidationError) Error() string {
+	return fmt.Sprintf("invalid configuration: %s", strings.Join(e.Problems, "; "))
+}
+
+type loader struct {
+	problems []string
+}
+
+func (l *loader) fail(format string, args ...any) {
+	l.problems = append(l.problems, fmt.Sprintf(format, args...))
+}
+
+// lookup reads VAR, or the contents of the file named by VAR_FILE.
+func (l *loader) lookup(key string) (string, bool) {
+	if path, ok := os.LookupEnv(key + "_FILE"); ok && strings.TrimSpace(path) != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			l.fail("%s_FILE is not readable", key)
+			return "", false
+		}
+		return strings.TrimRight(string(data), "\r\n"), true
+	}
+	v, ok := os.LookupEnv(key)
+	return v, ok
+}
+
+func (l *loader) str(key, def string) string {
+	v, ok := l.lookup(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
+}
+
+func (l *loader) required(key string) string {
+	v, ok := l.lookup(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		l.fail("%s is required", key)
+		return ""
+	}
+	return v
+}
+
+func (l *loader) intVal(key string, def, min, max int) int {
+	raw, ok := l.lookup(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return def
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		l.fail("%s must be an integer", key)
+		return def
+	}
+	if n < min || n > max {
+		l.fail("%s must be between %d and %d", key, min, max)
+		return def
+	}
+	return n
+}
+
+func (l *loader) boolVal(key string, def bool) bool {
+	raw, ok := l.lookup(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil {
+		l.fail("%s must be a boolean", key)
+		return def
+	}
+	return b
+}
+
+func (l *loader) duration(key string, def, min, max time.Duration) time.Duration {
+	raw, ok := l.lookup(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return def
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		l.fail("%s must be a Go duration such as 30s", key)
+		return def
+	}
+	if d < min || d > max {
+		l.fail("%s must be between %s and %s", key, min, max)
+		return def
+	}
+	return d
+}
+
+func (l *loader) absPath(key, def string) string {
+	v := l.str(key, def)
+	if v == "" {
+		l.fail("%s is required", key)
+		return ""
+	}
+	if !strings.HasPrefix(v, "/") {
+		l.fail("%s must be an absolute path", key)
+	}
+	return v
+}
+
+func (l *loader) common(app Application) Common {
+	host, _ := os.Hostname()
+	if host == "" {
+		host = string(app)
+	}
+
+	c := Common{
+		Application:     app,
+		Instance:        l.str("FN_INSTANCE", host),
+		LogLevel:        l.str("FN_LOG_LEVEL", "info"),
+		HTTPAddr:        l.str("FN_HTTP_ADDR", ":8080"),
+		ShutdownTimeout: l.duration("FN_SHUTDOWN_TIMEOUT", 20*time.Second, time.Second, 5*time.Minute),
+	}
+
+	c.Database = Database{
+		PrimaryHost:     l.required("FN_DB_PRIMARY_HOST"),
+		PrimaryPort:     l.intVal("FN_DB_PRIMARY_PORT", 5432, 1, 65535),
+		ReplicaHost:     l.str("FN_DB_REPLICA_HOST", ""),
+		ReplicaPort:     l.intVal("FN_DB_REPLICA_PORT", 5432, 1, 65535),
+		ReplicaRequired: l.boolVal("FN_DB_REPLICA_REQUIRED", false),
+		Name:            l.required("FN_DB_NAME"),
+		User:            l.required("FN_DB_USER"),
+		Password:        l.required("FN_DB_PASSWORD"),
+		SSLMode:         l.str("FN_DB_SSLMODE", "disable"),
+		MaxConns:        l.intVal("FN_DB_MAX_CONNS", 8, 1, 200),
+		ConnectTimeout:  l.duration("FN_DB_CONNECT_TIMEOUT", 5*time.Second, time.Second, time.Minute),
+		ApplyMigrations: l.boolVal("FN_DB_APPLY_MIGRATIONS", app == AppWatcher),
+	}
+	switch c.Database.SSLMode {
+	case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
+	default:
+		l.fail("FN_DB_SSLMODE is not a recognised libpq sslmode")
+	}
+	if c.Database.ReplicaRequired && c.Database.ReplicaHost == "" {
+		l.fail("FN_DB_REPLICA_REQUIRED is set but FN_DB_REPLICA_HOST is empty")
+	}
+
+	exchange := l.str("FN_AMQP_EXCHANGE", "filename_normalizer.jobs")
+	c.Broker = Broker{
+		Host:           l.required("FN_AMQP_HOST"),
+		Port:           l.intVal("FN_AMQP_PORT", 5672, 1, 65535),
+		VHost:          l.str("FN_AMQP_VHOST", "/"),
+		User:           l.required("FN_AMQP_USER"),
+		Password:       l.required("FN_AMQP_PASSWORD"),
+		Exchange:       exchange,
+		Queue:          l.str("FN_AMQP_QUEUE", "filename_normalizer.jobs.v1"),
+		RoutingKey:     l.str("FN_AMQP_ROUTING_KEY", "normalize"),
+		DeadLetterX:    l.str("FN_AMQP_DLX", exchange+".dlx"),
+		DeadLetterQ:    l.str("FN_AMQP_DEAD_LETTER_QUEUE", "filename_normalizer.jobs.v1.dead"),
+		DeliveryLimit:  l.intVal("FN_AMQP_DELIVERY_LIMIT", 5, 1, 100),
+		ConfirmTimeout: l.duration("FN_AMQP_CONFIRM_TIMEOUT", 10*time.Second, time.Second, time.Minute),
+		DialTimeout:    l.duration("FN_AMQP_DIAL_TIMEOUT", 5*time.Second, time.Second, time.Minute),
+		Heartbeat:      l.duration("FN_AMQP_HEARTBEAT", 10*time.Second, time.Second, time.Minute),
+		ReconnectDelay: l.duration("FN_AMQP_RECONNECT_DELAY", 2*time.Second, 100*time.Millisecond, time.Minute),
+	}
+
+	c.Storage = Storage{
+		Incoming: l.absPath("FN_STORAGE_INCOMING", "/var/lib/filename-normalizer/incoming"),
+		Queued:   l.absPath("FN_STORAGE_QUEUED", "/var/lib/filename-normalizer/queued"),
+		Staging:  l.absPath("FN_STORAGE_STAGING", "/var/lib/filename-normalizer/staging"),
+		Consume:  l.absPath("FN_STORAGE_CONSUME", "/var/lib/filename-normalizer/consume"),
+		Failed:   l.absPath("FN_STORAGE_FAILED", "/var/lib/filename-normalizer/failed"),
+		Required: l.boolVal("FN_STORAGE_REQUIRED", true),
+	}
+
+	// Destructive cleanup is explicitly unresolved policy. Refusing to start is
+	// safer than accepting a flag that has no implementation behind it.
+	if l.boolVal("FN_CLEANUP_ENABLED", false) {
+		l.fail("FN_CLEANUP_ENABLED is not supported: source deletion and ledger purging are unresolved policy and are not implemented")
+	}
+
+	if _, ok := levelNames[strings.ToLower(c.LogLevel)]; !ok {
+		l.fail("FN_LOG_LEVEL must be one of debug, info, warn, error")
+	}
+	return c
+}
+
+var levelNames = map[string]struct{}{
+	"debug": {}, "info": {}, "warn": {}, "warning": {}, "error": {},
+}
+
+// LoadWatcher reads the watcher configuration from the environment.
+func LoadWatcher() (WatcherConfig, error) {
+	l := &loader{}
+	cfg := WatcherConfig{Common: l.common(AppWatcher)}
+	cfg.DiscoveryEnabled = l.boolVal("FN_WATCHER_DISCOVERY_ENABLED", false)
+	if cfg.DiscoveryEnabled {
+		l.fail("FN_WATCHER_DISCOVERY_ENABLED is not supported in this build: incoming discovery is not implemented")
+	}
+	cfg.DispatchInterval = l.duration("FN_WATCHER_DISPATCH_INTERVAL", time.Second, 50*time.Millisecond, 5*time.Minute)
+	cfg.DispatchBatch = l.intVal("FN_WATCHER_DISPATCH_BATCH", 32, 1, 1000)
+	cfg.DispatchClaimMaxAge = l.duration("FN_WATCHER_DISPATCH_CLAIM_MAX_AGE", 60*time.Second, 5*time.Second, time.Hour)
+	cfg.AccountingInterval = l.duration("FN_WATCHER_ACCOUNTING_INTERVAL", 5*time.Second, time.Second, 5*time.Minute)
+	if len(l.problems) > 0 {
+		sort.Strings(l.problems)
+		return WatcherConfig{}, &ValidationError{Problems: l.problems}
+	}
+	return cfg, nil
+}
+
+// LoadRenamer reads the renamer configuration from the environment.
+func LoadRenamer() (RenamerConfig, error) {
+	l := &loader{}
+	cfg := RenamerConfig{Common: l.common(AppRenamer)}
+	cfg.Concurrency = l.intVal("FN_RENAMER_CONCURRENCY", 1, 1, 64)
+	cfg.Prefetch = l.intVal("FN_RENAMER_PREFETCH", cfg.Concurrency, 1, 1000)
+	if cfg.Prefetch < cfg.Concurrency {
+		l.fail("FN_RENAMER_PREFETCH must be at least FN_RENAMER_CONCURRENCY")
+	}
+	if len(l.problems) > 0 {
+		sort.Strings(l.problems)
+		return RenamerConfig{}, &ValidationError{Problems: l.problems}
+	}
+	return cfg, nil
+}
+
+// DSN renders the primary connection string, with every value quoted.
+func (d Database) DSN() string { return d.dsn(d.PrimaryHost, d.PrimaryPort) }
+
+// ReplicaDSN renders the standby connection string, or "" when none is set.
+func (d Database) ReplicaDSN() string {
+	if d.ReplicaHost == "" {
+		return ""
+	}
+	return d.dsn(d.ReplicaHost, d.ReplicaPort)
+}
+
+func (d Database) dsn(host string, port int) string {
+	// Every value is single-quoted with backslash escaping, which is the libpq
+	// keyword/value quoting rule. This is not cosmetic: a perfectly valid
+	// password containing a space would otherwise terminate the password
+	// parameter early and turn the remainder into further parameters, so the
+	// connection would either fail or — worse — be made with different
+	// settings than intended. Generated alphanumeric development passwords
+	// never exercise that, which is exactly why it has to be handled here
+	// rather than relied upon not to happen.
+	//
+	// The result contains the password and must never be logged; use Summary
+	// for anything that reaches an output stream.
+	return strings.Join([]string{
+		"host=" + quoteDSNValue(host),
+		"port=" + quoteDSNValue(strconv.Itoa(port)),
+		"dbname=" + quoteDSNValue(d.Name),
+		"user=" + quoteDSNValue(d.User),
+		"password=" + quoteDSNValue(d.Password),
+		"sslmode=" + quoteDSNValue(d.SSLMode),
+		"connect_timeout=" + quoteDSNValue(strconv.Itoa(int(d.ConnectTimeout.Seconds()))),
+		"application_name=" + quoteDSNValue("filename-normalizer"),
+	}, " ")
+}
+
+// quoteDSNValue renders one libpq keyword/value parameter value.
+//
+// Per the libpq connection-string rules, a value is surrounded by single
+// quotes, and within them a backslash or a single quote is escaped with a
+// backslash. Quoting unconditionally also covers the empty-value case.
+func quoteDSNValue(v string) string {
+	var b strings.Builder
+	b.Grow(len(v) + 2)
+	b.WriteByte('\'')
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; c == '\\' || c == '\'' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(v[i])
+	}
+	b.WriteByte('\'')
+	return b.String()
+}
+
+// URI renders the AMQP endpoint, percent-encoding the userinfo so a password
+// containing a colon, slash, at-sign or space cannot change which host or
+// vhost is addressed. It contains the password and must never be logged; use
+// Summary for anything that reaches an output stream.
+func (b Broker) URI() string {
+	return fmt.Sprintf("amqp://%s:%s@%s:%d%s", urlEscape(b.User), urlEscape(b.Password), b.Host, b.Port, normalizeVHost(b.VHost))
+}
+
+func normalizeVHost(v string) string {
+	if v == "" || v == "/" {
+		return "/"
+	}
+	if strings.HasPrefix(v, "/") {
+		return "/" + urlEscape(strings.TrimPrefix(v, "/"))
+	}
+	return "/" + urlEscape(v)
+}
+
+func urlEscape(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '-', c == '_', c == '.', c == '~':
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
+// Summary returns the loggable view of the configuration. It deliberately
+// omits every credential; a test asserts that no secret value appears in it.
+func (c Common) Summary() map[string]any {
+	return map[string]any{
+		"application":         string(c.Application),
+		"instance":            c.Instance,
+		"host":                c.Database.PrimaryHost,
+		"port":                c.Database.PrimaryPort,
+		"database":            c.Database.Name,
+		"replica_host":        c.Database.ReplicaHost,
+		"replica_port":        c.Database.ReplicaPort,
+		"replica_required":    c.Database.ReplicaRequired,
+		"tls":                 c.Database.SSLMode,
+		"exchange":            c.Broker.Exchange,
+		"queue":               c.Broker.Queue,
+		"routing_key":         c.Broker.RoutingKey,
+		"dlx":                 c.Broker.DeadLetterX,
+		"dead_letter_queue":   c.Broker.DeadLetterQ,
+		"vhost":               c.Broker.VHost,
+		"max_attempts":        c.Broker.DeliveryLimit,
+		"shutdown_timeout_ms": c.ShutdownTimeout.Milliseconds(),
+		"addr":                c.HTTPAddr,
+	}
+}
+
+// ErrNoConfig is returned when a required variable set is entirely absent.
+var ErrNoConfig = errors.New("no configuration present in the environment")
