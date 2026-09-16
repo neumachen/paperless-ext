@@ -43,6 +43,14 @@ x-app-env: &app-env
   FN_STORAGE_FAILED: /srv/fn/failed
   FN_STORAGE_REQUIRED: "true"
 
+  # The declarative configuration. Everything an operator is expected to tune
+  # -- selection patterns, the naming policy, discovery and completion
+  # behaviour -- lives here rather than in a dozen environment variables. The
+  # variables above still win over it, which is how one instance can be tuned
+  # differently from its siblings. Credentials are not in it and cannot be:
+  # the schema has no field to hold one.
+  FN_CONFIG_FILE: /etc/fn/normalizer.json
+
 x-app-hardening: &app-hardening
   user: "65532:65532"
   read_only: true
@@ -238,6 +246,7 @@ services:
       FN_WATCHER_ACCOUNTING_INTERVAL: ${FN_WATCHER_ACCOUNTING_INTERVAL:-2s}
     secrets: [fn_db_password, fn_amqp_password]
     volumes:
+      - ./config:/etc/fn:ro
       - fn-incoming:/srv/fn/incoming:ro
       - fn-queued:/srv/fn/queued
       - fn-staging:/srv/fn/staging
@@ -291,6 +300,7 @@ services:
       FN_RENAMER_CONCURRENCY: ${FN_RENAMER_CONCURRENCY:-2}
     secrets: [fn_db_password, fn_amqp_password]
     volumes:
+      - ./config:/etc/fn:ro
       - fn-incoming:/srv/fn/incoming:ro
       - fn-queued:/srv/fn/queued
       - fn-staging:/srv/fn/staging
@@ -388,6 +398,7 @@ services:
       FN_RENAMER_CONCURRENCY: "1"
     secrets: [fn_db_password, fn_amqp_password]
     volumes:
+      - ./config:/etc/fn:ro
       - fn-incoming:/srv/fn/incoming:ro
       - fn-queued:/srv/fn/queued
       - fn-staging:/srv/fn/staging
