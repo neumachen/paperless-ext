@@ -4,9 +4,18 @@
 
 ## Initial extension
 
-The first planned extension is a filename normalizer that prepares documents before Paperless consumes them. It will normalize human-readable filenames, coordinate durable jobs through RabbitMQ, and safely move completed files between directories on an SMB share.
+The first planned extension is a filename normalizer that prepares documents before Paperless consumes them. One watcher registers completed uploads; RabbitMQ distributes jobs to a configurable pool of workers that preserve Unicode, normalize filenames, and safely publish complete documents. Incoming and consumption directories may reside on different filesystems.
 
 See [Filename Normalizer Requirements](docs/filename-normalizer-requirements.md).
+
+## Working agreement
+
+ChatGPT owns requirements, architectural boundaries, acceptance criteria, and
+evidence review. The implementation agent owns code, tests, packaging, and
+implementation choices within those boundaries.
+
+- [Development roles and decisions](docs/development-workflow.md)
+- [First implementation handoff](docs/implementation-handoff-001.md)
 
 ## Repository layout
 
