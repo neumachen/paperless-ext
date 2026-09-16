@@ -1,14 +1,14 @@
 // Package watcher is the watcher application.
 //
-// It hosts two workers in this increment:
+// It hosts three workers:
 //
 //   - dispatch: publishes durable jobs that still owe a broker publication,
 //     and returns stranded claims to the pending set.
+//
 //   - accounting: aggregates the ledger into the exposed metrics.
 //
-// Incoming discovery is the third worker this process is intended to host. It
-// is not implemented here, and enabling it is a startup error rather than an
-// inert flag.
+//   - discovery: registers eligible completed submissions from the incoming
+//     root, and reconciles work that arrived while this process was down.
 package watcher
 
 import (
@@ -64,10 +64,8 @@ func (a *App) Run(ctx context.Context) int {
 	accountant := NewAccountant(a.base, a.cfg)
 	sup.Add("accounting", accountant.Run)
 
-	log.Warn("incoming discovery is not implemented in this build",
-		slog.String("event", "discovery_unimplemented"),
-		slog.String("worker", "discovery"),
-		slog.String("category", "normalization_unimplemented"))
+	discoverer := NewDiscoverer(a.base, a.cfg)
+	sup.Add("discovery", discoverer.Run)
 
 	sup.OnDrain(func(context.Context) {
 		a.base.Health.SetNotReady("shutting_down")

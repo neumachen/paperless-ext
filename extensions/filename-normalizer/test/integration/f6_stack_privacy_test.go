@@ -91,6 +91,7 @@ func TestF6SlowRegistrationDoesNotLeakIntoDatabaseLogs(t *testing.T) {
 		SizeBytes:       &size,
 		FingerprintAlgo: &algo,
 		Fingerprint:     fingerprintBytes[:],
+		PolicyIdentity:  e.Cfg.Policy.Identity,
 	})
 	elapsed := time.Since(start)
 	wg.Wait()

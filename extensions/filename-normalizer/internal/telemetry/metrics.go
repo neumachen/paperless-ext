@@ -54,7 +54,19 @@ type Metrics struct {
 	DispatchConfirmed prometheus.Counter
 	DispatchReclaimed prometheus.Counter
 
-	Deliveries       *prometheus.CounterVec
+	Deliveries *prometheus.CounterVec
+	// Published counts documents that reached the consume directory with a
+	// durable receipt. It is the only counter that means "a document was
+	// delivered"; every other outcome is explicitly something else.
+	Published         prometheus.Counter
+	PublishedBytes    prometheus.Counter
+	CollisionSuffixes prometheus.Counter
+	Discovered        *prometheus.CounterVec
+	DiscoveryRuns     *prometheus.CounterVec
+	// DiscoveryLastRun distinguishes "idle" from "not running": a watcher that
+	// is up but whose discovery worker has stopped leaves this timestamp
+	// behind while ordinary idleness keeps advancing it.
+	DiscoveryLastRun prometheus.Gauge
 	Redeliveries     prometheus.Counter
 	DeliveryInFlight prometheus.Gauge
 	DeliverySeconds  prometheus.Histogram
@@ -216,6 +228,35 @@ func New(app, instance, policyIdentity string) *Metrics {
 		policyIdentity, contractVersionLabel(), buildinfo.SourceDigest,
 	).Set(1)
 
+	m.Published = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "fn_documents_published_total",
+		Help: "Documents linked into the consume directory with a durable receipt.",
+	})
+	m.PublishedBytes = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "fn_documents_published_bytes_total",
+		Help: "Bytes of document content published.",
+	})
+	m.CollisionSuffixes = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "fn_destination_collisions_total",
+		Help: "Times a destination candidate was already taken and the next was tried.",
+	})
+	m.Discovered = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "fn_discovery_outcomes_total",
+		Help: "Incoming entries examined by discovery, by outcome.",
+	}, []string{"outcome"})
+	m.DiscoveryRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "fn_discovery_runs_total",
+		Help: "Discovery scans, by outcome.",
+	}, []string{"outcome"})
+	m.DiscoveryLastRun = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "fn_discovery_last_run_timestamp_seconds",
+		Help: "Unix time of the last completed discovery scan. Stays at 0 until one completes.",
+	})
+	m.Registry.MustRegister(
+		m.Published, m.PublishedBytes, m.CollisionSuffixes,
+		m.Discovered, m.DiscoveryRuns, m.DiscoveryLastRun,
+	)
+
 	m.preinitialise()
 	return m
 }
@@ -243,7 +284,12 @@ func (m *Metrics) preinitialise() {
 	}
 	for _, o := range []string{"ok", "error"} {
 		m.AccountingRuns.WithLabelValues(o)
+		m.DiscoveryRuns.WithLabelValues(o)
 	}
+	for _, o := range DiscoveryOutcomes() {
+		m.Discovered.WithLabelValues(o)
+	}
+	m.DiscoveryLastRun.Set(0)
 	for _, k := range logging.ErrorKinds() {
 		m.LedgerErrors.WithLabelValues(k)
 	}
@@ -265,7 +311,21 @@ func (m *Metrics) preinitialise() {
 // never emits a "delivered" outcome, because nothing is published to a
 // consume directory yet.
 func DeliveryOutcomes() []string {
-	return []string{"held", "requeued", "dead_lettered", "rejected_unknown_job", "rejected_contract"}
+	return []string{
+		"delivered", "reconciled", "uncertain", "dry_run",
+		"held", "requeued", "dead_lettered",
+		"rejected_unknown_job", "rejected_contract",
+	}
+}
+
+// DiscoveryOutcomes is the closed set of per-entry discovery results.
+func DiscoveryOutcomes() []string {
+	return []string{
+		"registered", "already_registered", "unstable", "too_large",
+		"hidden_file", "symlink", "not_regular_file", "escapes_root",
+		"unsafe_name", "temporary_suffix", "excluded_by_pattern",
+		"not_included", "directory", "permission_denied", "storage_error",
+	}
 }
 
 // StorageStatuses is the closed set of storage probe results.

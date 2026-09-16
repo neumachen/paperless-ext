@@ -24,15 +24,18 @@ const (
 	StateDispatched State = "dispatched"
 	// StateProcessing means a renamer has taken ownership of a delivery.
 	StateProcessing State = "processing"
-	// StateHeld means a durably recorded hold that requires intervention. It is
-	// a safe terminal outcome for this increment: it never claims delivery.
+	// StatePublishing means a destination is reserved and the link into the
+	// consume directory has been attempted. A job found here after a crash may
+	// or may not have been published, which is exactly why the state exists.
+	StatePublishing State = "publishing"
+	// StateHeld means a durably recorded hold that requires intervention. It
+	// never claims delivery.
 	StateHeld State = "held"
-	// StateDelivered means a durable delivery receipt exists. No code path in
-	// this increment produces this state; it is reserved for the normalization
-	// milestone and asserted to remain empty by the integration suite.
+	// StateDelivered means a durable delivery receipt exists.
 	StateDelivered State = "delivered"
-	// StateUncertain means the outcome could not be established. No code path in
-	// this increment produces this state either.
+	// StateUncertain means a publication may have happened but no receipt
+	// exists to prove it. It is terminal without intervention, and it never
+	// triggers redelivery: the document may already be with the consumer.
 	StateUncertain State = "uncertain"
 )
 
@@ -44,6 +47,7 @@ func States() []State {
 		StateDispatching,
 		StateDispatched,
 		StateProcessing,
+		StatePublishing,
 		StateHeld,
 		StateDelivered,
 		StateUncertain,
@@ -68,10 +72,46 @@ func ParseState(s string) (State, error) {
 type Category string
 
 const (
-	// CategoryNormalizationUnimplemented records that a delivery reached a
-	// renamer but normalization does not exist yet in this increment. It is an
-	// honest hold, not a success.
-	CategoryNormalizationUnimplemented Category = "normalization_unimplemented"
+	// CategorySourceMutated records a submission whose bytes or identity
+	// changed after it was registered.
+	CategorySourceMutated Category = "source_mutated"
+	// CategorySourceAbsent records a submission that disappeared before it
+	// could be copied.
+	CategorySourceAbsent Category = "source_absent"
+	// CategoryMissingExtension and the three that follow come from the naming
+	// policy refusing to name a file rather than guessing.
+	CategoryMissingExtension Category = "missing_extension"
+	// CategoryInvalidExtension records an extension outside the accepted shape.
+	CategoryInvalidExtension Category = "invalid_extension"
+	// CategoryNameTooLong records a name that cannot be shortened to fit.
+	CategoryNameTooLong Category = "name_too_long"
+	// CategoryPolicyNotIdempotent records configured rules that do not converge.
+	CategoryPolicyNotIdempotent Category = "policy_not_idempotent"
+	// CategoryNormalizationFailed is the residual naming failure.
+	CategoryNormalizationFailed Category = "normalization_failed"
+	// CategoryPolicyMismatch records a delivery whose job was accepted under a
+	// different naming policy than this process is running. Renaming it here
+	// would silently reinterpret queued work.
+	CategoryPolicyMismatch Category = "policy_version_mismatch"
+	// CategoryRetryExhausted records a job that used its delivery budget.
+	CategoryRetryExhausted Category = "retry_exhausted"
+	// CategoryCollisionExhausted records a collision sequence that ran out.
+	CategoryCollisionExhausted Category = "collision_exhausted"
+	// CategoryDestinationConflict records a destination occupied by content
+	// that is not this job's. Nothing is overwritten.
+	CategoryDestinationConflict Category = "destination_conflict"
+	// CategoryStorageUnavailable records an unreadable or unmounted root. It is
+	// never interpreted as an empty directory.
+	CategoryStorageUnavailable Category = "storage_unavailable"
+	// CategoryPermissionDenied records a permission failure.
+	CategoryPermissionDenied Category = "permission_denied"
+	// CategoryStorageError is the residual filesystem failure.
+	CategoryStorageError Category = "storage_error"
+	// CategoryPublicationUncertain records that a publication was attempted but
+	// no receipt exists. Redelivery is refused.
+	CategoryPublicationUncertain Category = "publication_uncertain"
+	// CategoryDryRun records a job a dry run examined without acting.
+	CategoryDryRun Category = "dry_run"
 	// CategoryUnknownJob records a broker message referencing no ledger row.
 	CategoryUnknownJob Category = "unknown_job"
 	// CategoryUnsupportedContract records an unparseable or future message.
@@ -82,10 +122,28 @@ const (
 	CategoryLedgerUnavailable Category = "ledger_unavailable"
 )
 
+// String renders the category for logs and metric labels.
+func (c Category) String() string { return string(c) }
+
 // Categories lists every category emitted by this increment.
 func Categories() []Category {
 	return []Category{
-		CategoryNormalizationUnimplemented,
+		CategorySourceMutated,
+		CategorySourceAbsent,
+		CategoryMissingExtension,
+		CategoryInvalidExtension,
+		CategoryNameTooLong,
+		CategoryPolicyNotIdempotent,
+		CategoryNormalizationFailed,
+		CategoryPolicyMismatch,
+		CategoryRetryExhausted,
+		CategoryCollisionExhausted,
+		CategoryDestinationConflict,
+		CategoryStorageUnavailable,
+		CategoryPermissionDenied,
+		CategoryStorageError,
+		CategoryPublicationUncertain,
+		CategoryDryRun,
 		CategoryUnknownJob,
 		CategoryUnsupportedContract,
 		CategoryDispatchReclaimed,
@@ -111,6 +169,26 @@ const (
 	EventDeliveryReceived EventType = "delivery_received"
 	// EventHeld is written when a job reaches a durably recorded hold.
 	EventHeld EventType = "held"
+	// EventDiscovered is written when discovery registers a submission.
+	EventDiscovered EventType = "discovered"
+	// EventNormalized is written when a name has been computed.
+	EventNormalized EventType = "normalized"
+	// EventReserved is written when a destination name becomes exclusive.
+	EventReserved EventType = "reserved"
+	// EventReservationBlocked is written when a reserved name turned out to be
+	// occupied by a file this job did not publish.
+	EventReservationBlocked EventType = "reservation_blocked"
+	// EventPublishAttempted is written immediately before the destination link.
+	EventPublishAttempted EventType = "publish_attempted"
+	// EventDelivered is written with the durable delivery receipt.
+	EventDelivered EventType = "delivered"
+	// EventReconciled is written when recovery established an existing
+	// destination as this job's own work, without republishing.
+	EventReconciled EventType = "reconciled"
+	// EventUncertain is written when a publication may have happened.
+	EventUncertain EventType = "uncertain"
+	// EventDryRun is written when a dry run examined a job without acting.
+	EventDryRun EventType = "dry_run"
 )
 
 // SafeIdentifier reports whether a string is safe to use as a metric label
