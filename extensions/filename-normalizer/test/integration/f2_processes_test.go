@@ -343,8 +343,8 @@ func minTime(a, b time.Time) time.Time {
 }
 
 // TestF2WatcherReportsDiscoveryAsUnimplemented asserts the watcher does not
-// present an unimplemented worker as operational.
-func TestF2WatcherReportsDiscoveryAsUnimplemented(t *testing.T) {
+// report a worker as running when it is not.
+func TestF2WatcherReportsItsDiscoveryWorkerState(t *testing.T) {
 	e := Suite()
 	e.OnlyIn(t, PhaseTelemetry)
 
@@ -355,15 +355,25 @@ func TestF2WatcherReportsDiscoveryAsUnimplemented(t *testing.T) {
 		if json.Unmarshal([]byte(ln), &rec) != nil {
 			continue
 		}
-		if rec["event"] == "discovery_unimplemented" {
+		// Discovery is implemented now. The worker must say which of the two
+		// states it is in -- running, or switched off by configuration -- so
+		// an operator can tell "no work arrived" from "nothing is looking".
+		switch rec["event"] {
+		case "discovery_started":
 			found = true
-			if rec["level"] != "WARN" {
-				t.Errorf("discovery_unimplemented was logged at level %v, expected WARN", rec["level"])
+			for _, key := range []string{"completion_contract", "interval_seconds", "stability_seconds"} {
+				if _, ok := rec[key]; !ok {
+					t.Errorf("discovery_started omits %s: %v", key, rec)
+				}
 			}
+		case "discovery_disabled":
+			found = true
+		case "discovery_unimplemented":
+			t.Errorf("the watcher still reports discovery as unimplemented: %v", rec)
 		}
 	}
 	if !found {
-		t.Errorf("the watcher never reported that incoming discovery is unimplemented")
+		t.Errorf("the watcher never reported whether its discovery worker is running")
 	}
 }
 

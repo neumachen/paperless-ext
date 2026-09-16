@@ -110,13 +110,50 @@ func TestClosedLabelSpaceIsPreInitialised(t *testing.T) {
 	}
 }
 
-func TestDeliveryOutcomesNeverClaimDelivery(t *testing.T) {
-	// This increment publishes nothing, so no outcome may read as a delivery
-	// to the consumer directory.
+// TestDeliveryOutcomesDistinguishDeliveryFromEverythingElse replaces an
+// earlier test that forbade a "delivered" outcome entirely, which was correct
+// while nothing could be published. Publication exists now, so the property
+// worth protecting is different: exactly one outcome may read as a delivery,
+// and the outcomes that are explicitly NOT deliveries must stay distinct from
+// it. A held or uncertain job must never be counted as a delivered one.
+func TestDeliveryOutcomesDistinguishDeliveryFromEverythingElse(t *testing.T) {
+	outcomes := map[string]bool{}
 	for _, o := range DeliveryOutcomes() {
-		if o == "delivered" || o == "published" || o == "completed" {
-			t.Errorf("the outcome set includes %q, which this increment cannot produce", o)
+		if outcomes[o] {
+			t.Errorf("duplicate delivery outcome %q", o)
 		}
+		outcomes[o] = true
+	}
+	// The one outcome that means a document reached the consume directory.
+	if !outcomes["delivered"] {
+		t.Error("no outcome records an actual delivery")
+	}
+	// Outcomes that must exist and must not be conflated with it.
+	for _, o := range []string{"reconciled", "uncertain", "dry_run", "held", "requeued"} {
+		if !outcomes[o] {
+			t.Errorf("the outcome set is missing %q", o)
+		}
+	}
+	// A dry run must never be able to look like a delivery.
+	if outcomes["published"] || outcomes["completed"] {
+		t.Error("the outcome set contains a second delivery-sounding label")
+	}
+}
+
+// TestPublishedCounterIsSeparateFromDeliveryOutcomes: the published counter is
+// the only metric that asserts a document reached the consumer.
+func TestPublishedCounterIsSeparateFromDeliveryOutcomes(t *testing.T) {
+	m := New("renamer", "renamer-1", "v1-candidate-test")
+	families := gather(t, m)
+	if families["fn_documents_published_total"] == nil {
+		t.Error("fn_documents_published_total is not registered")
+	}
+	if families["fn_documents_published_bytes_total"] == nil {
+		t.Error("fn_documents_published_bytes_total is not registered")
+	}
+	// It starts at zero: a freshly started process has published nothing.
+	if v := families["fn_documents_published_total"].GetMetric()[0].GetCounter().GetValue(); v != 0 {
+		t.Errorf("a new process reports %v published documents", v)
 	}
 }
 

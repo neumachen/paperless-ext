@@ -42,6 +42,7 @@ func registerSyntheticJob(t *testing.T, led *ledger.Ledger, e *Env, label string
 		SizeBytes:       &size,
 		FingerprintAlgo: &algo,
 		Fingerprint:     sum[:],
+		PolicyIdentity:  e.Cfg.Policy.Identity,
 	})
 	if err != nil {
 		t.Fatalf("register job through the real ledger: %v", err)

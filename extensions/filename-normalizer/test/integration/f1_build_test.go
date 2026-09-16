@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/buildinfo"
+	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/naming"
 )
 
 // F1 — reproducible container-only development.
@@ -42,6 +42,7 @@ func TestF1ApplicationsReportPinnedBuildIdentity(t *testing.T) {
 	targets := append([]string{e.WatcherURL}, e.RenamerURLs...)
 	var report strings.Builder
 
+	policySeen := ""
 	for _, url := range targets {
 		body, status, err := GetHealth(url)
 		if err != nil || status != 200 {
@@ -70,13 +71,24 @@ func TestF1ApplicationsReportPinnedBuildIdentity(t *testing.T) {
 		if doc.Revision == "" || doc.Revision == "unknown" {
 			t.Logf("%s reports revision %q: the build did not receive a git revision", url, doc.Revision)
 		}
-		// The naming policy is not implemented in this increment. An artefact
-		// claiming a real policy version would be a false claim of capability.
-		if doc.PolicyVersion != buildinfo.PolicyVersion {
-			t.Errorf("%s reports policy_version %q, expected %q", url, doc.PolicyVersion, buildinfo.PolicyVersion)
+		// A naming policy is implemented now, so the honest assertion is the
+		// opposite of the one this test used to make: the process must report
+		// the candidate policy identity it is actually running, and must not
+		// still claim "unimplemented".
+		if doc.PolicyVersion == "unimplemented" {
+			t.Errorf("%s still reports an unimplemented naming policy", url)
 		}
-		if doc.PolicyVersion != "unimplemented" {
-			t.Errorf("%s claims naming policy %q, but no normalization is implemented in this build", url, doc.PolicyVersion)
+		if !strings.HasPrefix(doc.PolicyVersion, naming.PolicyVersion+"+") {
+			t.Errorf("%s reports policy_version %q, expected the running identity to begin with %q+",
+				url, doc.PolicyVersion, naming.PolicyVersion)
+		}
+		// Every application must be running the SAME policy; a mixed stack
+		// would silently name documents two different ways.
+		if policySeen == "" {
+			policySeen = doc.PolicyVersion
+		} else if policySeen != doc.PolicyVersion {
+			t.Errorf("%s reports policy %q while another application reports %q",
+				url, doc.PolicyVersion, policySeen)
 		}
 		report.WriteString(url + " -> " + string(body))
 	}
@@ -106,8 +118,11 @@ func TestF1BuildInfoMetricIsExposed(t *testing.T) {
 				t.Errorf("%s fn_build_info is missing label %s: %s", url, want, labels)
 			}
 		}
-		if !strings.Contains(labels, `policy_version="unimplemented"`) {
-			t.Errorf("%s fn_build_info claims an implemented naming policy: %s", url, labels)
+		if strings.Contains(labels, `policy_version="unimplemented"`) {
+			t.Errorf("%s fn_build_info still reports an unimplemented naming policy: %s", url, labels)
+		}
+		if !strings.Contains(labels, `policy_version="`+naming.PolicyVersion+`+`) {
+			t.Errorf("%s fn_build_info does not report the running policy identity: %s", url, labels)
 		}
 	}
 }

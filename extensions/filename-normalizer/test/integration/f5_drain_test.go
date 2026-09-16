@@ -92,6 +92,7 @@ func TestF5DrainLoadFillsTheWorkQueue(t *testing.T) {
 			SizeBytes:       &size,
 			FingerprintAlgo: &algo,
 			Fingerprint:     sum[:],
+			PolicyIdentity:  e.Cfg.Policy.Identity,
 		})
 		if err != nil {
 			t.Fatalf("register job %d: %v", i, err)

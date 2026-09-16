@@ -57,6 +57,14 @@ type Job struct {
 	DispatchedAt     *time.Time
 	LastDeliveryAt   *time.Time
 	TerminalAt       *time.Time
+	// Source identity as discovery observed it. Used to detect a submission
+	// that was replaced or modified between discovery and publication.
+	SourceInode      *int64
+	SourceDevice     *int64
+	SourceModifiedAt *time.Time
+	// PublishAttemptedAt is set immediately before the destination link, so a
+	// crash during publication is recoverable as "may have published".
+	PublishAttemptedAt *time.Time
 }
 
 // Event is one append-only history row.
@@ -226,6 +234,10 @@ type RegisterInput struct {
 	// running a different policy must refuse the job rather than rename it
 	// under rules the job was not accepted with.
 	PolicyIdentity string
+	// Source identity as discovery observed it.
+	SourceInode      *int64
+	SourceDevice     *int64
+	SourceModifiedAt *time.Time
 }
 
 // RegisterJob makes a submission durable and writes its first history row.
@@ -238,12 +250,14 @@ func (l *Ledger) RegisterJob(ctx context.Context, in RegisterInput) (Job, error)
 		row := tx.QueryRow(ctx, `
 			INSERT INTO jobs (
 				job_id, contract_version, state, source_root, source_name,
-				size_bytes, fingerprint_algorithm, content_fingerprint, policy_version
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				size_bytes, fingerprint_algorithm, content_fingerprint, policy_version,
+				source_inode, source_device, source_modified_at, discovered_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
 			RETURNING `+jobColumns,
 			id, jobs.ContractVersion, string(jobs.StatePendingDispatch),
 			in.SourceRoot, in.SourceName, in.SizeBytes, in.FingerprintAlgo,
-			in.Fingerprint, in.PolicyIdentity)
+			in.Fingerprint, in.PolicyIdentity,
+			in.SourceInode, in.SourceDevice, in.SourceModifiedAt)
 		var scanErr error
 		job, scanErr = scanJob(row)
 		if scanErr != nil {
@@ -753,7 +767,8 @@ const jobColumns = `job_id, contract_version, state, source_root, source_name,
 	size_bytes, fingerprint_algorithm, content_fingerprint, policy_version,
 	normalized_name, reserved_name, dispatch_attempts, delivery_attempts,
 	failure_category, claimed_by, claimed_at, created_at, updated_at,
-	dispatched_at, last_delivery_at, terminal_at`
+	dispatched_at, last_delivery_at, terminal_at,
+	source_inode, source_device, source_modified_at, publish_attempted_at`
 
 func prefixedJobColumns(alias string) string {
 	cols := []string{
@@ -762,6 +777,7 @@ func prefixedJobColumns(alias string) string {
 		"normalized_name", "reserved_name", "dispatch_attempts", "delivery_attempts",
 		"failure_category", "claimed_by", "claimed_at", "created_at", "updated_at",
 		"dispatched_at", "last_delivery_at", "terminal_at",
+		"source_inode", "source_device", "source_modified_at", "publish_attempted_at",
 	}
 	out := make([]string, len(cols))
 	for i, c := range cols {
@@ -793,7 +809,8 @@ func scanJob(row scannable) (Job, error) {
 		&j.SizeBytes, &j.FingerprintAlgo, &j.Fingerprint, &j.PolicyVersion,
 		&j.NormalizedName, &j.ReservedName, &j.DispatchAttempts, &j.DeliveryAttempts,
 		&j.FailureCategory, &j.ClaimedBy, &j.ClaimedAt, &j.CreatedAt, &j.UpdatedAt,
-		&j.DispatchedAt, &j.LastDeliveryAt, &j.TerminalAt)
+		&j.DispatchedAt, &j.LastDeliveryAt, &j.TerminalAt,
+		&j.SourceInode, &j.SourceDevice, &j.SourceModifiedAt, &j.PublishAttemptedAt)
 	if err != nil {
 		return Job{}, err
 	}

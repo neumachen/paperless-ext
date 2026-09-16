@@ -20,12 +20,14 @@ type Processor struct {
 	cfg      config.RenamerConfig
 	log      *slog.Logger
 	consumer *broker.Consumer
+	pipeline *Pipeline
 }
 
 // NewProcessor builds the consumer worker.
 func NewProcessor(base *app.Base, cfg config.RenamerConfig) *Processor {
 	log := base.Log.With(slog.String("component", "consumer"))
 	p := &Processor{base: base, cfg: cfg, log: log}
+	p.pipeline = NewPipeline(cfg, base.Ledger, log, base.Metrics)
 	// Publish the configured bounds so an observer can check in-flight work
 	// against this instance's own limit.
 	base.Metrics.ConcurrencyLimit.Set(float64(cfg.Concurrency))
@@ -141,39 +143,69 @@ func (p *Processor) handle(ctx context.Context, d broker.Delivery) broker.Decisi
 		return broker.NackRequeue
 	}
 
-	if job.State == jobs.StateHeld {
-		// A redelivery of an already-held job. The hold is already durable, so
-		// the delivery is settled without repeating the outcome.
-		p.base.Metrics.Deliveries.WithLabelValues("held").Inc()
-		log.Info("delivery settled against an existing hold",
+	switch job.State {
+	case jobs.StateHeld, jobs.StateDelivered, jobs.StateUncertain:
+		// A redelivery of a job that already reached a durable terminal
+		// outcome. The outcome stands; repeating it would be noise, and
+		// reprocessing it could publish a second copy.
+		outcome := string(job.State)
+		p.base.Metrics.Deliveries.WithLabelValues(terminalLabel(job.State)).Inc()
+		log.Info("delivery settled against an existing terminal outcome",
 			slog.String("event", "delivery_settled"),
-			slog.String("state", string(job.State)),
-			slog.String("outcome", "held"),
-			slog.String("category", string(jobs.CategoryNormalizationUnimplemented)))
+			slog.String("state", outcome),
+			slog.String("outcome", outcome),
+			slog.String("category", categoryOf(job)))
 		return broker.Ack
 	}
 
-	// This is where normalization, reservation and publication will run. They
-	// are not implemented, so the only honest outcome is a durably recorded
-	// hold requiring intervention. Nothing claims that a document was
-	// delivered, and no filesystem state is changed.
-	if err := p.base.Ledger.RecordHold(ctx, msg.JobID, jobs.CategoryNormalizationUnimplemented, msg.Attempt); err != nil {
+	// Normalization, reservation and publication.
+	out := p.pipeline.Process(ctx, job, msg.Attempt)
+	if !out.Settled {
+		// Nothing was committed, so the delivery must go back to the broker.
 		p.base.Metrics.Deliveries.WithLabelValues("requeued").Inc()
-		p.base.Metrics.LedgerErrors.WithLabelValues(logging.ErrorKind(err)).Inc()
-		log.Error("could not record the outcome durably; returning the delivery and pausing consumption",
+		if out.Err != nil {
+			p.base.Metrics.LedgerErrors.WithLabelValues(logging.ErrorKind(out.Err)).Inc()
+		}
+		log.Error("could not reach a durable outcome; returning the delivery and pausing consumption",
 			slog.String("event", "delivery_requeued"),
 			slog.String("dependency", "postgres_primary"),
 			slog.String("category", string(jobs.CategoryLedgerUnavailable)),
-			slog.String("error_kind", logging.ErrorKind(err)))
+			slog.String("error_kind", logging.ErrorKind(out.Err)))
 		p.consumer.RequestDetach()
 		return broker.NackRequeue
 	}
 
-	p.base.Metrics.Deliveries.WithLabelValues("held").Inc()
-	log.Info("delivery settled",
+	if out.Label != "dry_run" {
+		p.base.Metrics.Deliveries.WithLabelValues(out.Label).Inc()
+	}
+	attrs := []any{
 		slog.String("event", "delivery_settled"),
-		slog.String("state", string(jobs.StateHeld)),
-		slog.String("outcome", "held"),
-		slog.String("category", string(jobs.CategoryNormalizationUnimplemented)))
+		slog.String("state", string(out.State)),
+		slog.String("outcome", out.Label),
+	}
+	if out.Category != "" {
+		attrs = append(attrs, slog.String("category", string(out.Category)))
+	}
+	log.Info("delivery settled", attrs...)
 	return broker.Ack
+}
+
+// terminalLabel maps an already-terminal state to its metric label.
+func terminalLabel(s jobs.State) string {
+	switch s {
+	case jobs.StateDelivered:
+		return "delivered"
+	case jobs.StateUncertain:
+		return "uncertain"
+	default:
+		return "held"
+	}
+}
+
+// categoryOf reports a job's recorded category, or the empty string.
+func categoryOf(job ledger.Job) string {
+	if job.FailureCategory == nil {
+		return ""
+	}
+	return *job.FailureCategory
 }
