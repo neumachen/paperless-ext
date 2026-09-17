@@ -541,6 +541,18 @@ services:
       storage-init:
         condition: service_completed_successfully
     environment:
+      # ONE account owns the shared directory.
+      #
+      # The consume root is prepared by storage-init as 0770 owned by the
+      # runtime account, and Paperless chowns its consumption directory to its
+      # own user when it starts. Left to themselves the two fight over it: the
+      # renamer's staging was refused while Paperless owned the directory, and
+      # Paperless could not read it once storage-init took it back, so nothing
+      # was ever consumed. Mapping Paperless onto the same uid/gid makes its
+      # chown a no-op and both able to use the directory -- which is what any
+      # real deployment sharing a directory between two services has to do.
+      USERMAP_UID: ${FN_RUNTIME_UID:-65532}
+      USERMAP_GID: ${FN_RUNTIME_GID:-65532}
       PAPERLESS_REDIS: redis://paperless-redis:6379
       # SQLite, so this instance needs no database of its own and cannot be
       # pointed at the normalizer's cluster by accident.
@@ -551,6 +563,12 @@ services:
       # whole handoff, and it is the real thing here rather than a directory
       # nothing watches.
       PAPERLESS_CONSUMPTION_DIR: /usr/src/paperless/consume
+      # Documents already in the destination when the exercise starts. They
+      # belong to earlier runs: this instance is not asked to consume them,
+      # and the exercise does not remove them. Set from the directory itself
+      # so it names exactly what was there and cannot match anything this
+      # exercise publishes afterwards.
+      PAPERLESS_CONSUMER_IGNORE_PATTERNS: ${FN_PAPERLESS_IGNORE:-[]}
       PAPERLESS_CONSUMER_POLLING: ${FN_PAPERLESS_POLL:-1}
       PAPERLESS_CONSUMER_POLLING_DELAY: "1"
       PAPERLESS_CONSUMER_POLLING_RETRY_COUNT: "5"
@@ -631,7 +649,7 @@ services:
       FN_DB_APPLY_MIGRATIONS: "false"
       FN_RENAMER_CONCURRENCY: "1"
       FN_FAULT_POINTS: hold_after_link
-      FN_FAULT_HOLD: ${FN_CONSUME_HOLD:-60s}
+      FN_FAULT_HOLD: ${FN_CONSUME_HOLD:-150s}
     ports: []
 
   # -------------------------------------------------------------------------
