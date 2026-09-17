@@ -141,27 +141,86 @@ func (l *Ledger) RecordNormalized(ctx context.Context, jobID, normalized string,
 	})
 }
 
-// RecordPublishIntent marks a job as publishing and stamps the attempt time.
+// ErrPublicationInProgress reports that another attempt holds the right to
+// publish this job.
 //
-// It is committed BEFORE the destination link is attempted. That ordering is
-// the whole point: if the process dies during publication, the ledger already
-// says a publication may have happened, and recovery can distinguish that from
-// a job that never got that far.
-func (l *Ledger) RecordPublishIntent(ctx context.Context, jobID, reserved string, attempt int) error {
-	return l.tx(ctx, func(tx pgx.Tx) error {
-		ct, err := tx.Exec(ctx, `
+// It is not a failure. It means a sibling is mid-publication, and the correct
+// response is to return the delivery and let that attempt finish: two attempts
+// racing to publish one job is how a submission ends up with two documents.
+var ErrPublicationInProgress = errors.New("another attempt is publishing this job")
+
+// PublishClaim is the exclusive right to publish one job.
+type PublishClaim struct {
+	Name      string
+	ClaimedBy string
+	Inode     int64
+	Device    int64
+}
+
+// ClaimPublication takes the exclusive right to publish, and records the
+// identity of the file that is about to be linked.
+//
+// # Why a claim
+//
+// Recording intent used to accept any job already in `processing` or
+// `publishing`, so two attempts could both record intent for the same job.
+// The second would then link, get EEXIST, consult the snapshot it loaded
+// before the first attempt's intent existed, conclude the first attempt's
+// document was foreign, and publish a suffixed duplicate. Making the claim
+// exclusive removes that branch entirely rather than trying to detect it
+// afterwards.
+//
+// # Why the inode
+//
+// The claim also records the device and inode of the staged temporary. After
+// a successful link the destination IS that inode, so recovery can ask "is
+// this file the one I linked?" instead of "do the bytes match?". Content
+// equality cannot answer it: two distinct submissions may legitimately hold
+// identical bytes, and the contract says they stay distinct.
+//
+// A claim held by a process that has since died is taken over only when it is
+// older than takeoverAfter, which the caller sets from its own handler budget.
+func (l *Ledger) ClaimPublication(ctx context.Context, jobID, reserved string, inode, device int64, attempt int, takeoverAfter time.Duration) (PublishClaim, error) {
+	var claim PublishClaim
+	err := l.tx(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
 			UPDATE jobs
 			   SET state = 'publishing',
 			       reserved_name = $2,
+			       publish_claimed_by = $3,
+			       publish_inode = $4,
+			       publish_device = $5,
 			       publish_attempted_at = now(),
 			       updated_at = now()
-			 WHERE job_id = $1 AND state IN ('processing', 'publishing')`,
-			jobID, reserved)
-		if err != nil {
+			 WHERE job_id = $1
+			   AND state IN ('processing', 'publishing')
+			   AND NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = $1)
+			   AND (publish_claimed_by IS NULL
+			        OR publish_claimed_by = $3
+			        OR publish_attempted_at < now() - $6::interval)
+			RETURNING reserved_name, publish_claimed_by, publish_inode, publish_device`,
+			jobID, reserved, l.actor, inode, device, takeoverAfter.String())
+		if err := row.Scan(&claim.Name, &claim.ClaimedBy, &claim.Inode, &claim.Device); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Either the job is not publishable, it already has a receipt,
+				// or a live sibling holds the claim. Tell those apart so the
+				// caller can settle rather than spin.
+				var state string
+				var holder *string
+				qerr := tx.QueryRow(ctx,
+					`SELECT state, publish_claimed_by FROM jobs WHERE job_id = $1`, jobID).Scan(&state, &holder)
+				if errors.Is(qerr, pgx.ErrNoRows) {
+					return ErrNotFound
+				}
+				if qerr != nil {
+					return qerr
+				}
+				if holder != nil && *holder != l.actor {
+					return fmt.Errorf("%w: held by %s", ErrPublicationInProgress, *holder)
+				}
+				return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
+			}
 			return err
-		}
-		if ct.RowsAffected() == 0 {
-			return fmt.Errorf("job %s is not in a publishable state", jobID)
 		}
 		return l.appendEvent(ctx, tx, eventInput{
 			JobID:     jobID,
@@ -170,6 +229,10 @@ func (l *Ledger) RecordPublishIntent(ctx context.Context, jobID, reserved string
 			Attempt:   ptr(attempt),
 		})
 	})
+	if err != nil {
+		return PublishClaim{}, err
+	}
+	return claim, nil
 }
 
 // RecordDelivered writes the delivery receipt and moves the job to delivered.
@@ -179,25 +242,33 @@ func (l *Ledger) RecordPublishIntent(ctx context.Context, jobID, reserved string
 // not delivered.
 func (l *Ledger) RecordDelivered(ctx context.Context, r Receipt, reconciled bool) error {
 	return l.tx(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		// ON CONFLICT DO NOTHING keeps the FIRST finisher's receipt, which is
+		// right: it describes the document that is actually in place. But the
+		// job row was then updated to THIS attempt's name regardless, so a
+		// loser could leave reserved_name naming one file while the receipt
+		// named another. The job is now aligned with whatever receipt actually
+		// survives, so the state, the reserved name and the receipt always
+		// describe one document.
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO delivery_receipts
 				(job_id, destination_root, delivered_name, size_bytes,
 				 content_fingerprint, attempt)
 			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (job_id) DO NOTHING`,
 			r.JobID, r.DestinationRoot, r.DeliveredName, r.SizeBytes,
-			r.Fingerprint, r.Attempt)
-		if err != nil {
+			r.Fingerprint, r.Attempt); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
-			UPDATE jobs
+			UPDATE jobs j
 			   SET state = 'delivered',
-			       reserved_name = $2,
-			       terminal_at = COALESCE(terminal_at, now()),
+			       reserved_name = r.delivered_name,
+			       terminal_at = COALESCE(j.terminal_at, now()),
 			       failure_category = NULL,
+			       publish_claimed_by = NULL,
 			       updated_at = now()
-			 WHERE job_id = $1`, r.JobID, r.DeliveredName); err != nil {
+			  FROM delivery_receipts r
+			 WHERE j.job_id = $1 AND r.job_id = j.job_id`, r.JobID); err != nil {
 			return err
 		}
 		evt := jobs.EventDelivered
@@ -221,18 +292,32 @@ func (l *Ledger) RecordDelivered(ctx context.Context, r Receipt, reconciled bool
 // the ambiguity to stay visible instead of being resolved by guessing.
 func (l *Ledger) RecordUncertain(ctx context.Context, jobID string, category jobs.Category, attempt int) error {
 	return l.tx(ctx, func(tx pgx.Tx) error {
+		// The guard RecordHold already had, which this function was missing
+		// entirely. An attempt that decided "uncertain", paused, and resumed
+		// after a sibling had published would otherwise overwrite `delivered`
+		// -- contradicting a completed outcome that has a receipt behind it.
 		ct, err := tx.Exec(ctx, `
 			UPDATE jobs
 			   SET state = 'uncertain',
 			       failure_category = $2,
 			       terminal_at = COALESCE(terminal_at, now()),
 			       updated_at = now()
-			 WHERE job_id = $1`, jobID, string(category))
+			 WHERE job_id = $1
+			   AND state <> 'delivered'
+			   AND NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = $1)`,
+			jobID, string(category))
 		if err != nil {
 			return err
 		}
 		if ct.RowsAffected() == 0 {
-			return ErrNotFound
+			var state string
+			if qerr := tx.QueryRow(ctx, `SELECT state FROM jobs WHERE job_id = $1`, jobID).Scan(&state); qerr != nil {
+				if errors.Is(qerr, pgx.ErrNoRows) {
+					return ErrNotFound
+				}
+				return qerr
+			}
+			return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
 		}
 		return l.appendEvent(ctx, tx, eventInput{
 			JobID:     jobID,
@@ -435,3 +520,36 @@ func (l *Ledger) DeliveredNames(ctx context.Context, root string) (map[string]bo
 // It is not a failure: it means another attempt got there first and its result
 // stands. The caller settles the delivery against the existing outcome.
 var ErrOutcomeAlreadyRecorded = errors.New("a durable outcome is already recorded for this job")
+
+// DestinationOwner reports whether a destination file is the one this job
+// linked into place, read fresh rather than from a snapshot.
+//
+// Ownership is identity, not content. A foreign file whose bytes happen to
+// match this job's is somebody else's document, and adopting it would both
+// steal a file and quietly deduplicate two submissions the contract says must
+// stay distinct.
+//
+// The comparison is against the inode recorded when the publication claim was
+// taken, which is the inode of the staged temporary and therefore -- after a
+// successful link -- the inode of the destination.
+func (l *Ledger) DestinationOwner(ctx context.Context, jobID string) (inode, device int64, name string, ok bool, err error) {
+	var in, dev *int64
+	var nm *string
+	qerr := l.primary.QueryRow(ctx, `
+		SELECT publish_inode, publish_device, reserved_name
+		  FROM jobs WHERE job_id = $1`, jobID).Scan(&in, &dev, &nm)
+	if errors.Is(qerr, pgx.ErrNoRows) {
+		return 0, 0, "", false, ErrNotFound
+	}
+	if qerr != nil {
+		return 0, 0, "", false, fmt.Errorf("read publication identity: %w", qerr)
+	}
+	if in == nil || dev == nil || nm == nil {
+		return 0, 0, "", false, nil
+	}
+	return *in, *dev, *nm, true, nil
+}
+
+// ReadJob re-reads a job row. The pipeline uses it immediately before any
+// decision that a stale snapshot could get wrong.
+func (l *Ledger) ReadJob(ctx context.Context, jobID string) (Job, error) { return l.GetJob(ctx, jobID) }

@@ -509,7 +509,16 @@ func applyStorageFile(sf *StorageFile, defs map[string]string) {
 // themselves must be absolute, distinct, and non-nested: a staging root inside
 // the incoming root would make a staged copy look like a new submission, and a
 // consume root inside staging would expose partial files to the consumer.
-func validateStorageRoots(l *loader, s Storage) {
+func validateStorageRoots(l *loader, s Storage) { checkStorageRoots(l, s, true) }
+
+// checkStorageRoots validates the roots, optionally requiring all of them.
+//
+// A configuration document may legitimately supply only some roots and leave
+// the rest to the environment, so "required" is not a defect there. Every
+// other check -- absolute, clean, and the pairwise equal/nested comparisons --
+// applies to whatever IS supplied, which is what makes startup and document
+// validation agree on a contradiction the supplied values already determine.
+func checkStorageRoots(l *loader, s Storage, requireAll bool) {
 	roots := map[string]string{
 		"incoming": s.Incoming,
 		"queued":   s.Queued,
@@ -526,7 +535,9 @@ func validateStorageRoots(l *loader, s Storage) {
 	for _, n := range names {
 		p := roots[n]
 		if p == "" {
-			l.fail("storage.%s is required", n)
+			if requireAll {
+				l.fail("storage.%s is required", n)
+			}
 			continue
 		}
 		if !filepath.IsAbs(p) {
@@ -648,24 +659,12 @@ func validateDocumentShape(l *loader, fc FileConfig) {
 			Staging: fc.Storage.Staging, Consume: fc.Storage.Consume,
 			Failed: fc.Storage.Failed,
 		}
-		if allRootsPresent(s) {
-			validateStorageRoots(l, s)
-		} else {
-			for name, p := range map[string]string{
-				"incoming": s.Incoming, "queued": s.Queued,
-				"staging": s.Staging, "consume": s.Consume, "failed": s.Failed,
-			} {
-				if p == "" {
-					continue
-				}
-				if !filepath.IsAbs(p) {
-					l.fail("storage.%s must be an absolute path", name)
-				}
-				if p != filepath.Clean(p) {
-					l.fail("storage.%s must be a clean path", name)
-				}
-			}
-		}
+		// Pairwise checks used to run only when all five roots were supplied,
+		// so a partial document naming staging and consume as the same
+		// absolute path validated cleanly while startup rejected it. A
+		// contradiction that is already determined by the supplied values is
+		// a contradiction whether or not the rest of the document is present.
+		checkStorageRoots(l, s, false)
 	}
 	if fc.Processing != nil {
 		checkRange(l, "processing.concurrency", fc.Processing.Concurrency, 1, 64)
@@ -676,8 +675,4 @@ func validateDocumentShape(l *loader, fc FileConfig) {
 			l.fail("processing.prefetch must be at least processing.concurrency")
 		}
 	}
-}
-
-func allRootsPresent(s Storage) bool {
-	return s.Incoming != "" && s.Queued != "" && s.Staging != "" && s.Consume != "" && s.Failed != ""
 }

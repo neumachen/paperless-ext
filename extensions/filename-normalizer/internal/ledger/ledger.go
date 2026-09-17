@@ -69,6 +69,18 @@ type Job struct {
 	// renamer configured with a different one must refuse it rather than
 	// redirect work that was already accepted elsewhere.
 	DestinationRoot *string
+	// DestinationRootUnknown marks work accepted before the destination was
+	// recorded. It is not "compatible with anything": it is ambiguous, and
+	// ambiguous accepted work is held rather than adopted by whatever
+	// configuration happens to be running now.
+	DestinationRootUnknown bool
+	// PublishClaimedBy identifies the attempt currently entitled to publish.
+	PublishClaimedBy *string
+	// PublishInode and PublishDevice identify the file this job linked into
+	// place. Ownership of a destination is proved by identity, not by content:
+	// two distinct submissions may legitimately hold identical bytes.
+	PublishInode  *int64
+	PublishDevice *int64
 }
 
 // Event is one append-only history row.
@@ -835,7 +847,8 @@ const jobColumns = `job_id, contract_version, state, source_root, source_name,
 	failure_category, claimed_by, claimed_at, created_at, updated_at,
 	dispatched_at, last_delivery_at, terminal_at,
 	source_inode, source_device, source_modified_at, publish_attempted_at,
-	destination_root`
+	destination_root, publish_claimed_by, publish_inode, publish_device,
+	destination_root_unknown`
 
 func prefixedJobColumns(alias string) string {
 	cols := []string{
@@ -845,7 +858,8 @@ func prefixedJobColumns(alias string) string {
 		"failure_category", "claimed_by", "claimed_at", "created_at", "updated_at",
 		"dispatched_at", "last_delivery_at", "terminal_at",
 		"source_inode", "source_device", "source_modified_at", "publish_attempted_at",
-		"destination_root",
+		"destination_root", "publish_claimed_by", "publish_inode", "publish_device",
+		"destination_root_unknown",
 	}
 	out := make([]string, len(cols))
 	for i, c := range cols {
@@ -879,7 +893,8 @@ func scanJob(row scannable) (Job, error) {
 		&j.FailureCategory, &j.ClaimedBy, &j.ClaimedAt, &j.CreatedAt, &j.UpdatedAt,
 		&j.DispatchedAt, &j.LastDeliveryAt, &j.TerminalAt,
 		&j.SourceInode, &j.SourceDevice, &j.SourceModifiedAt, &j.PublishAttemptedAt,
-		&j.DestinationRoot)
+		&j.DestinationRoot, &j.PublishClaimedBy, &j.PublishInode, &j.PublishDevice,
+		&j.DestinationRootUnknown)
 	if err != nil {
 		return Job{}, err
 	}

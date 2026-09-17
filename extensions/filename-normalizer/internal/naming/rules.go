@@ -159,22 +159,74 @@ const maxIntermediateBytes = 1 << 16
 // ErrExpansionTooLarge reports that rules grew the stem past the working bound.
 var ErrExpansionTooLarge = errors.New("configured rules expanded the name beyond the working limit")
 
+// projectedSize is an upper bound on what a rule would produce, computed
+// WITHOUT producing it.
+//
+// The previous bound checked len(stem) after ReplaceAllString had already
+// built the result, which does not bound anything that matters: a rule
+// replacing ^.+$ with 30,000 characters, followed by one replacing every
+// character with 30,000 more, asks the regexp engine for a 900 MB string
+// before the 64 KB check is ever reached. The configuration doing it is about
+// 60 KB. Refusing afterwards is refusing after the damage.
+//
+// The estimate is deliberately conservative. Each match contributes the
+// literal replacement plus, for every group reference it contains, the largest
+// a group could be -- the whole input. Over-estimating rejects a few exotic
+// rule sets that would in fact have fitted; under-estimating would let the
+// allocation happen, which is the thing being prevented.
+func projectedSize(re *regexp.Regexp, stem, replacement string, all bool) int {
+	matches := re.FindAllStringIndex(stem, -1)
+	if matches == nil {
+		return len(stem)
+	}
+	n := len(matches)
+	if !all {
+		n = 1
+	}
+
+	groupRefs := strings.Count(replacement, "$")
+	perMatch := len(replacement) + groupRefs*len(stem)
+
+	consumed := 0
+	for i, m := range matches {
+		if !all && i > 0 {
+			break
+		}
+		consumed += m[1] - m[0]
+	}
+	return len(stem) - consumed + n*perMatch
+}
+
 // apply runs every rule in order and reports which ones changed the stem.
 //
-// It stops as soon as the intermediate exceeds the working bound, rather than
-// continuing and letting the next doubling allocate.
+// Every rule is projected before it runs, and the projection is checked
+// against the same bound as the result, so an expanding rule set is refused
+// before it allocates rather than after.
 func (rs Rules) apply(stem string) (string, []string, error) {
 	if len(rs) == 0 {
 		return stem, nil, nil
 	}
+	if len(stem) > maxIntermediateBytes {
+		return "", nil, fmt.Errorf("%w: input is %d bytes, limit %d",
+			ErrExpansionTooLarge, len(stem), maxIntermediateBytes)
+	}
+
 	var hits []string
 	for _, r := range rs {
+		if projected := projectedSize(r.Pattern, stem, r.Replacement, r.All); projected > maxIntermediateBytes {
+			return "", hits, fmt.Errorf("%w: rule %q would produce up to %d bytes, limit %d",
+				ErrExpansionTooLarge, r.Name, projected, maxIntermediateBytes)
+		}
+
 		before := stem
 		if r.All {
 			stem = r.Pattern.ReplaceAllString(stem, r.Replacement)
 		} else {
 			stem = replaceFirst(r.Pattern, stem, r.Replacement)
 		}
+		// The projection is an upper bound, so this should never fire. It is
+		// kept because a bound that is only ever asserted is a bound nobody
+		// notices has drifted.
 		if len(stem) > maxIntermediateBytes {
 			return "", hits, fmt.Errorf("%w: rule %q produced %d bytes, limit %d",
 				ErrExpansionTooLarge, r.Name, len(stem), maxIntermediateBytes)

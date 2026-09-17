@@ -136,9 +136,18 @@ func (p *Pipeline) Process(ctx context.Context, job ledger.Job, attempt int) Out
 	// restart would otherwise silently redirect work that was already
 	// registered and, for a reserved job, publish it somewhere its reservation
 	// does not cover.
-	// An empty recorded root means the same as no recorded root: jobs
-	// registered before this column existed, and callers that do not supply
-	// one, are compatible with any configuration.
+	// Work accepted before the destination was recorded is AMBIGUOUS, not
+	// compatible with anything. Treating a missing root as "any root will do"
+	// meant a job accepted under one configuration could follow a newly
+	// configured destination after a restart -- the exact reinterpretation the
+	// recorded root exists to prevent, simply unguarded for historical rows.
+	// Migration 0004 marks those rows, and they are held for an operator.
+	if job.DestinationRootUnknown {
+		log.Warn("job was accepted before its destination was recorded; not adopting the current one",
+			slog.String("event", "destination_unknown"),
+			slog.String("category", string(jobs.CategoryDestinationMismatch)))
+		return p.hold(ctx, job, jobs.CategoryDestinationMismatch, attempt)
+	}
 	if job.DestinationRoot != nil && *job.DestinationRoot != "" &&
 		*job.DestinationRoot != p.cfg.Storage.Consume {
 		log.Warn("job was accepted for a different destination root",
@@ -168,6 +177,18 @@ func (p *Pipeline) Process(ctx context.Context, job ledger.Job, attempt int) Out
 		return settled("uncertain", jobs.StateUncertain, jobs.CategoryPublicationUncertain)
 	}
 
+	// Roots must still be the directories this process validated -- checked
+	// BEFORE the recovery branch, which reads and may link inside the consume
+	// root. Verifying only on the ordinary path left recovery running against
+	// a root that could have been replaced.
+	if err := p.cfg.Roots.Verify(); err != nil {
+		log.Error("a storage root is not the directory it was at startup",
+			slog.String("event", "storage_root_changed"),
+			slog.String("category", string(jobs.CategoryStorageUnavailable)))
+		out, _ := p.holdOr(ctx, job, jobs.CategoryStorageUnavailable, attempt, err)
+		return out
+	}
+
 	// A job found mid-publication is a recovery case, not a fresh one.
 	if job.State == jobs.StatePublishing {
 		return p.recoverPublishing(ctx, job, attempt, log)
@@ -184,15 +205,6 @@ func (p *Pipeline) Process(ctx context.Context, job ledger.Job, attempt int) Out
 			slog.Int("attempts", job.DeliveryAttempts),
 			slog.Int("max_attempts", p.cfg.MaxDeliveryAttempts))
 		return p.hold(ctx, job, jobs.CategoryRetryExhausted, attempt)
-	}
-
-	// Roots must still be the directories this process validated.
-	if err := p.cfg.Roots.Verify(); err != nil {
-		log.Error("a storage root is not the directory it was at startup",
-			slog.String("event", "storage_root_changed"),
-			slog.String("category", string(jobs.CategoryStorageUnavailable)))
-		out, _ := p.holdOr(ctx, job, jobs.CategoryStorageUnavailable, attempt, err)
-		return out
 	}
 
 	// --- the source, opened once ------------------------------------------
@@ -385,7 +397,7 @@ func (p *Pipeline) publish(ctx context.Context, job ledger.Job, res naming.Resul
 	return p.hold(ctx, job, jobs.CategoryCollisionExhausted, attempt)
 }
 
-// linkIntoPlace performs the intent-link-receipt sequence for one candidate.
+// linkIntoPlace performs the claim-link-receipt sequence for one candidate.
 func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, candidate, key, working string, attempt, seq int, log *slog.Logger) (Outcome, bool) {
 	final := filepath.Join(root, candidate)
 	// Attempt-private: two attempts on one job must not stage over each other.
@@ -406,37 +418,78 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		}
 	}()
 
-	// Intent before action.
-	if err := p.led.RecordPublishIntent(ctx, job.JobID, candidate, attempt); err != nil {
-		return unsettled(err), true
+	// The identity of the bytes about to be linked. After a successful link the
+	// destination IS this inode, which is what makes ownership provable later.
+	staged, serr := storage.Identify(tmp)
+	if serr != nil {
+		out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)
+		return out, true
 	}
-	p.faults.Fire(config.FaultBeforeLink, log)
+
+	// Claim the right to publish. Exclusive per job: a sibling mid-publication
+	// makes this attempt stand down rather than race it to a suffixed name.
+	claim, cerr := p.led.ClaimPublication(ctx, job.JobID, candidate,
+		int64(staged.Inode), int64(staged.Device), attempt, p.cfg.ShutdownTimeout)
+	switch {
+	case errors.Is(cerr, ledger.ErrPublicationInProgress):
+		log.Info("another attempt is publishing this job; standing down",
+			slog.String("event", "publication_in_progress"))
+		return unsettled(cerr), true
+	case errors.Is(cerr, ledger.ErrOutcomeAlreadyRecorded):
+		log.Info("a durable outcome was recorded while this attempt was preparing",
+			slog.String("event", "outcome_preserved"))
+		return settled("delivered", jobs.StateDelivered, ""), true
+	case cerr != nil:
+		return unsettled(cerr), true
+	}
+	_ = claim
 
 	err := storage.PublishExclusive(tmp, final)
-	p.faults.Fire(config.FaultAfterLink, log)
+	if err == nil {
+		// Fired only when the link actually succeeded, so `after_link` means
+		// what its name says. An EEXIST interruption is a different scenario
+		// and would need its own point.
+		p.faults.Fire(config.FaultAfterLink, log)
+	}
 
 	switch {
 	case err == nil:
-		// The receipt records what is actually at the destination, and it is
-		// checked against what this job is supposed to be. Recording a
-		// fingerprint without comparing it would let a receipt describe bytes
-		// that are not the job's.
-		sum, size, ferr := storage.Fingerprint(final)
-		if ferr != nil {
+		// The link returned success, so publication HAPPENED. What is at the
+		// destination now is a separate question: a consumer may already have
+		// taken it. Reading the destination is therefore best-effort evidence,
+		// never the thing that decides whether we published.
+		size, fp := int64(0), job.Fingerprint
+		if job.SizeBytes != nil {
+			size = *job.SizeBytes
+		}
+		absent := false
+		switch sum, n, ferr := storage.Fingerprint(final); {
+		case ferr == nil:
+			if job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint) {
+				log.Error("the published file is not this job's content",
+					slog.String("event", "published_content_mismatch"),
+					slog.String("category", string(jobs.CategoryDestinationConflict)))
+				return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt), true
+			}
+			fp, size = sum, n
+		case errors.Is(ferr, fs.ErrNotExist):
+			// Gone between the link and the read. The old code ran this
+			// through the generic storage classifier and held the job as
+			// source_absent -- reporting a missing SOURCE for a document that
+			// had just been published successfully, and losing the delivery
+			// from the accounting entirely.
+			absent = true
+			log.Info("the destination was removed immediately after publication; recording the delivery",
+				slog.String("event", "destination_consumed_immediately"))
+		default:
 			cat := jobs.Category(storage.RejectionCategory(ferr))
 			out, _ := p.holdOr(ctx, job, cat, attempt, ferr)
 			return out, true
 		}
-		if job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint) {
-			log.Error("the published file is not this job's content",
-				slog.String("event", "published_content_mismatch"),
-				slog.String("category", string(jobs.CategoryDestinationConflict)))
-			return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt), true
-		}
 
 		receipt := ledger.Receipt{
 			JobID: job.JobID, DestinationRoot: root, DeliveredName: candidate,
-			SizeBytes: size, Fingerprint: sum, Attempt: attempt,
+			SizeBytes: size, Fingerprint: fp, Attempt: attempt,
 		}
 		if derr := p.led.RecordDelivered(ctx, receipt, false); derr != nil {
 			log.Error("published but could not record the receipt; the delivery will be retried and reconciled",
@@ -444,12 +497,19 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 				slog.String("dependency", "postgres_primary"))
 			return unsettled(derr), true
 		}
+		if absent {
+			if nerr := p.led.NoteDeliveredFileAbsent(ctx, job.JobID); nerr != nil {
+				log.Warn("could not record that the delivered file was already absent",
+					slog.String("event", "absence_note_failed"))
+			}
+		}
 		p.faults.Fire(config.FaultAfterReceipt, log)
 		p.metrics.Published.Inc()
 		p.metrics.PublishedBytes.Add(float64(size))
 		log.Info("document published",
 			slog.String("event", "document_published"),
 			slog.Int("collision_sequence", seq),
+			slog.Bool("destination_already_absent", absent),
 			slog.Int64("size_bytes", size))
 		return settled("delivered", jobs.StateDelivered, ""), true
 
@@ -468,32 +528,50 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 
 // resolveOccupiedDestination decides what an existing destination file means.
 //
-// Matching content is NOT sufficient to claim it. Two distinct submissions may
-// legitimately hold identical bytes, and the contract says they stay distinct;
-// a file that merely looks like this job's is somebody else's until there is
-// evidence this job put it there. The evidence required is this job's own
-// publication intent for this exact name -- committed before any link this job
-// performs, so it is present for a retry and absent on a first attempt.
+// Ownership is IDENTITY, not content. Two distinct submissions may legitimately
+// hold identical bytes and the contract says they stay distinct, so a file that
+// merely looks like this job's is somebody else's until the inode says
+// otherwise. The inode compared against is the one recorded when this job took
+// its publication claim, which is the inode it linked.
+//
+// The job row is re-read here rather than taken from the snapshot loaded at
+// delivery time. That snapshot is why overlapping attempts could duplicate a
+// publication: the second attempt's copy predated the first attempt's claim, so
+// it saw no publication for this job and concluded the first attempt's document
+// was foreign.
 func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Job, root, candidate, key, final string, attempt int, log *slog.Logger) (Outcome, bool) {
-	sum, size, err := storage.Fingerprint(final)
-	if err != nil {
-		// Unreadable, a symlink, or not a regular file. It cannot be
-		// established as this job's work, and taking the name would risk
-		// overwriting a document; retrying would spin against a condition
-		// that will not change by itself.
+	fresh, ferr := p.led.ReadJob(ctx, job.JobID)
+	if ferr != nil {
+		return unsettled(ferr), true
+	}
+	if fresh.State == jobs.StateDelivered {
+		log.Info("a sibling attempt completed this job while this one was publishing",
+			slog.String("event", "outcome_preserved"))
+		return settled("delivered", jobs.StateDelivered, ""), true
+	}
+
+	got, gerr := storage.Identify(final)
+	if gerr != nil {
 		log.Error("the destination is occupied by something this process cannot verify",
 			slog.String("event", "destination_unverifiable"),
 			slog.String("category", string(jobs.CategoryDestinationConflict)),
-			slog.String("error_kind", storage.RejectionCategory(err)))
+			slog.String("error_kind", storage.RejectionCategory(gerr)))
 		return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt), true
 	}
 
-	contentMatches := job.Fingerprint != nil && bytes.Equal(sum, job.Fingerprint)
-	ours := contentMatches &&
-		job.PublishAttemptedAt != nil &&
-		job.ReservedName != nil && *job.ReservedName == candidate
+	ours := fresh.PublishInode != nil && fresh.PublishDevice != nil &&
+		*fresh.PublishInode == int64(got.Inode) && *fresh.PublishDevice == int64(got.Device)
 
 	if ours {
+		sum, size, serr := storage.Fingerprint(final)
+		if serr != nil {
+			out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)
+			return out, true
+		}
+		if job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint) {
+			// Our inode, wrong bytes: something rewrote it in place.
+			return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt), true
+		}
 		receipt := ledger.Receipt{
 			JobID: job.JobID, DestinationRoot: root, DeliveredName: candidate,
 			SizeBytes: size, Fingerprint: sum, Attempt: attempt,
@@ -502,25 +580,32 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 			return unsettled(err), true
 		}
 		log.Info("reconciled an existing destination as this job's own delivery",
-			slog.String("event", "delivery_reconciled"),
-			slog.Int64("size_bytes", size))
+			slog.String("event", "delivery_reconciled"), slog.Int64("size_bytes", size))
 		return settled("reconciled", jobs.StateDelivered, ""), true
 	}
 
-	// Not ours -- even if the bytes match. Keep the reservation blocked so the
-	// name is never silently reused, and advance the sequence.
+	// Not ours. Whether the bytes match is recorded but decides nothing: equal
+	// content is exactly the case the identity check exists for, and treating
+	// it as ownership would be implicit deduplication.
+	matches := false
+	if sum, _, serr := storage.Fingerprint(final); serr == nil && job.Fingerprint != nil {
+		matches = bytes.Equal(sum, job.Fingerprint)
+	}
 	if err := p.led.BlockReservation(ctx, job.JobID, root, key); err != nil {
 		return unsettled(err), true
 	}
 	p.metrics.CollisionSuffixes.Inc()
 	log.Info("destination is occupied by a file this job did not publish; advancing the sequence",
 		slog.String("event", "destination_occupied"),
-		slog.Bool("content_matches", contentMatches),
+		slog.Bool("content_matches", matches),
 		slog.String("category", string(jobs.CategoryDestinationConflict)))
 	return Outcome{}, false
 }
 
 // recoverPublishing decides the outcome of a job interrupted mid-publication.
+//
+// It runs after the root verification in Process, so a recovery cannot read or
+// write through a root that is no longer the directory it was.
 func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attempt int, log *slog.Logger) Outcome {
 	root := p.cfg.Storage.Consume
 
@@ -541,9 +626,28 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 	}
 
 	final := filepath.Join(root, name)
-	sum, size, err := storage.Fingerprint(final)
+	got, gerr := storage.Identify(final)
 	switch {
-	case err == nil && job.Fingerprint != nil && bytes.Equal(sum, job.Fingerprint):
+	case gerr == nil:
+		// Identity first. A foreign file whose bytes matched this job's was
+		// previously adopted here, which both took someone else's file and
+		// deduplicated two submissions that must stay distinct.
+		ours := job.PublishInode != nil && job.PublishDevice != nil &&
+			*job.PublishInode == int64(got.Inode) && *job.PublishDevice == int64(got.Device)
+		if !ours {
+			log.Error("the reserved destination holds a file this job did not link",
+				slog.String("event", "destination_conflict"),
+				slog.String("category", string(jobs.CategoryDestinationConflict)))
+			return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt)
+		}
+		sum, size, serr := storage.Fingerprint(final)
+		if serr != nil {
+			out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)
+			return out
+		}
+		if job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint) {
+			return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt)
+		}
 		receipt := ledger.Receipt{
 			JobID: job.JobID, DestinationRoot: root, DeliveredName: name,
 			SizeBytes: size, Fingerprint: sum, Attempt: attempt,
@@ -555,13 +659,7 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 			slog.String("event", "delivery_reconciled"), slog.Int64("size_bytes", size))
 		return settled("reconciled", jobs.StateDelivered, "")
 
-	case err == nil:
-		log.Error("the reserved destination holds content this job did not publish",
-			slog.String("event", "destination_conflict"),
-			slog.String("category", string(jobs.CategoryDestinationConflict)))
-		return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt)
-
-	case errors.Is(err, fs.ErrNotExist):
+	case errors.Is(gerr, fs.ErrNotExist):
 		// The honest answer. The file may never have been created, or it may
 		// have been created and already taken by the consumer. A filesystem
 		// handoff cannot distinguish those, so the job stops here rather than
@@ -572,8 +670,8 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 		return p.uncertain(ctx, job, attempt)
 
 	default:
-		cat := jobs.Category(storage.RejectionCategory(err))
-		out, _ := p.holdOr(ctx, job, cat, attempt, err)
+		cat := jobs.Category(storage.RejectionCategory(gerr))
+		out, _ := p.holdOr(ctx, job, cat, attempt, gerr)
 		return out
 	}
 }
