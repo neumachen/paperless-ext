@@ -643,6 +643,17 @@ emit "   foreign file still intact:    $([ "$STILL_FOREIGN5" = "$FOREIGN_INO5" ]
 [ "$CAT5F" = "destination_conflict" ] || bad "category is '$CAT5F', not destination_conflict"
 [ "${RECEIPTS5:-0}" = "0" ] || bad "recovery claimed a foreign file as its own delivery"
 [ "$STILL_FOREIGN5" = "$FOREIGN_INO5" ] || bad "the foreign file was replaced or removed"
+
+# The intruder was planted by this exercise, so this exercise takes it away
+# again. Leaving it behind means a file in the destination that no receipt and
+# no job explains -- which is exactly what the suite's isolation assertion is
+# for, and it caught these: four of them had accumulated, one per run. The
+# assertion was right; the exercise was littering. Removed only after the
+# checks above have read it.
+in_storage "rm -f '/srv/fn/consume/$RESERVED5' 2>/dev/null; true" >/dev/null 2>&1 || true
+GONE5="$(in_storage "test -e '/srv/fn/consume/$RESERVED5' && echo present || echo removed")"
+emit "   the planted intruder was:     $GONE5 afterwards (this exercise created it, so it removes it)"
+[ "$GONE5" = "removed" ] || bad "the exercise left its planted file in the destination"
 emit ""
 
 # ---------------------------------------------------------------------------

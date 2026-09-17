@@ -656,6 +656,38 @@ func (l *Ledger) DeliveredNames(ctx context.Context, root string) (map[string]bo
 	return out, rows.Err()
 }
 
+// UnresolvedNames returns the names a destination root may legitimately hold
+// without a receipt: the reserved names of jobs whose publication is unresolved.
+//
+// A job that is `uncertain` or still `publishing` may or may not have reached
+// the directory -- that is precisely what those states mean. A file under such
+// a name is therefore explained by the ledger, and is the physical evidence an
+// operator needs in order to resolve it. It is not "something wrote to the
+// destination outside the pipeline", and anything that treated it that way
+// would be pressing for the evidence to be deleted.
+func (l *Ledger) UnresolvedNames(ctx context.Context, root string) (map[string]string, error) {
+	rows, err := l.primary.Query(ctx,
+		`SELECT reserved_name, state
+		   FROM jobs
+		  WHERE destination_root = $1
+		    AND reserved_name IS NOT NULL
+		    AND state IN ('uncertain', 'publishing')`, root)
+	if err != nil {
+		return nil, fmt.Errorf("read unresolved names: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]string{}
+	for rows.Next() {
+		var name, state string
+		if err := rows.Scan(&name, &state); err != nil {
+			return nil, err
+		}
+		out[name] = state
+	}
+	return out, rows.Err()
+}
+
 // ErrOutcomeAlreadyRecorded reports that a job already reached a durable
 // outcome that the attempted write must not replace.
 //
