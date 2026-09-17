@@ -188,6 +188,11 @@ test-normalization: ## Run only the end-to-end document phase
 	  FN_TEST_RUN_ID=$${FN_TEST_RUN_ID:-manual-$$(date -u +%Y%m%dT%H%M%SZ)} \
 	  $(COMPOSE) --profile test run --rm integration -test.v -test.timeout 20m
 
+.PHONY: test-dry-run
+test-dry-run: ## Prove a dry run preserves sources and the operational ledger (A9)
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-dry-run.sh
+
 .PHONY: test-cleanup-ownership
 test-cleanup-ownership: ## Prove the isolation wrapper's own cleanup cannot remove pre-existing resources
 	@mkdir -p $(EVIDENCE)

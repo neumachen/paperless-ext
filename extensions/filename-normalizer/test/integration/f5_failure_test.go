@@ -180,13 +180,45 @@ func TestF5NoOutcomeIsInventedDuringAnOutage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ledger snapshot after recovery: %v", err)
 	}
-	if n := snap.ByState[jobs.StateDelivered]; n != 0 {
-		t.Errorf("%d jobs are recorded as delivered; the outage produced an outcome no code path can produce", n)
+
+	// This test used to assert that NO job was ever delivered, which was a
+	// correct reading of "no invented outcome" only while nothing could
+	// publish. Documents are published now, so that assertion would fail on
+	// the system working. The invariant that actually matters is stronger and
+	// still holds: an outcome must be backed by its own evidence.
+	//
+	//   delivered  =>  a durable delivery receipt exists
+	//   uncertain  =>  a publication was actually attempted
+	//
+	// An outage that invented an outcome would break one of those, because
+	// the evidence is written in the same transaction as the state.
+	unbacked, err := led.DeliveredWithoutReceipt(ctx)
+	if err != nil {
+		t.Fatalf("check delivered jobs against their receipts: %v", err)
 	}
-	if n := snap.ByState[jobs.StateUncertain]; n != 0 {
-		t.Errorf("%d jobs are recorded as uncertain; no code path in this increment writes that state", n)
+	if unbacked != 0 {
+		t.Errorf("%d jobs are delivered with no delivery receipt; an outcome was invented", unbacked)
 	}
+
+	unattempted, err := led.UncertainWithoutPublishAttempt(ctx)
+	if err != nil {
+		t.Fatalf("check uncertain jobs against their publish attempts: %v", err)
+	}
+	if unattempted != 0 {
+		t.Errorf("%d jobs are uncertain with no recorded publication attempt; "+
+			"uncertainty was invented rather than observed", unattempted)
+	}
+
 	t.Logf("ledger after the outage: %v", snap.ByState)
+	e.WriteEvidence(t, "f5-no-invented-outcome.txt", []byte(fmt.Sprintf(
+		"No outcome was invented during the outage\n\n"+
+			"ledger after recovery: %v\n\n"+
+			"delivered jobs with no receipt:              %d\n"+
+			"uncertain jobs with no publication attempt:  %d\n\n"+
+			"Both must be zero. The receipt is written in the same transaction as the\n"+
+			"delivered state and the publish intent is committed before the link, so a\n"+
+			"state that appeared without its evidence would mean the outage produced it.\n",
+		snap.ByState, unbacked, unattempted)))
 }
 
 // TestF5DeliveryDuringALedgerOutageIsBoundedAndNotLost is the assertion that

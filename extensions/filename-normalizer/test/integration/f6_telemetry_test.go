@@ -350,19 +350,36 @@ func TestF6FixturesAreRealAndIsolated(t *testing.T) {
 		t.Errorf("the generated fixture set does not cover: %s", strings.Join(missing, ", "))
 	}
 
-	// Isolation: the consume root must be empty. Nothing in this increment
-	// publishes, so a file here would mean something fabricated a delivery.
+	// Isolation. The consume root is no longer required to be empty -- the
+	// normalization phase publishes real documents into it -- so the check
+	// that still means something is that every entry there is accounted for
+	// by a delivery receipt. A file nobody has a receipt for would mean
+	// something wrote to the destination outside the pipeline.
 	entries, err := os.ReadDir(e.Cfg.Storage.Consume)
 	if err != nil {
 		t.Fatalf("read the consume root: %v", err)
 	}
-	if len(entries) != 0 {
-		var got []string
-		for _, en := range entries {
-			got = append(got, en.Name())
+	led := e.Ledger(t)
+	recCtx, recCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer recCancel()
+	delivered, err := led.DeliveredNames(recCtx, e.Cfg.Storage.Consume)
+	if err != nil {
+		t.Fatalf("read the delivered names: %v", err)
+	}
+	var unaccounted []string
+	for _, en := range entries {
+		// The short-lived link target is a dotfile and is not a publication.
+		if strings.HasPrefix(en.Name(), ".") {
+			continue
 		}
-		t.Errorf("the consume root holds %d entries (%v); no code path in this increment publishes a document",
-			len(entries), got)
+		if !delivered[en.Name()] {
+			unaccounted = append(unaccounted, en.Name())
+		}
+	}
+	if len(unaccounted) != 0 {
+		t.Errorf("%d file(s) in the consume root have no delivery receipt: %v; "+
+			"something wrote to the destination outside the pipeline",
+			len(unaccounted), unaccounted)
 	}
 
 	e.WriteEvidence(t, "f6-fixtures.txt", []byte(fmt.Sprintf(
