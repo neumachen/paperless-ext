@@ -366,20 +366,40 @@ func TestF6FixturesAreRealAndIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the delivered names: %v", err)
 	}
-	var unaccounted []string
+	// A receipt is not the only thing that explains a file here. A job that is
+	// `uncertain` or `publishing` may or may not have reached the directory --
+	// that is what those states mean -- so a file under its reserved name is
+	// accounted for by the ledger and is the evidence an operator needs to
+	// resolve it. Counting it as an intruder would make the suite demand the
+	// deletion of exactly the thing the design preserves.
+	unresolved, err := led.UnresolvedNames(recCtx, e.Cfg.Storage.Consume)
+	if err != nil {
+		t.Fatalf("read the unresolved names: %v", err)
+	}
+
+	var unaccounted, pending []string
 	for _, en := range entries {
 		// The short-lived link target is a dotfile and is not a publication.
 		if strings.HasPrefix(en.Name(), ".") {
 			continue
 		}
-		if !delivered[en.Name()] {
-			unaccounted = append(unaccounted, en.Name())
+		if delivered[en.Name()] {
+			continue
 		}
+		if state, ok := unresolved[en.Name()]; ok {
+			pending = append(pending, fmt.Sprintf("%s (%s)", en.Name(), state))
+			continue
+		}
+		unaccounted = append(unaccounted, en.Name())
+	}
+	if len(pending) != 0 {
+		t.Logf("%d file(s) belong to jobs whose publication is unresolved, which is "+
+			"their defined state and not a leak: %v", len(pending), pending)
 	}
 	if len(unaccounted) != 0 {
-		t.Errorf("%d file(s) in the consume root have no delivery receipt: %v; "+
-			"something wrote to the destination outside the pipeline",
-			len(unaccounted), unaccounted)
+		t.Errorf("%d file(s) in the consume root have neither a delivery receipt nor an "+
+			"unresolved job to explain them: %v; something wrote to the destination "+
+			"outside the pipeline", len(unaccounted), unaccounted)
 	}
 
 	e.WriteEvidence(t, "f6-fixtures.txt", []byte(fmt.Sprintf(
