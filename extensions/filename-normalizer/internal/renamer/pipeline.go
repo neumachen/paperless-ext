@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/config"
@@ -90,6 +91,23 @@ type Outcome struct {
 	Category jobs.Category
 	// Err explains an unsettled outcome. It never carries document text.
 	Err error
+	// Deferred distinguishes "a sibling is doing this work" from "a dependency
+	// failed". Both return the delivery to the broker, but only the second is
+	// a fault: a deferral must not be reported as a database problem, must not
+	// pause the consumer's other work, and must not spend the job's retry
+	// budget on a sibling that is succeeding.
+	Deferred bool
+	// DeferredTo names the attempt holding the publication claim, for history.
+	DeferredTo string
+	// Cause names what actually failed when nothing was settled, and
+	// Dependency names which one. Empty means the ledger, which is the only
+	// thing the requeue path used to be able to say: a destination the kernel
+	// refused and a disk with no space were both reported as
+	// `postgres_primary` / `ledger_unavailable`, and both detached the
+	// consumer, so one job's storage fault stalled every unrelated job the
+	// worker held. That is the same mistake a deferral used to make.
+	Cause      jobs.Category
+	Dependency string
 }
 
 func settled(label string, state jobs.State, cat jobs.Category) Outcome {
@@ -98,6 +116,17 @@ func settled(label string, state jobs.State, cat jobs.Category) Outcome {
 
 func unsettled(err error) Outcome {
 	return Outcome{Settled: false, Label: "requeued", Err: err}
+}
+
+// retryable is an unsettled outcome whose cause is storage, not the ledger:
+// the attempt failed, the failure is retryable while the budget lasts, and
+// nothing is wrong with the database.
+func retryable(err error, cat jobs.Category) Outcome {
+	return Outcome{Settled: false, Label: "requeued", Err: err, Cause: cat, Dependency: "storage"}
+}
+
+func deferred(holder string, err error) Outcome {
+	return Outcome{Settled: false, Label: "deferred", Err: err, Deferred: true, DeferredTo: holder}
 }
 
 // tempPrefix marks a short-lived, attempt-private file.
@@ -429,12 +458,13 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	// Claim the right to publish. Exclusive per job: a sibling mid-publication
 	// makes this attempt stand down rather than race it to a suffixed name.
 	claim, cerr := p.led.ClaimPublication(ctx, job.JobID, candidate,
-		int64(staged.Inode), int64(staged.Device), attempt, p.cfg.ShutdownTimeout)
+		int64(staged.Inode), int64(staged.Device), attempt, p.cfg.PublishTakeoverAfter)
 	switch {
 	case errors.Is(cerr, ledger.ErrPublicationInProgress):
 		log.Info("another attempt is publishing this job; standing down",
-			slog.String("event", "publication_in_progress"))
-		return unsettled(cerr), true
+			slog.String("event", "publication_in_progress"),
+			slog.String("held_by", ledger.ClaimHolder(cerr)))
+		return deferred(ledger.ClaimHolder(cerr), cerr), true
 	case errors.Is(cerr, ledger.ErrOutcomeAlreadyRecorded):
 		log.Info("a durable outcome was recorded while this attempt was preparing",
 			slog.String("event", "outcome_preserved"))
@@ -444,12 +474,35 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	}
 	_ = claim
 
+	// Armed only in the interruption exercise: stop with the claim committed
+	// and the destination untouched.
+	//
+	// This call was lost when linkIntoPlace was rewritten around the exclusive
+	// claim, which left `before_link` accepted by the configuration, named in
+	// the startup warning, and completely inert -- so the scenario that
+	// depends on it published normally and the oracle read the result as a
+	// product failure. An armed fault point that does nothing is worse than
+	// one that does not exist.
+	p.faults.Fire(config.FaultBeforeLink, log)
+
+	// Hold the claim open, if armed, BEFORE the link. This is the window the
+	// duplicate-publication race lives in: a second attempt arriving here sees
+	// no file at the destination, so the claim is the only thing that can stop
+	// it from publishing a second copy. Pausing after the link would let the
+	// occupied destination do the work instead and would prove the weaker
+	// property.
+	p.faults.Pause(config.FaultHoldAfterClaim, log)
+
 	err := storage.PublishExclusive(tmp, final)
 	if err == nil {
 		// Fired only when the link actually succeeded, so `after_link` means
 		// what its name says. An EEXIST interruption is a different scenario
 		// and would need its own point.
 		p.faults.Fire(config.FaultAfterLink, log)
+		// Held open, if armed, so a real consumer can take the document before
+		// the read below. The publication has already happened at this point;
+		// what follows must not be able to undo that.
+		p.faults.Pause(config.FaultHoldAfterLink, log)
 	}
 
 	switch {
@@ -491,14 +544,20 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			JobID: job.JobID, DestinationRoot: root, DeliveredName: candidate,
 			SizeBytes: size, Fingerprint: fp, Attempt: attempt,
 		}
-		if derr := p.led.RecordDelivered(ctx, receipt, false); derr != nil {
+		// The link already succeeded, so this receipt records something that
+		// has happened. It is written even if the attempt's budget has just
+		// run out; otherwise a completed publication is reconciled later as a
+		// recovery instead of being recorded now.
+		rctx, rcancel := durably(ctx)
+		defer rcancel()
+		if derr := p.led.RecordDelivered(rctx, receipt, false); derr != nil {
 			log.Error("published but could not record the receipt; the delivery will be retried and reconciled",
 				slog.String("event", "receipt_write_failed"),
 				slog.String("dependency", "postgres_primary"))
 			return unsettled(derr), true
 		}
 		if absent {
-			if nerr := p.led.NoteDeliveredFileAbsent(ctx, job.JobID); nerr != nil {
+			if nerr := p.led.NoteDeliveredFileAbsent(rctx, job.JobID); nerr != nil {
 				log.Warn("could not record that the delivered file was already absent",
 					slog.String("event", "absence_note_failed"))
 			}
@@ -521,9 +580,53 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		log.Error("publication failed",
 			slog.String("event", "publication_failed"),
 			slog.String("category", string(cat)))
+
+		// link(2) is atomic: a refusal means no directory entry was created,
+		// so nothing was published and the claim should not stand. Leaving it
+		// standing left the job in `publishing`, which is the recovery path's
+		// input -- so the next delivery did not retry the write, it "recovered"
+		// it, found no destination, and recorded `uncertain`. A destination the
+		// kernel had plainly refused became an unresolvable outcome instead of
+		// a retry that would have recorded the real reason.
+		//
+		// Only definite refusals qualify. An ambiguous failure must keep the
+		// claim, because then a publication may in fact have happened.
+		if definitelyNotPublished(err) {
+			actx, acancel := durably(ctx)
+			aerr := p.led.AbandonPublication(actx, job.JobID, attempt, string(cat))
+			acancel()
+			if aerr != nil {
+				log.Warn("could not withdraw the publication claim after a refused link",
+					slog.String("event", "publish_abandon_failed"),
+					slog.String("error_kind", storage.RejectionCategory(aerr)))
+			}
+		}
+
 		out, _ := p.holdOr(ctx, job, cat, attempt, err)
 		return out, true
 	}
+}
+
+// definitelyNotPublished reports whether a link failure proves no directory
+// entry was created.
+//
+// The listed errors are refusals the kernel makes BEFORE creating anything:
+// permission, a read-only filesystem, no space, a name the filesystem will not
+// take, a missing or non-directory parent. Anything else -- an I/O error most
+// of all -- is ambiguous, and an ambiguous publication must stay ambiguous.
+func definitelyNotPublished(err error) bool {
+	switch {
+	case errors.Is(err, fs.ErrPermission),
+		errors.Is(err, syscall.EROFS),
+		errors.Is(err, syscall.ENOSPC),
+		errors.Is(err, syscall.EDQUOT),
+		errors.Is(err, syscall.ENAMETOOLONG),
+		errors.Is(err, syscall.ENOTDIR),
+		errors.Is(err, syscall.EMLINK),
+		errors.Is(err, syscall.EXDEV):
+		return true
+	}
+	return false
 }
 
 // resolveOccupiedDestination decides what an existing destination file means.
@@ -576,7 +679,11 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 			JobID: job.JobID, DestinationRoot: root, DeliveredName: candidate,
 			SizeBytes: size, Fingerprint: sum, Attempt: attempt,
 		}
-		if err := p.led.RecordDelivered(ctx, receipt, true); err != nil {
+		// Reconciling records a delivery that already exists on disk; the same
+		// grace applies as for a fresh receipt.
+		rctx, rcancel := durably(ctx)
+		defer rcancel()
+		if err := p.led.RecordDelivered(rctx, receipt, true); err != nil {
 			return unsettled(err), true
 		}
 		log.Info("reconciled an existing destination as this job's own delivery",
@@ -608,6 +715,29 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 // write through a root that is no longer the directory it was.
 func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attempt int, log *slog.Logger) Outcome {
 	root := p.cfg.Storage.Consume
+
+	// `publishing` does not mean "abandoned". It is also exactly what a job
+	// looks like while a LIVE attempt sits between its claim and its link.
+	//
+	// Recovery used to skip this check, so a sibling handed the same job --
+	// which is what happens the moment the holder's broker connection drops --
+	// looked at the destination, found nothing there yet, and recorded
+	// `uncertain` for a publication that was still in progress. The holder
+	// then went on to link its document, leaving a file in the consume
+	// directory with no receipt and a job whose durable state contradicted
+	// what was on disk. That is precisely the conflicting durable identity
+	// the claim exists to prevent, arrived at from the other direction.
+	//
+	// A claim still inside its takeover window therefore defers. Only once it
+	// is stale -- the holder is presumed gone -- does recovery decide anything.
+	if holder, fresh, herr := p.led.PublicationClaimState(ctx, job.JobID, p.cfg.PublishTakeoverAfter); herr == nil {
+		if fresh && holder != "" && holder != p.led.Actor() {
+			log.Info("another attempt is still publishing this job; not recovering it",
+				slog.String("event", "publication_in_progress"),
+				slog.String("held_by", holder))
+			return deferred(holder, ledger.ErrPublicationInProgress)
+		}
+	}
 
 	name := ""
 	if job.ReservedName != nil {
@@ -652,7 +782,9 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 			JobID: job.JobID, DestinationRoot: root, DeliveredName: name,
 			SizeBytes: size, Fingerprint: sum, Attempt: attempt,
 		}
-		if err := p.led.RecordDelivered(ctx, receipt, true); err != nil {
+		rctx, rcancel := durably(ctx)
+		defer rcancel()
+		if err := p.led.RecordDelivered(rctx, receipt, true); err != nil {
 			return unsettled(err)
 		}
 		log.Info("recovered a publication and reconciled it without republishing",
@@ -691,7 +823,36 @@ func (p *Pipeline) stageBesideDestination(working, tmp string) error {
 	return err
 }
 
+// recordGrace bounds a durable write that has outlived the attempt that
+// established what it records.
+const recordGrace = 10 * time.Second
+
+// durably returns a context for recording an outcome this attempt has ALREADY
+// determined.
+//
+// The handler budget bounds the ATTEMPT, which is right: an attempt cannot run
+// forever. But an outcome established just before the budget ran out is a
+// fact, and dropping it is not a neutral failure. The job stays in
+// `publishing`, the next delivery reads that as "a publication may have
+// happened", finds no destination, and settles `uncertain` -- so a publication
+// the kernel had plainly refused becomes an unresolvable outcome needing a
+// person. Losing a known result is strictly worse than spending another second
+// writing it down.
+//
+// So a write that records something already decided is detached from the
+// attempt's deadline and bounded on its own. This is the same reasoning the
+// consumer already applies when it detaches a running handler from shutdown.
+// While the attempt's context is still live, nothing changes.
+func durably(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), recordGrace)
+}
+
 func (p *Pipeline) hold(ctx context.Context, job ledger.Job, cat jobs.Category, attempt int) Outcome {
+	ctx, cancel := durably(ctx)
+	defer cancel()
 	err := p.led.RecordHold(ctx, job.JobID, cat, attempt)
 	switch {
 	case err == nil:
@@ -719,14 +880,26 @@ func (p *Pipeline) holdOr(ctx context.Context, job ledger.Job, cat jobs.Category
 	// one. It is held immediately, with the reason intact.
 	case jobs.CategoryStorageUnavailable, jobs.CategoryStorageError,
 		jobs.CategoryPermissionDenied:
-		if job.DeliveryAttempts <= p.cfg.MaxDeliveryAttempts {
-			return unsettled(cause), false
+		// `<` and not `<=`, so the LAST permitted attempt records the real
+		// reason instead of returning the delivery one more time.
+		//
+		// With `<=`, the final delivery was requeued and the one after it was
+		// stopped by Process's budget check before it ever reached storage --
+		// so a destination the kernel refuses to write, a root that is gone,
+		// and a disk that is full all ended up recorded as `retry_exhausted`.
+		// That is the same loss of an informative reason the source_absent
+		// note above exists to prevent, and it made every persistent storage
+		// fault look identical to an operator.
+		if job.DeliveryAttempts < p.cfg.MaxDeliveryAttempts {
+			return retryable(cause, cat), false
 		}
 	}
 	return p.hold(ctx, job, cat, attempt), true
 }
 
 func (p *Pipeline) uncertain(ctx context.Context, job ledger.Job, attempt int) Outcome {
+	ctx, cancel := durably(ctx)
+	defer cancel()
 	if err := p.led.RecordUncertain(ctx, job.JobID, jobs.CategoryPublicationUncertain, attempt); err != nil {
 		return unsettled(err)
 	}

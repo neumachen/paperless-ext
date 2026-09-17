@@ -162,18 +162,75 @@ func (p *Processor) handle(ctx context.Context, d broker.Delivery) broker.Decisi
 
 	// Normalization, reservation and publication.
 	out := p.pipeline.Process(ctx, job, msg.Attempt)
+
+	// A deferral is not a fault. A sibling holds the publication claim, so
+	// this attempt did nothing and puts the delivery back untouched.
+	//
+	// It is handled apart from the failure path below for three reasons, each
+	// of which was wrong when the two shared a branch: it was logged as a
+	// postgres_primary problem, which it is not; it detached the consumer, so
+	// one contended job stalled every unrelated job this worker had; and it
+	// spent a delivery against the job's durable retry budget, so two healthy
+	// workers taking turns could hold a document that nothing was wrong with.
+	if out.Deferred {
+		if rerr := p.base.Ledger.ReleaseDelivery(ctx, msg.JobID, msg.Attempt, out.DeferredTo); rerr != nil {
+			// The attempt stays counted. That is the safe direction: the
+			// budget is a bound on retries, and over-counting ends in a hold
+			// somebody can see rather than in an unbounded loop.
+			log.Warn("could not return the deferred delivery attempt to the budget",
+				slog.String("event", "delivery_attempt_not_released"),
+				slog.String("error_kind", logging.ErrorKind(rerr)))
+		}
+		p.base.Metrics.Deliveries.WithLabelValues("deferred").Inc()
+		log.Info("another attempt holds this job's publication; returning the delivery",
+			slog.String("event", "delivery_deferred"),
+			slog.String("held_by", out.DeferredTo))
+		// A short bounded wait before the message goes back, so a contended
+		// job does not spin between workers at broker speed. It holds one
+		// handler slot, not the consumer, which is the difference from the
+		// detach this replaces.
+		select {
+		case <-ctx.Done():
+		case <-time.After(p.cfg.Broker.ReconnectDelay):
+		}
+		return broker.NackRequeue
+	}
+
 	if !out.Settled {
 		// Nothing was committed, so the delivery must go back to the broker.
 		p.base.Metrics.Deliveries.WithLabelValues("requeued").Inc()
 		if out.Err != nil {
 			p.base.Metrics.LedgerErrors.WithLabelValues(logging.ErrorKind(out.Err)).Inc()
 		}
-		log.Error("could not reach a durable outcome; returning the delivery and pausing consumption",
+		// Say which dependency actually failed. A refused destination and a
+		// full disk used to be reported as a PostgreSQL problem, which sent an
+		// operator to look at a database that was working perfectly.
+		dep, cat := out.Dependency, out.Cause
+		if dep == "" {
+			dep, cat = "postgres_primary", jobs.CategoryLedgerUnavailable
+		}
+		log.Error("could not reach a durable outcome; returning the delivery",
 			slog.String("event", "delivery_requeued"),
-			slog.String("dependency", "postgres_primary"),
-			slog.String("category", string(jobs.CategoryLedgerUnavailable)),
+			slog.String("dependency", dep),
+			slog.String("category", string(cat)),
 			slog.String("error_kind", logging.ErrorKind(out.Err)))
-		p.consumer.RequestDetach()
+
+		// Detach only when the dependency itself is unusable. One job's
+		// storage failure is that job's problem: pausing the whole consumer
+		// for it stalls every unrelated job this worker holds, which is the
+		// defect a deferral was already fixed for. A vanished or replaced root
+		// is different -- nothing else will succeed either -- so that still
+		// detaches, and readiness reports it.
+		if dep == "postgres_primary" || cat == jobs.CategoryStorageUnavailable {
+			p.consumer.RequestDetach()
+		} else {
+			// A bounded pause, so a persistently failing job does not spin
+			// between redeliveries at broker speed while its budget runs down.
+			select {
+			case <-ctx.Done():
+			case <-time.After(p.cfg.Broker.ReconnectDelay):
+			}
+		}
 		return broker.NackRequeue
 	}
 
