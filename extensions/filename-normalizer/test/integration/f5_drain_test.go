@@ -231,11 +231,13 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 		t.Errorf("the ledger holds %d jobs in %q but %d were registered during the load window",
 			snap.ByState[jobs.StateHeld], jobs.StateHeld, registered)
 	}
-	for _, state := range []jobs.State{jobs.StateDelivered, jobs.StateUncertain} {
-		if n := snap.ByState[state]; n != 0 {
-			t.Errorf("%d job(s) reached %q, which no code path in this increment produces", n, state)
-		}
-	}
+	// There used to be a whole-ledger assertion here that no job is ever
+	// delivered or uncertain. Both states are reachable now, and the
+	// normalization phase legitimately produces deliveries, so that check
+	// would fail on the system working. The property it was protecting -- that
+	// these particular jobs, registered with no source file, cannot be
+	// delivered -- is already covered by the per-job sample loop above, which
+	// requires each of them to be held.
 
 	// The terminated instance must have settled work after shutdown began, or
 	// nothing was in flight and the drain was not exercised.

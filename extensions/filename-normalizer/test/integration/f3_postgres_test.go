@@ -328,15 +328,15 @@ func TestF3AccountingReflectsTheLedger(t *testing.T) {
 		_ = metricValue(t, body, "fn_jobs", map[string]string{"state": string(state)})
 	}
 
-	// This increment records holds; it never records a delivery or an
-	// uncertain outcome. A non-zero count here would mean the foundation is
-	// claiming an outcome it cannot produce.
-	for _, state := range []jobs.State{jobs.StateDelivered, jobs.StateUncertain} {
-		if n := snap.ByState[state]; n != 0 {
-			t.Errorf("the ledger holds %d jobs in state %q, but no code path in this increment produces that state", n, state)
-		}
-		if v := metricValue(t, body, "fn_jobs", map[string]string{"state": string(state)}); v != 0 {
-			t.Errorf("fn_jobs{state=%q} is %v; this increment must never report that outcome", state, v)
+	// Delivery and uncertainty are real outcomes now, so the old assertion --
+	// that neither state ever appears -- would fail on the system working.
+	// What still has to hold is that the metric agrees with the ledger: a
+	// gauge that reported deliveries the ledger does not have would be
+	// claiming an outcome that did not happen.
+	for _, state := range []jobs.State{jobs.StateDelivered, jobs.StateUncertain, jobs.StateHeld} {
+		want := float64(snap.ByState[state])
+		if v := metricValue(t, body, "fn_jobs", map[string]string{"state": string(state)}); v != want {
+			t.Errorf("fn_jobs{state=%q} is %v but the ledger holds %v", state, v, want)
 		}
 	}
 

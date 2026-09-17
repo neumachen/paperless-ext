@@ -370,3 +370,61 @@ func (l *Ledger) JobBySource(ctx context.Context, root, name string) (Job, error
 	}
 	return job, nil
 }
+
+// DeliveredWithoutReceipt counts jobs marked delivered that have no receipt.
+//
+// It must always be zero: RecordDelivered writes the receipt and the state in
+// one transaction. A non-zero answer means a delivered state appeared without
+// the evidence that is supposed to accompany it.
+func (l *Ledger) DeliveredWithoutReceipt(ctx context.Context) (int, error) {
+	var n int
+	err := l.primary.QueryRow(ctx, `
+		SELECT count(*) FROM jobs j
+		 WHERE j.state = 'delivered'
+		   AND NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = j.job_id)`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count delivered jobs without a receipt: %w", err)
+	}
+	return n, nil
+}
+
+// UncertainWithoutPublishAttempt counts uncertain jobs for which no
+// publication was ever attempted.
+//
+// It must always be zero: uncertainty is only reachable after the publish
+// intent has been committed. A non-zero answer means uncertainty was inferred
+// rather than observed.
+func (l *Ledger) UncertainWithoutPublishAttempt(ctx context.Context) (int, error) {
+	var n int
+	err := l.primary.QueryRow(ctx, `
+		SELECT count(*) FROM jobs j
+		 WHERE j.state = 'uncertain'
+		   AND j.publish_attempted_at IS NULL`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count uncertain jobs without a publication attempt: %w", err)
+	}
+	return n, nil
+}
+
+// DeliveredNames returns the set of names delivered into a destination root.
+//
+// It is the counterpart to reading the directory: a file in the destination
+// that is not in this set was not put there by the pipeline.
+func (l *Ledger) DeliveredNames(ctx context.Context, root string) (map[string]bool, error) {
+	rows, err := l.primary.Query(ctx,
+		`SELECT delivered_name FROM delivery_receipts WHERE destination_root = $1`, root)
+	if err != nil {
+		return nil, fmt.Errorf("read delivered names: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
+}

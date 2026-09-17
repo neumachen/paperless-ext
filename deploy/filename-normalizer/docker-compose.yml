@@ -363,6 +363,24 @@ services:
       - "${FN_RENAMER2_PORT:-18082}:8080"
 
   # -------------------------------------------------------------------------
+  # A renamer in dry-run mode, for the A9 demonstration. It consumes the same
+  # real queue as its siblings, so `make test-dry-run` stops them first: the
+  # point is to show what a dry run does NOT do, which only means anything if
+  # it is the only consumer.
+  # -------------------------------------------------------------------------
+  renamer-dry-run:
+    <<: *renamer
+    profiles: [fault]
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-dry-run
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "1"
+      FN_RENAMER_DRY_RUN: "true"
+      FN_GRPC_ADDR: ":9090"
+    ports: !reset []
+
+  # -------------------------------------------------------------------------
   # A watcher whose incoming root was never mounted.
   #
   # Its database and broker are the healthy ones, so storage is the only thing
@@ -390,6 +408,7 @@ services:
       FN_WATCHER_ACCOUNTING_INTERVAL: 5s
     secrets: [fn_db_password, fn_amqp_password]
     volumes:
+      - ./config:/etc/fn:ro
       - fn-queued:/srv/fn/queued
       - fn-staging:/srv/fn/staging
       - fn-consume:/srv/fn/consume:ro
