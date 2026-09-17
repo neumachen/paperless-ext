@@ -81,6 +81,11 @@ type EffectiveProcessing struct {
 	Prefetch            int  `json:"prefetch"`
 	MaxDeliveryAttempts int  `json:"max_delivery_attempts"`
 	DryRun              bool `json:"dry_run"`
+	// PublishTakeoverMS is how old a publication claim must be before another
+	// attempt may take it over. Reported because an operator diagnosing a
+	// stranded or a double-attempted publication needs to know it, and it is
+	// no longer implied by the shutdown timeout.
+	PublishTakeoverMS int64 `json:"publish_takeover_ms"`
 }
 
 // EffectiveDependencies names the endpoints without their credentials.
@@ -176,6 +181,7 @@ func (c RenamerConfig) Effective() Effective {
 		Concurrency:         c.Concurrency,
 		Prefetch:            c.Prefetch,
 		MaxDeliveryAttempts: c.MaxDeliveryAttempts,
+		PublishTakeoverMS:   c.PublishTakeoverAfter.Milliseconds(),
 		DryRun:              c.DryRun,
 	}
 	return e

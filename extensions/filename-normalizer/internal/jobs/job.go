@@ -198,6 +198,13 @@ const (
 	EventUncertain EventType = "uncertain"
 	// EventDryRun is written when a dry run examined a job without acting.
 	EventDryRun EventType = "dry_run"
+	// EventDeliveryDeferred is written when an attempt stood down because a
+	// sibling held the publication claim, and gave its delivery attempt back.
+	EventDeliveryDeferred EventType = "delivery_deferred"
+	// EventPublishAbandoned is written when a claim is withdrawn because the
+	// link definitely did not happen, so the next delivery is an ordinary
+	// attempt rather than a recovery.
+	EventPublishAbandoned EventType = "publish_abandoned"
 )
 
 // SafeIdentifier reports whether a string is safe to use as a metric label

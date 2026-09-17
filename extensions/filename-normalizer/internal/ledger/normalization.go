@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -157,6 +158,24 @@ type PublishClaim struct {
 	Device    int64
 }
 
+// ClaimHolder extracts the attempt named in an ErrPublicationInProgress.
+//
+// The holder's name is part of the error text so the deferring attempt can put
+// it in its own history without a second query. An error of any other shape
+// yields "unknown" rather than a panic: this is used only for logging.
+func ClaimHolder(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	const marker = "held by "
+	if i := strings.LastIndex(err.Error(), marker); i >= 0 {
+		if h := strings.TrimSpace(err.Error()[i+len(marker):]); h != "" {
+			return h
+		}
+	}
+	return "unknown"
+}
+
 // ClaimPublication takes the exclusive right to publish, and records the
 // identity of the file that is about to be linked.
 //
@@ -233,6 +252,129 @@ func (l *Ledger) ClaimPublication(ctx context.Context, jobID, reserved string, i
 		return PublishClaim{}, err
 	}
 	return claim, nil
+}
+
+// AbandonPublication withdraws a claim for a publication that DID NOT HAPPEN.
+//
+// Only the caller can know that, and only for a definite failure. link(2) is
+// atomic: it either creates the directory entry or it does not, so EACCES,
+// EROFS, ENOSPC and their kind mean nothing was published. An ambiguous
+// failure -- an I/O error, or the process dying -- means the opposite and must
+// leave the claim standing.
+//
+// # Why this is necessary
+//
+// `publishing` means "a publication may have happened", and a job left in it
+// is handled by the recovery path on its next delivery. A refused link left
+// the job there, so the retry did not retry: it recovered, found no
+// destination, and recorded `uncertain`. A destination the kernel had plainly
+// refused to write therefore ended up as an unresolvable outcome needing a
+// person, instead of a retry that would have failed again and recorded the
+// real reason. That is the worst available direction to be wrong in.
+//
+// Withdrawing the claim returns the job to `processing`, so the next delivery
+// is an ordinary attempt.
+func (l *Ledger) AbandonPublication(ctx context.Context, jobID string, attempt int, reason string) error {
+	return l.tx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE jobs
+			   SET state = 'processing',
+			       publish_claimed_by = NULL,
+			       publish_inode = NULL,
+			       publish_device = NULL,
+			       updated_at = now()
+			 WHERE job_id = $1
+			   AND state = 'publishing'
+			   AND publish_claimed_by = $2
+			   AND NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = $1)`,
+			jobID, l.actor)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			// Somebody else holds the claim, a receipt exists, or the job
+			// moved on. Withdrawing anything here would be acting on a stale
+			// view, which is the class of bug this whole area exists to close.
+			return nil
+		}
+		return l.appendEvent(ctx, tx, eventInput{
+			JobID:     jobID,
+			EventType: jobs.EventPublishAbandoned,
+			ToState:   ptr(string(jobs.StateProcessing)),
+			Attempt:   ptr(attempt),
+			Detail:    map[string]any{"reason": reason},
+		})
+	})
+}
+
+// Actor is the instance name this ledger writes history rows as. Recovery
+// compares it against a claim holder to tell "somebody else is publishing
+// this" from "I was publishing this and came back".
+func (l *Ledger) Actor() string { return l.actor }
+
+// PublicationClaimState reports who holds a job's publication claim and
+// whether that claim is still within the takeover window.
+//
+// Recovery needs this. A job in `publishing` is not necessarily abandoned:
+// it is also what a job looks like while a LIVE attempt is between its claim
+// and its link. Treating the two the same is how a healthy publication got
+// declared uncertain out from under the worker that was still performing it.
+func (l *Ledger) PublicationClaimState(ctx context.Context, jobID string, takeoverAfter time.Duration) (holder string, fresh bool, err error) {
+	var who *string
+	var live *bool
+	row := l.primary.QueryRow(ctx, `
+		SELECT publish_claimed_by,
+		       publish_attempted_at > now() - $2::interval
+		  FROM jobs
+		 WHERE job_id = $1`, jobID, takeoverAfter.String())
+	if err := row.Scan(&who, &live); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, ErrNotFound
+		}
+		return "", false, err
+	}
+	if who == nil {
+		return "", false, nil
+	}
+	return *who, live != nil && *live, nil
+}
+
+// ReleaseDelivery gives back a delivery attempt that did no work.
+//
+// BeginDelivery counts every delivery against the job's durable retry budget,
+// which is right when an attempt tried and failed: that is what the budget is
+// for. An attempt that stood down because a SIBLING held the publication claim
+// did not try. It found the work already in hand and put the message back
+// untouched.
+//
+// Counting those would let two healthy workers spend a job's entire budget on
+// each other. A document held for retry_exhausted when nothing was ever wrong
+// with it is worse than the race the claim was added to prevent, because it
+// needs a person to clear it.
+//
+// The decrement is floored at zero and skipped once the job is terminal, so a
+// late release can neither drive the counter negative nor resurrect an outcome.
+func (l *Ledger) ReleaseDelivery(ctx context.Context, jobID string, attempt int, holder string) error {
+	return l.tx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE jobs
+			   SET delivery_attempts = GREATEST(delivery_attempts - 1, 0),
+			       updated_at = now()
+			 WHERE job_id = $1
+			   AND state NOT IN ('delivered','held','uncertain')`, jobID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+		return l.appendEvent(ctx, tx, eventInput{
+			JobID:     jobID,
+			EventType: jobs.EventDeliveryDeferred,
+			Attempt:   ptr(attempt),
+			Detail:    map[string]any{"publication_held_by": holder},
+		})
+	})
 }
 
 // RecordDelivered writes the delivery receipt and moves the job to delivered.

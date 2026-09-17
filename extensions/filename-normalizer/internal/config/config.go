@@ -165,6 +165,17 @@ type RenamerConfig struct {
 	Prefetch int
 	// MaxDeliveryAttempts bounds redelivery before a job is held.
 	MaxDeliveryAttempts int
+	// PublishTakeoverAfter is how old a publication claim must be before
+	// another attempt may take it over.
+	//
+	// It is its own setting rather than the shutdown timeout it used to
+	// borrow. Those answer different questions -- "how long do we wait for a
+	// graceful stop" and "how long before we presume the worker holding this
+	// publication is gone" -- and tying them together meant an operator could
+	// not lengthen one without lengthening the other. Too short and a live
+	// publication gets taken over mid-flight; too long and a genuinely dead
+	// worker's claim strands a document.
+	PublishTakeoverAfter time.Duration
 	// DryRun switches the renamer into preview mode. It does not consume the
 	// work queue at all; see the renamer package for why.
 	DryRun bool
@@ -452,6 +463,7 @@ func LoadRenamer() (RenamerConfig, error) {
 			cfg.Prefetch, cfg.Concurrency)
 	}
 	cfg.MaxDeliveryAttempts = l.intVal("FN_RENAMER_MAX_DELIVERY_ATTEMPTS", attempts, 1, 100)
+	cfg.PublishTakeoverAfter = l.duration("FN_PUBLISH_TAKEOVER_AFTER", cfg.ShutdownTimeout, 5*time.Second, 10*time.Minute)
 	cfg.DryRun = l.boolVal("FN_RENAMER_DRY_RUN", dryRun)
 
 	if len(l.problems) > 0 {
