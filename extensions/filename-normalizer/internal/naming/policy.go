@@ -170,9 +170,17 @@ func (p Policy) normalizeOnce(original, jobID string) (Result, error) {
 
 	var res Result
 	var rerr error
+	beforeRules := stem
 	stem, res.RuleHits, rerr = p.Rules.apply(stem)
 	if rerr != nil {
 		return Result{}, rerr
+	}
+	// Unicode preservation is enforced for THIS input, not merely probed with a
+	// fixed corpus at configuration time. A rule written as ^für$ -> fur evades
+	// any finite set of probes, converges perfectly, and silently transliterates
+	// a character the owner explicitly required to be preserved.
+	if err := checkPreservedRunes(beforeRules, stem); err != nil {
+		return Result{}, err
 	}
 	stem = normalizeStem(stem)
 
@@ -430,6 +438,8 @@ func HoldCategory(err error) string {
 		return "name_too_long"
 	case errors.Is(err, ErrExpansionTooLarge):
 		return "policy_expansion_too_large"
+	case errors.Is(err, ErrTransliterated):
+		return "policy_transliterates"
 	default:
 		return "normalization_failed"
 	}
@@ -456,6 +466,49 @@ func (p Policy) VerifyFinalName(name, jobID string) error {
 	}
 	if again.Name != name {
 		return fmt.Errorf("%w: the final name is not a fixed point", ErrNotIdempotent)
+	}
+	return nil
+}
+
+// ErrTransliterated reports that configured rules replaced a preserved
+// character with a different one.
+var ErrTransliterated = errors.New("configured rules transliterate a preserved character")
+
+// checkPreservedRunes enforces the Unicode-preservation contract per input.
+//
+// The owner's confirmed direction is that characters such as ä, ö, ü and ß are
+// PRESERVED rather than transliterated to ASCII. The character pipeline decides
+// which classes survive, but it cannot tell whether a configured rule swapped
+// one letter for another before the pipeline ran -- to the pipeline, "fur" is
+// simply a word.
+//
+// The rule applied here is narrow enough to be correct and broad enough to be
+// useful: a non-ASCII letter present before the rules must either still be
+// present afterwards, or be gone along with the rest of its text. Deleting a
+// segment is legitimate; swapping ü for u inside otherwise intact text is the
+// transliteration the contract forbids.
+func checkPreservedRunes(before, after string) error {
+	if before == after {
+		return nil
+	}
+	lowerAfter := strings.ToLower(after)
+
+	// A rule that removed most of the text is deleting, not transliterating.
+	// The threshold is generous: only when the result still carries the bulk of
+	// the original is a vanished letter treated as a substitution.
+	if len(after) < len(before)/2 {
+		return nil
+	}
+
+	seen := map[rune]bool{}
+	for _, r := range strings.ToLower(before) {
+		if r < 0x80 || !unicode.IsLetter(r) || seen[r] {
+			continue
+		}
+		seen[r] = true
+		if !strings.ContainsRune(lowerAfter, r) {
+			return fmt.Errorf("%w: %q is no longer present after the rules ran", ErrTransliterated, string(r))
+		}
 	}
 	return nil
 }

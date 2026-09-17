@@ -242,19 +242,101 @@ func openRegular(path string) (*os.File, Entry, error) {
 // together with the identity of the file that was actually opened.
 //
 // The caller reads from the returned descriptor. It must not re-open the path.
+//
+// # Why every component is opened, not just the last one
+//
+// O_NOFOLLOW protects the FINAL component only. In recursive discovery the
+// name is a relative subpath, so "sub/doc.pdf" can be redirected by replacing
+// `sub` with a symlink to somewhere outside the root: the final component is
+// then an honest regular file, and the containment check -- which resolved the
+// root once and joined a cleaned relative path to it -- never looks at what
+// `sub` actually is.
+//
+// The walk below descends one component at a time from a descriptor on the
+// resolved root, each step refusing to follow a symlink. A replaced parent is
+// therefore rejected at the moment it is traversed, not inferred from a
+// pathname that no longer describes the filesystem.
 func Open(root, name string, allowSubdirs bool) (*os.File, Entry, error) {
 	if strings.HasPrefix(filepath.Base(name), ".") {
 		return nil, Entry{}, ErrHidden
 	}
-	path, err := safeJoin(root, name, allowSubdirs)
-	if err != nil {
+	if _, err := safeJoin(root, name, allowSubdirs); err != nil {
 		return nil, Entry{}, err
 	}
-	f, e, err := openRegular(path)
+
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, Entry{}, fmt.Errorf("resolve root: %w", err)
+	}
+
+	parts := strings.Split(filepath.ToSlash(name), "/")
+	dir, err := os.OpenFile(realRoot, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, Entry{}, fmt.Errorf("open root: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
+
+	for i, part := range parts[:len(parts)-1] {
+		next, derr := openatDir(dir, part)
+		if derr != nil {
+			if errors.Is(derr, syscall.ELOOP) || errors.Is(derr, syscall.ENOTDIR) {
+				return nil, Entry{}, fmt.Errorf("%w: component %d of the path is not a directory this root contains",
+					ErrEscapesRoot, i)
+			}
+			return nil, Entry{}, derr
+		}
+		_ = dir.Close()
+		dir = next
+	}
+
+	f, e, err := openRegularAt(dir, parts[len(parts)-1])
 	if err != nil {
 		return nil, Entry{}, err
 	}
 	e.Name = name
+	e.Path = filepath.Join(realRoot, filepath.Join(parts...))
+	return f, e, nil
+}
+
+// openatDir opens a subdirectory relative to an open directory, refusing a
+// symlink.
+func openatDir(dir *os.File, name string) (*os.File, error) {
+	fd, err := syscall.Openat(int(dir.Fd()), name,
+		syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+// openRegularAt opens a file relative to an open directory and confirms from
+// the descriptor that it is a regular file.
+func openRegularAt(dir *os.File, name string) (*os.File, Entry, error) {
+	fd, err := syscall.Openat(int(dir.Fd()), name,
+		syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, Entry{}, ErrSymlink
+		}
+		return nil, Entry{}, err
+	}
+	f := os.NewFile(uintptr(fd), name)
+
+	fi, serr := f.Stat()
+	if serr != nil {
+		f.Close()
+		return nil, Entry{}, serr
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, Entry{}, fmt.Errorf("%w: mode %s", ErrNotRegular, fi.Mode().Type())
+	}
+
+	e := Entry{Name: name, Size: fi.Size(), ModTime: fi.ModTime()}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		e.Inode = uint64(st.Ino)
+		e.Device = uint64(st.Dev)
+	}
 	return f, e, nil
 }
 
@@ -500,4 +582,23 @@ func RejectionCategory(err error) string {
 	default:
 		return "storage_error"
 	}
+}
+
+// Identify reports the identity of a regular file without reading it.
+//
+// It refuses a final symlink and anything that is not a regular file, and it
+// answers from the descriptor it opened rather than from a second lookup of
+// the pathname.
+//
+// Identity is what proves ownership of a destination. Content cannot: two
+// distinct submissions may legitimately hold identical bytes, and the contract
+// requires them to stay distinct, so "the bytes match" must never be read as
+// "this is my file".
+func Identify(path string) (Entry, error) {
+	f, e, err := openRegular(path)
+	if err != nil {
+		return Entry{}, err
+	}
+	f.Close()
+	return e, nil
 }

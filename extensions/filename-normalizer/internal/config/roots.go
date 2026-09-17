@@ -1,6 +1,8 @@
 package config
 
 import (
+	"sync"
+
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/storage"
 )
 
@@ -20,8 +22,22 @@ import (
 // what actually distinguishes one directory from another. It also remembers
 // the identity so a later check can tell whether a root is still the same
 // directory: a remount between startup and use would otherwise be invisible.
+// The mutable part lives behind a pointer because the configuration structs
+// are values that get copied freely -- into Common, into the app, into every
+// worker. A mutex embedded in a copied value protects nothing and `go vet`
+// says so; a shared pointer means every copy of the configuration refers to
+// the same root state, which is what adopting a late root requires anyway.
 type RootSet struct {
+	state *rootState
+}
+
+type rootState struct {
+	mu    sync.Mutex
 	roots []storage.RootID
+	// pending are roots that did not resolve at startup. They are adopted --
+	// and checked for aliasing -- the first time they become available, so
+	// late availability cannot bypass the separation guarantee.
+	pending []pendingRoot
 }
 
 // identifyRoots resolves the configured roots and checks they are distinct.
@@ -40,26 +56,33 @@ func identifyRoots(l *loader, s Storage) RootSet {
 		{"failed", s.Failed},
 	}
 
-	var out RootSet
+	out := RootSet{state: &rootState{}}
 	for _, r := range want {
 		if r.path == "" {
 			continue
 		}
 		id, err := storage.IdentifyRoot(r.name, r.path)
 		if err != nil {
-			// Unresolvable now; readiness will report it. Nothing is recorded,
-			// so Verify has nothing to compare and will not block processing
-			// once the root appears.
+			// Unresolvable right now. The applications are expected to start
+			// with storage down and report not-ready, so this is not fatal --
+			// but it must NOT be forgotten. A root omitted from the recorded
+			// set was omitted from every later identity check too, so a
+			// staging root that appeared after startup could quietly alias
+			// consume and expose working copies to the consumer.
+			out.state.pending = append(out.state.pending, pendingRoot{role: r.name, path: r.path})
 			continue
 		}
-		out.roots = append(out.roots, id)
+		out.state.roots = append(out.state.roots, id)
 	}
 
-	if err := storage.DistinctRoots(out.roots); err != nil {
+	if err := storage.DistinctRoots(out.state.roots); err != nil {
 		l.fail("%v", err)
 	}
 	return out
 }
+
+// pendingRoot is a configured root that could not be resolved at startup.
+type pendingRoot struct{ role, path string }
 
 // Verify re-resolves every recorded root and reports the first that changed.
 //
@@ -67,18 +90,50 @@ func identifyRoots(l *loader, s Storage) RootSet {
 // processed, so a root that was remounted or repointed after startup is caught
 // before a document is read from or written to the wrong directory.
 func (rs RootSet) Verify() error {
-	for _, r := range rs.roots {
+	if rs.state == nil {
+		return nil
+	}
+	rs.state.mu.Lock()
+	defer rs.state.mu.Unlock()
+
+	// Adopt any root that has appeared since startup, and check it against the
+	// others before it is used for anything.
+	if len(rs.state.pending) > 0 {
+		still := rs.state.pending[:0]
+		for _, p := range rs.state.pending {
+			id, err := storage.IdentifyRoot(p.role, p.path)
+			if err != nil {
+				still = append(still, p)
+				continue
+			}
+			rs.state.roots = append(rs.state.roots, id)
+		}
+		rs.state.pending = still
+		if err := storage.DistinctRoots(rs.state.roots); err != nil {
+			return err
+		}
+	}
+
+	for _, r := range rs.state.roots {
 		if err := r.Verify(); err != nil {
 			return err
 		}
 	}
-	return nil
+	// Re-checking aliasing every time is cheap and catches a root that was
+	// repointed at another role's directory rather than at a new one, which
+	// the per-root identity check alone would accept.
+	return storage.DistinctRoots(rs.state.roots)
 }
 
 // Devices reports the device backing each role, for evidence.
 func (rs RootSet) Devices() map[string]uint64 {
 	out := map[string]uint64{}
-	for _, r := range rs.roots {
+	if rs.state == nil {
+		return out
+	}
+	rs.state.mu.Lock()
+	defer rs.state.mu.Unlock()
+	for _, r := range rs.state.roots {
 		out[r.Role] = r.Device
 	}
 	return out
@@ -87,7 +142,12 @@ func (rs RootSet) Devices() map[string]uint64 {
 // Resolved reports the directory each role actually resolves to.
 func (rs RootSet) Resolved() map[string]string {
 	out := map[string]string{}
-	for _, r := range rs.roots {
+	if rs.state == nil {
+		return out
+	}
+	rs.state.mu.Lock()
+	defer rs.state.mu.Unlock()
+	for _, r := range rs.state.roots {
 		out[r.Role] = r.Real
 	}
 	return out

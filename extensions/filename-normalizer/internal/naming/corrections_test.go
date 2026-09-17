@@ -106,9 +106,15 @@ func TestRulesMayNotTransliteratePreservedCharacters(t *testing.T) {
 	}
 	p.Rules = rules
 
-	// It converges, which is exactly why convergence was not enough.
-	if _, err := p.Normalize("Überweisung.pdf", testJobID); err != nil {
-		t.Fatalf("the rule is idempotent, so Normalize should still succeed: %v", err)
+	// It converges, which is exactly why convergence was not enough. Runtime
+	// now refuses it per input, which is stronger than the corpus gate: a rule
+	// written as ^für$ -> fur evades any finite probe set.
+	_, err := p.Normalize("Überweisung.pdf", testJobID)
+	if err == nil {
+		t.Fatal("Normalize accepted a rule that maps a preserved character to ASCII")
+	}
+	if HoldCategory(err) != "policy_transliterates" {
+		t.Errorf("category = %q, want policy_transliterates", HoldCategory(err))
 	}
 
 	problems = p.SelfCheck()
@@ -199,5 +205,66 @@ func TestBoundedExpansionStillAllowsUsefulGrowth(t *testing.T) {
 	}
 	if got.Name != "doc.pdf" {
 		t.Errorf("got %q, want %q", got.Name, "doc.pdf")
+	}
+}
+
+// FN-N008 (second round): the corpus gate could be evaded by writing a rule
+// that only fires on a stem the corpus does not contain.
+//
+// Before: pattern ^für$ with replacement "fur" passed CompileRules, passed
+// SelfCheck -- none of the six fixed probes is "für" -- converged, and turned
+// für.pdf into fur.pdf, transliterating a character the owner explicitly
+// required to be preserved.
+func TestCorpusEvadingTransliterationIsRefusedAtRuntime(t *testing.T) {
+	p := DefaultPolicy()
+	rules, problems := CompileRules([]RuleSpec{
+		{Name: "fuer", Pattern: "^für$", Replacement: "fur"},
+	})
+	if len(problems) != 0 {
+		t.Fatalf("compile: %v", problems)
+	}
+	p.Rules = rules
+
+	// The corpus gate does NOT catch this, and saying so is the point: a
+	// configuration-time probe set cannot anticipate every input.
+	if probes := p.SelfCheck(); len(probes) != 0 {
+		t.Logf("SelfCheck happened to flag it: %v", probes)
+	}
+
+	_, err := p.Normalize("für.pdf", testJobID)
+	if err == nil {
+		t.Fatal("für.pdf was transliterated to fur.pdf")
+	}
+	if HoldCategory(err) != "policy_transliterates" {
+		t.Errorf("category = %q, want policy_transliterates", HoldCategory(err))
+	}
+
+	// A name the rule does not touch must be unaffected.
+	got, err := p.Normalize("Bericht.pdf", testJobID)
+	if err != nil {
+		t.Fatalf("an untouched name was refused: %v", err)
+	}
+	if got.Name != "bericht.pdf" {
+		t.Errorf("got %q", got.Name)
+	}
+}
+
+// TestDeletingRulesRemainAllowed: the per-input check must not forbid a rule
+// that legitimately removes text containing a preserved character.
+func TestDeletingRulesRemainAllowed(t *testing.T) {
+	p := DefaultPolicy()
+	rules, problems := CompileRules([]RuleSpec{
+		{Name: "drop-suffix", Pattern: ` – Überweisung$`, Replacement: "", All: true},
+	})
+	if len(problems) != 0 {
+		t.Fatalf("compile: %v", problems)
+	}
+	p.Rules = rules
+	got, err := p.Normalize("Rechnung 2026 – Überweisung.pdf", testJobID)
+	if err != nil {
+		t.Fatalf("a rule that deletes a segment was refused as transliteration: %v", err)
+	}
+	if got.Name != "rechnung_2026.pdf" {
+		t.Errorf("got %q, want %q", got.Name, "rechnung_2026.pdf")
 	}
 }
