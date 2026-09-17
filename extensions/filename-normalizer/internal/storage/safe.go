@@ -40,33 +40,131 @@ var (
 	// ErrDestinationExists reports that a destination name is already taken by
 	// a file this job did not publish.
 	ErrDestinationExists = errors.New("destination already exists")
+	// ErrRootChanged reports that an authorized root is not the directory it
+	// was when the process validated it.
+	ErrRootChanged = errors.New("storage root is not the directory it was")
+	// ErrRootAlias reports two configured roots resolving to one directory.
+	ErrRootAlias = errors.New("two storage roots resolve to the same directory")
 )
 
-// SafeJoin resolves name inside root and refuses anything that leaves it.
+// ---------------------------------------------------------------------------
+// Root identity
+// ---------------------------------------------------------------------------
+
+// RootID is the filesystem identity of an authorized root.
 //
-// The name must be a single path element: discovery hands over base names, and
-// a stored source_name that somehow contained a separator must never be
-// interpreted as a path. The root itself is resolved through symlinks once, so
-// a legitimately symlinked root still works, while a symlinked *entry* inside
-// it is rejected separately by Inspect.
-func SafeJoin(root, name string) (string, error) {
+// Roots are compared by device and inode rather than by pathname, because the
+// deployment is allowed to mount a root through a symlink: two different
+// strings can name one directory, and one string can name a different
+// directory after a remount. A textual comparison satisfies neither case, and
+// a staging root that is secretly the consume root would expose an incomplete
+// working copy to the consumer.
+type RootID struct {
+	Role   string
+	Path   string
+	Real   string
+	Device uint64
+	Inode  uint64
+}
+
+// IdentifyRoot resolves a root and records the directory it actually is.
+func IdentifyRoot(role, path string) (RootID, error) {
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return RootID{}, fmt.Errorf("resolve %s root: %w", role, err)
+	}
+	fi, err := os.Stat(real)
+	if err != nil {
+		return RootID{}, fmt.Errorf("stat %s root: %w", role, err)
+	}
+	if !fi.IsDir() {
+		return RootID{}, fmt.Errorf("%s root is not a directory", role)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return RootID{}, errors.New("directory identity is unavailable on this platform")
+	}
+	return RootID{Role: role, Path: path, Real: real, Device: uint64(st.Dev), Inode: uint64(st.Ino)}, nil
+}
+
+// Verify re-resolves the root and reports whether it is still the same
+// directory. It is called before a root is used, not only at startup.
+func (r RootID) Verify() error {
+	now, err := IdentifyRoot(r.Role, r.Path)
+	if err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrRootChanged, r.Role, err)
+	}
+	if now.Device != r.Device || now.Inode != r.Inode {
+		return fmt.Errorf("%w: %s was device %d inode %d and is now device %d inode %d",
+			ErrRootChanged, r.Role, r.Device, r.Inode, now.Device, now.Inode)
+	}
+	return nil
+}
+
+// DistinctRoots reports an error if any two roots resolve to one directory.
+//
+// The paths may legitimately differ in spelling; what must differ is the
+// directory. Staging and consume sharing a directory is the dangerous case,
+// but any collision means one role can see another's intermediates.
+func DistinctRoots(roots []RootID) error {
+	seen := map[[2]uint64]RootID{}
+	for _, r := range roots {
+		key := [2]uint64{r.Device, r.Inode}
+		if prev, dup := seen[key]; dup {
+			return fmt.Errorf("%w: %s (%s) and %s (%s) are both %s",
+				ErrRootAlias, prev.Role, prev.Path, r.Role, r.Path, r.Real)
+		}
+		seen[key] = r
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Names and containment
+// ---------------------------------------------------------------------------
+
+// SafeJoin resolves a name inside a root and refuses anything that leaves it.
+//
+// The name may contain separators only when the caller allows a relative
+// subpath, which discovery does in recursive mode. Every component is checked
+// individually: a component that is empty, "." or ".." is refused outright, so
+// containment does not depend on the cleaned result alone.
+func SafeJoin(root, name string) (string, error) { return safeJoin(root, name, false) }
+
+// SafeJoinRel is SafeJoin for a relative subpath below the root.
+func SafeJoinRel(root, name string) (string, error) { return safeJoin(root, name, true) }
+
+func safeJoin(root, name string, allowSubdirs bool) (string, error) {
 	if name == "" || name == "." || name == ".." {
 		return "", fmt.Errorf("%w: empty or relative", ErrUnsafeName)
 	}
-	if strings.ContainsRune(name, os.PathSeparator) || strings.ContainsRune(name, '/') {
-		return "", fmt.Errorf("%w: contains a separator", ErrUnsafeName)
-	}
 	if strings.ContainsRune(name, 0) {
 		return "", fmt.Errorf("%w: contains a NUL byte", ErrUnsafeName)
+	}
+	if filepath.IsAbs(name) {
+		return "", fmt.Errorf("%w: absolute", ErrUnsafeName)
+	}
+	if strings.ContainsRune(name, '\\') {
+		return "", fmt.Errorf("%w: contains a backslash", ErrUnsafeName)
+	}
+
+	parts := strings.Split(name, "/")
+	if !allowSubdirs && len(parts) != 1 {
+		return "", fmt.Errorf("%w: contains a separator", ErrUnsafeName)
+	}
+	for _, part := range parts {
+		switch part {
+		case "", ".", "..":
+			return "", fmt.Errorf("%w: unsafe path component", ErrUnsafeName)
+		}
 	}
 
 	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return "", fmt.Errorf("resolve root: %w", err)
 	}
-	full := filepath.Join(realRoot, name)
+	full := filepath.Join(realRoot, filepath.Join(parts...))
 
-	// Join already cleans, but verify explicitly rather than trusting it.
 	rel, err := filepath.Rel(realRoot, full)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("%w: %s", ErrEscapesRoot, rel)
@@ -86,62 +184,151 @@ type Entry struct {
 	Device uint64
 }
 
-// Inspect stats a candidate without following symlinks and rejects everything
-// that is not an ordinary, non-hidden regular file inside root.
-//
-// Lstat rather than Stat is the point: a symlink pointing at a file outside
-// the root would satisfy Stat, and following it would publish a document the
-// operator never placed in the incoming directory.
-func Inspect(root, name string) (Entry, error) {
-	// Containment is checked BEFORE the dotfile rule. "../escape.pdf" starts
-	// with a dot and would otherwise be reported as a hidden file, which is
-	// true but useless: the reason that matters is that it tried to leave the
-	// root, and an operator reading "hidden_file" would not learn that.
-	path, err := SafeJoin(root, name)
-	if err != nil {
-		return Entry{}, err
-	}
-	if strings.HasPrefix(filepath.Base(name), ".") {
-		return Entry{}, ErrHidden
-	}
-	fi, err := os.Lstat(path)
-	if err != nil {
-		return Entry{}, err
-	}
-	switch {
-	case fi.Mode()&fs.ModeSymlink != 0:
-		return Entry{}, ErrSymlink
-	case !fi.Mode().IsRegular():
-		return Entry{}, fmt.Errorf("%w: mode %s", ErrNotRegular, fi.Mode().Type())
-	}
-
-	e := Entry{Name: name, Path: path, Size: fi.Size(), ModTime: fi.ModTime()}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-		e.Inode = uint64(st.Ino)
-		e.Device = uint64(st.Dev)
-	}
-	return e, nil
-}
-
 // SameFile reports whether two observations describe the same file, unchanged.
-//
-// Identity is compared before content: a source replaced by a different file
-// with identical size and timestamp is still a different submission.
 func SameFile(a, b Entry) bool {
 	return a.Inode == b.Inode && a.Device == b.Device &&
 		a.Size == b.Size && a.ModTime.Equal(b.ModTime)
 }
 
+// ---------------------------------------------------------------------------
+// Opening: the check and the read are the same file
+// ---------------------------------------------------------------------------
+
+// openRegular opens a path without following a final symlink and without
+// blocking, then confirms from the OPEN DESCRIPTOR that it is a regular file.
+//
+// This is the whole point of the function. Checking a pathname with Lstat and
+// then opening the same pathname later is two operations on a name, not one
+// operation on a file: between them the name can be repointed at a symlink
+// leading outside the root, or at a FIFO whose open blocks forever. Here the
+// kernel resolves the name once, and every subsequent question -- is it
+// regular? what is its identity? what are its bytes? -- is answered about the
+// descriptor that resulted, not about the name.
+//
+// O_NOFOLLOW refuses a final symlink outright. O_NONBLOCK means a FIFO cannot
+// hang the open; fstat then rejects it for not being a regular file.
+func openRegular(path string) (*os.File, Entry, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		// ELOOP is what O_NOFOLLOW returns for a symlink; report it as one.
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, Entry{}, ErrSymlink
+		}
+		return nil, Entry{}, err
+	}
+
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, Entry{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, Entry{}, fmt.Errorf("%w: mode %s", ErrNotRegular, fi.Mode().Type())
+	}
+
+	e := Entry{
+		Name: filepath.Base(path), Path: path,
+		Size: fi.Size(), ModTime: fi.ModTime(),
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		e.Inode = uint64(st.Ino)
+		e.Device = uint64(st.Dev)
+	}
+	return f, e, nil
+}
+
+// Open opens an eligible entry inside a root and returns the descriptor
+// together with the identity of the file that was actually opened.
+//
+// The caller reads from the returned descriptor. It must not re-open the path.
+func Open(root, name string, allowSubdirs bool) (*os.File, Entry, error) {
+	if strings.HasPrefix(filepath.Base(name), ".") {
+		return nil, Entry{}, ErrHidden
+	}
+	path, err := safeJoin(root, name, allowSubdirs)
+	if err != nil {
+		return nil, Entry{}, err
+	}
+	f, e, err := openRegular(path)
+	if err != nil {
+		return nil, Entry{}, err
+	}
+	e.Name = name
+	return f, e, nil
+}
+
+// Inspect reports an entry's identity without reading it.
+//
+// It opens the file rather than calling Lstat, so the entry it describes is a
+// file that could actually be opened as a regular file at that moment. A
+// caller that then reads by pathname still races; callers that must read
+// should use Open or OpenExpected.
+func Inspect(root, name string) (Entry, error) {
+	f, e, err := Open(root, name, false)
+	if err != nil {
+		return Entry{}, err
+	}
+	f.Close()
+	return e, nil
+}
+
+// InspectRel is Inspect for a relative subpath below the root.
+func InspectRel(root, name string) (Entry, error) {
+	f, e, err := Open(root, name, true)
+	if err != nil {
+		return Entry{}, err
+	}
+	f.Close()
+	return e, nil
+}
+
+// OpenExpected opens an entry and requires it to be the file the caller
+// already observed.
+//
+// This closes the window between discovery and use: if the name now leads to a
+// different file -- replaced, relinked, or rewritten -- the open is refused
+// with ErrMutated instead of reading bytes that belong to something else.
+func OpenExpected(root, name string, expect Entry, allowSubdirs bool) (*os.File, Entry, error) {
+	f, got, err := Open(root, name, allowSubdirs)
+	if err != nil {
+		return nil, Entry{}, err
+	}
+	if got.Inode != expect.Inode || got.Device != expect.Device {
+		f.Close()
+		return nil, Entry{}, fmt.Errorf("%w: identity changed", ErrMutated)
+	}
+	return f, got, nil
+}
+
+// ---------------------------------------------------------------------------
+// Content
+// ---------------------------------------------------------------------------
+
 // Fingerprint streams a file and returns its SHA-256 and size.
+//
+// It refuses a final symlink and anything that is not a regular file, and it
+// reads the descriptor it opened rather than re-opening the path.
 func Fingerprint(path string) ([]byte, int64, error) {
-	f, err := os.Open(path)
+	f, _, err := openRegular(path)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer f.Close()
+	return hashReader(f)
+}
 
+// FingerprintFile hashes an already-open descriptor from its start.
+func FingerprintFile(f *os.File) ([]byte, int64, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, 0, err
+	}
+	return hashReader(f)
+}
+
+func hashReader(r io.Reader) ([]byte, int64, error) {
 	h := sha256.New()
-	n, err := io.CopyBuffer(h, f, make([]byte, copyBufferSize))
+	n, err := io.CopyBuffer(h, r, make([]byte, copyBufferSize))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -149,9 +336,6 @@ func Fingerprint(path string) ([]byte, int64, error) {
 }
 
 // HexFingerprint renders a fingerprint for restricted diagnostics.
-//
-// A content hash identifies a document, so it belongs in restricted state and
-// explicitly requested reports, never in ordinary logs or metric labels.
 func HexFingerprint(sum []byte) string { return hex.EncodeToString(sum) }
 
 // CopyResult describes a completed working copy.
@@ -161,26 +345,20 @@ type CopyResult struct {
 	Fingerprint []byte
 }
 
-// CopyVerified copies src to a working copy at dst, fsyncs it, and returns the
-// content fingerprint computed from the bytes that were actually written.
+// CopyFrom copies an already-open source into a newly created file and returns
+// the fingerprint of the bytes actually written.
 //
-// The fingerprint is taken during the copy rather than by re-reading the
-// source, so what is verified is what landed on disk. dst is created
-// exclusively; an existing working copy is removed first only when the caller
-// has established that it owns it.
-func CopyVerified(src, dst string) (CopyResult, error) {
-	in, err := os.Open(src)
-	if err != nil {
-		return CopyResult{}, fmt.Errorf("open source: %w", err)
+// The source is a descriptor, not a pathname, so the bytes copied are the
+// bytes of the file the caller verified. dst is created exclusively; an
+// existing file is never opened or truncated.
+func CopyFrom(src *os.File, dst string) (CopyResult, error) {
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return CopyResult{}, fmt.Errorf("rewind source: %w", err)
 	}
-	defer in.Close()
-
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o640)
 	if err != nil {
 		return CopyResult{}, fmt.Errorf("create working copy: %w", err)
 	}
-	// Any failure after this point must not leave a half-written working copy
-	// that a later attempt could mistake for a verified one.
 	committed := false
 	defer func() {
 		out.Close()
@@ -190,7 +368,7 @@ func CopyVerified(src, dst string) (CopyResult, error) {
 	}()
 
 	h := sha256.New()
-	n, err := io.CopyBuffer(io.MultiWriter(out, h), in, make([]byte, copyBufferSize))
+	n, err := io.CopyBuffer(io.MultiWriter(out, h), src, make([]byte, copyBufferSize))
 	if err != nil {
 		return CopyResult{}, fmt.Errorf("copy: %w", err)
 	}
@@ -204,19 +382,31 @@ func CopyVerified(src, dst string) (CopyResult, error) {
 	return CopyResult{Path: dst, Size: n, Fingerprint: h.Sum(nil)}, nil
 }
 
+// CopyVerified copies one path to another, refusing symlinks on both sides.
+func CopyVerified(src, dst string) (CopyResult, error) {
+	in, _, err := openRegular(src)
+	if err != nil {
+		return CopyResult{}, fmt.Errorf("open source: %w", err)
+	}
+	defer in.Close()
+	return CopyFrom(in, dst)
+}
+
+// ---------------------------------------------------------------------------
+// Publication
+// ---------------------------------------------------------------------------
+
 // PublishExclusive makes src visible at dst under a name that must not already
 // exist, and never overwrites.
 //
-// It uses link(2) plus unlink(2) rather than rename(2). rename replaces an
-// existing destination silently, so "check that it is absent, then rename" is
-// a race the contract explicitly rejects. link fails with EEXIST if the
-// destination exists, which makes the absence check and the publication one
-// atomic step decided by the kernel.
+// link(2) plus unlink(2), not rename(2). rename replaces an existing
+// destination silently, so "check that it is absent, then rename" is a race
+// the contract rejects. link fails with EEXIST, which makes the absence check
+// and the publication one atomic step decided by the kernel.
 //
 // src and dst must be on the same filesystem, which is why the caller stages
-// the temporary inside the destination directory. That also means the
-// publication step never crosses a filesystem boundary, so it behaves
-// identically for same-filesystem and cross-filesystem deployments.
+// the temporary inside the destination directory. The publication step
+// therefore never crosses a filesystem boundary, whatever the topology.
 func PublishExclusive(src, dst string) error {
 	if err := os.Link(src, dst); err != nil {
 		if errors.Is(err, fs.ErrExist) {
@@ -224,7 +414,6 @@ func PublishExclusive(src, dst string) error {
 		}
 		return fmt.Errorf("link into place: %w", err)
 	}
-	// The destination is durable only once its directory entry is.
 	if err := SyncDir(filepath.Dir(dst)); err != nil {
 		// The link exists; report the failure without unlinking, because
 		// removing a published document to tidy up an fsync error would be
@@ -235,6 +424,20 @@ func PublishExclusive(src, dst string) error {
 		return fmt.Errorf("remove the staged link: %w", err)
 	}
 	return nil
+}
+
+// LinkExclusive links src to dst and reports whether dst already existed.
+//
+// It is how a verified working copy is promoted to its canonical name without
+// any possibility of replacing another attempt's file.
+func LinkExclusive(src, dst string) (existed bool, err error) {
+	if err := os.Link(src, dst); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
 }
 
 // SyncDir flushes a directory entry so a rename or link survives a crash.
@@ -248,25 +451,16 @@ func SyncDir(dir string) error {
 }
 
 // SameFilesystem reports whether two existing paths share a device.
-//
-// It exists so a deployment can state, from evidence rather than from two
-// different-looking paths, whether its staging and destination roots are
-// genuinely on separate filesystems.
 func SameFilesystem(a, b string) (bool, error) {
-	fa, err := os.Stat(a)
+	da, err := DeviceOf(a)
 	if err != nil {
 		return false, err
 	}
-	fb, err := os.Stat(b)
+	db, err := DeviceOf(b)
 	if err != nil {
 		return false, err
 	}
-	sa, oka := fa.Sys().(*syscall.Stat_t)
-	sb, okb := fb.Sys().(*syscall.Stat_t)
-	if !oka || !okb {
-		return false, errors.New("device identity is unavailable on this platform")
-	}
-	return sa.Dev == sb.Dev, nil
+	return da == db, nil
 }
 
 // DeviceOf reports the device id backing a path, for evidence.
@@ -297,6 +491,8 @@ func RejectionCategory(err error) string {
 		return "unsafe_name"
 	case errors.Is(err, ErrMutated):
 		return "source_mutated"
+	case errors.Is(err, ErrRootChanged), errors.Is(err, ErrRootAlias):
+		return "storage_unavailable"
 	case errors.Is(err, fs.ErrPermission):
 		return "permission_denied"
 	case errors.Is(err, fs.ErrNotExist):

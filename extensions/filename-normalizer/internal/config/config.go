@@ -45,6 +45,12 @@ type Common struct {
 	Policy Policy
 	// ConfigFile is the configuration file this process read, or "".
 	ConfigFile string
+	// Roots is the verified identity of every configured root. Roots are
+	// compared by device and inode, not by pathname, so a symlinked root is
+	// supported while two roots secretly naming one directory is refused.
+	Roots RootSet
+	// Faults names the injected interruption points, normally empty.
+	Faults FaultPoints
 }
 
 // Database describes the PostgreSQL cluster endpoints.
@@ -159,8 +165,12 @@ type RenamerConfig struct {
 	Prefetch int
 	// MaxDeliveryAttempts bounds redelivery before a job is held.
 	MaxDeliveryAttempts int
-	// DryRun computes and records outcomes without touching the filesystem.
+	// DryRun switches the renamer into preview mode. It does not consume the
+	// work queue at all; see the renamer package for why.
 	DryRun bool
+	// Discovery is carried so the renamer opens a source the same way
+	// discovery found it, including whether a relative subpath is allowed.
+	Discovery Discovery
 }
 
 // ValidationError collects every configuration problem at once so an operator
@@ -389,6 +399,8 @@ func LoadWatcher() (WatcherConfig, error) {
 	cfg.Policy = compilePolicy(l, fc.Normalization)
 	cfg.Discovery = compileDiscovery(l, fc.Discovery)
 	validateStorageRoots(l, cfg.Storage)
+	cfg.Roots = identifyRoots(l, cfg.Storage)
+	cfg.Faults = warnOnFaults(l)
 
 	cfg.DispatchInterval = l.duration("FN_WATCHER_DISPATCH_INTERVAL", time.Second, 50*time.Millisecond, 5*time.Minute)
 	cfg.DispatchBatch = l.intVal("FN_WATCHER_DISPATCH_BATCH", 32, 1, 1000)
@@ -409,18 +421,21 @@ func LoadRenamer() (RenamerConfig, error) {
 	cfg := RenamerConfig{Common: l.common(AppRenamer)}
 	cfg.ConfigFile = path
 	cfg.Policy = compilePolicy(l, fc.Normalization)
+	cfg.Discovery = compileDiscovery(l, fc.Discovery)
 	validateStorageRoots(l, cfg.Storage)
+	cfg.Roots = identifyRoots(l, cfg.Storage)
+	cfg.Faults = warnOnFaults(l)
 
 	concurrency, prefetch, attempts, dryRun := 1, 0, 5, false
 	if fc.Processing != nil {
-		if fc.Processing.Concurrency != 0 {
-			concurrency = fc.Processing.Concurrency
+		if v := checkRange(l, "processing.concurrency", fc.Processing.Concurrency, 1, 64); v != 0 {
+			concurrency = v
 		}
-		if fc.Processing.Prefetch != 0 {
-			prefetch = fc.Processing.Prefetch
+		if v := checkRange(l, "processing.prefetch", fc.Processing.Prefetch, 1, 1000); v != 0 {
+			prefetch = v
 		}
-		if fc.Processing.MaxDeliveryAttempts != 0 {
-			attempts = fc.Processing.MaxDeliveryAttempts
+		if v := checkRange(l, "processing.max_delivery_attempts", fc.Processing.MaxDeliveryAttempts, 1, 100); v != 0 {
+			attempts = v
 		}
 		if fc.Processing.DryRun != nil {
 			dryRun = *fc.Processing.DryRun

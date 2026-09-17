@@ -428,3 +428,10 @@ func (l *Ledger) DeliveredNames(ctx context.Context, root string) (map[string]bo
 	}
 	return out, rows.Err()
 }
+
+// ErrOutcomeAlreadyRecorded reports that a job already reached a durable
+// outcome that the attempted write must not replace.
+//
+// It is not a failure: it means another attempt got there first and its result
+// stands. The caller settles the delivery against the existing outcome.
+var ErrOutcomeAlreadyRecorded = errors.New("a durable outcome is already recorded for this job")

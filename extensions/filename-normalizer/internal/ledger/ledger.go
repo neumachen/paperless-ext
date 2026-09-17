@@ -65,6 +65,10 @@ type Job struct {
 	// PublishAttemptedAt is set immediately before the destination link, so a
 	// crash during publication is recoverable as "may have published".
 	PublishAttemptedAt *time.Time
+	// DestinationRoot is the consume root this job was accepted for. A
+	// renamer configured with a different one must refuse it rather than
+	// redirect work that was already accepted elsewhere.
+	DestinationRoot *string
 }
 
 // Event is one append-only history row.
@@ -238,6 +242,8 @@ type RegisterInput struct {
 	SourceInode      *int64
 	SourceDevice     *int64
 	SourceModifiedAt *time.Time
+	// DestinationRoot is the consume root this submission is accepted for.
+	DestinationRoot string
 }
 
 // RegisterJob makes a submission durable and writes its first history row.
@@ -251,13 +257,14 @@ func (l *Ledger) RegisterJob(ctx context.Context, in RegisterInput) (Job, error)
 			INSERT INTO jobs (
 				job_id, contract_version, state, source_root, source_name,
 				size_bytes, fingerprint_algorithm, content_fingerprint, policy_version,
-				source_inode, source_device, source_modified_at, discovered_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+				source_inode, source_device, source_modified_at, discovered_at,
+				destination_root
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), $13)
 			RETURNING `+jobColumns,
 			id, jobs.ContractVersion, string(jobs.StatePendingDispatch),
 			in.SourceRoot, in.SourceName, in.SizeBytes, in.FingerprintAlgo,
 			in.Fingerprint, in.PolicyIdentity,
-			in.SourceInode, in.SourceDevice, in.SourceModifiedAt)
+			in.SourceInode, in.SourceDevice, in.SourceModifiedAt, in.DestinationRoot)
 		var scanErr error
 		job, scanErr = scanJob(row)
 		if scanErr != nil {
@@ -450,12 +457,23 @@ func (l *Ledger) ReclaimStaleDispatch(ctx context.Context, maxAge time.Duration)
 // It accepts a job in dispatched, processing or held state: a redelivery of an
 // already-processed job is a normal at-least-once event, and the count of
 // delivery attempts is part of the retained history.
+//
+// States that carry an OUTCOME or an ambiguity are preserved, not reset. This
+// used to move everything except held and delivered to processing, which had
+// two consequences that defeated recovery entirely: a job interrupted during
+// publication came back as processing, so the publishing recovery path could
+// never run on the ordinary consumer path; and uncertain -- which must stay
+// terminal until someone decides -- was silently reopened and reprocessed. The
+// row returned is the row after the update, so the caller sees the preserved
+// state and can act on it.
 func (l *Ledger) BeginDelivery(ctx context.Context, jobID string, attempt int, redelivered bool) (Job, error) {
 	var job Job
 	err := l.tx(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			UPDATE jobs
-			   SET state = CASE WHEN state IN ('held','delivered') THEN state ELSE 'processing' END,
+			   SET state = CASE
+			       WHEN state IN ('held','delivered','publishing','uncertain') THEN state
+			       ELSE 'processing' END,
 			       delivery_attempts = delivery_attempts + 1,
 			       last_delivery_at = now(),
 			       updated_at = now()
@@ -491,18 +509,34 @@ func (l *Ledger) BeginDelivery(ctx context.Context, jobID string, attempt int, r
 // exists. A consumer acknowledgement is issued only after this commit returns.
 func (l *Ledger) RecordHold(ctx context.Context, jobID string, category jobs.Category, attempt int) error {
 	err := l.tx(ctx, func(tx pgx.Tx) error {
+		// A stale attempt must not demote a newer outcome. Without the state
+		// guard, an attempt that failed slowly could overwrite `delivered`
+		// with `held` after another attempt had already published the
+		// document and written its receipt, leaving the state and the receipt
+		// contradicting each other.
 		tag, err := tx.Exec(ctx, `
 			UPDATE jobs
 			   SET state = 'held',
 			       failure_category = $2,
 			       terminal_at = COALESCE(terminal_at, now()),
 			       updated_at = now()
-			 WHERE job_id = $1`, jobID, string(category))
+			 WHERE job_id = $1
+			   AND state NOT IN ('delivered','uncertain')`, jobID, string(category))
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			return ErrNotFound
+			// Either there is no such job, or it already reached an outcome
+			// this hold must not replace. Tell those apart so the caller can
+			// settle rather than retry.
+			var state string
+			if qerr := tx.QueryRow(ctx, `SELECT state FROM jobs WHERE job_id = $1`, jobID).Scan(&state); qerr != nil {
+				if errors.Is(qerr, pgx.ErrNoRows) {
+					return ErrNotFound
+				}
+				return qerr
+			}
+			return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
 		}
 		return l.appendEvent(ctx, tx, eventInput{
 			JobID:     jobID,
@@ -791,7 +825,8 @@ const jobColumns = `job_id, contract_version, state, source_root, source_name,
 	normalized_name, reserved_name, dispatch_attempts, delivery_attempts,
 	failure_category, claimed_by, claimed_at, created_at, updated_at,
 	dispatched_at, last_delivery_at, terminal_at,
-	source_inode, source_device, source_modified_at, publish_attempted_at`
+	source_inode, source_device, source_modified_at, publish_attempted_at,
+	destination_root`
 
 func prefixedJobColumns(alias string) string {
 	cols := []string{
@@ -801,6 +836,7 @@ func prefixedJobColumns(alias string) string {
 		"failure_category", "claimed_by", "claimed_at", "created_at", "updated_at",
 		"dispatched_at", "last_delivery_at", "terminal_at",
 		"source_inode", "source_device", "source_modified_at", "publish_attempted_at",
+		"destination_root",
 	}
 	out := make([]string, len(cols))
 	for i, c := range cols {
@@ -833,7 +869,8 @@ func scanJob(row scannable) (Job, error) {
 		&j.NormalizedName, &j.ReservedName, &j.DispatchAttempts, &j.DeliveryAttempts,
 		&j.FailureCategory, &j.ClaimedBy, &j.ClaimedAt, &j.CreatedAt, &j.UpdatedAt,
 		&j.DispatchedAt, &j.LastDeliveryAt, &j.TerminalAt,
-		&j.SourceInode, &j.SourceDevice, &j.SourceModifiedAt, &j.PublishAttemptedAt)
+		&j.SourceInode, &j.SourceDevice, &j.SourceModifiedAt, &j.PublishAttemptedAt,
+		&j.DestinationRoot)
 	if err != nil {
 		return Job{}, err
 	}

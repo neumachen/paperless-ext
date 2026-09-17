@@ -115,6 +115,24 @@ type NormalizationFile struct {
 	Rules              []naming.RuleSpec `json:"rules,omitempty"`
 }
 
+// checkRange validates a file-provided integer.
+//
+// Values from the file used to be passed to intVal as its default, and intVal
+// returns a default without checking it: a file could therefore set a
+// concurrency of 10000 or a negative delivery limit and pass startup, while
+// the gRPC validator rejected the same document. Bounds now apply wherever the
+// value came from.
+func checkRange(l *loader, where string, v, min, max int) int {
+	if v == 0 {
+		return 0
+	}
+	if v < min || v > max {
+		l.fail("%s must be between %d and %d", where, min, max)
+		return 0
+	}
+	return v
+}
+
 // ProcessingFile declares operational controls.
 type ProcessingFile struct {
 	Concurrency         int `json:"concurrency,omitempty"`
@@ -434,8 +452,18 @@ func policyIdentity(p naming.Policy, nf *NormalizationFile) string {
 	fmt.Fprintf(h, "require_extension=%t\n", p.RequireExtension)
 	if nf != nil {
 		for i, r := range nf.Rules {
-			fmt.Fprintf(h, "rule[%d]=%s|%s|%s|%t|%t\n",
-				i, r.Name, r.Pattern, r.Replacement, r.All, r.CaseInsensitive)
+			// Length-prefixed, not delimiter-joined. Joining with "|" made the
+			// encoding ambiguous: a rule with pattern "qz|qx" and replacement
+			// "qy" hashed identically to one with pattern "qz" and replacement
+			// "qx|qy", even though the two produce different names. Two
+			// deployments with genuinely different naming behaviour would then
+			// share a policy identity, which is exactly what the identity
+			// exists to prevent.
+			fmt.Fprintf(h, "rule[%d]", i)
+			for _, field := range []string{r.Name, r.Pattern, r.Replacement} {
+				fmt.Fprintf(h, " %d:%s", len(field), field)
+			}
+			fmt.Fprintf(h, " all=%t ci=%t\n", r.All, r.CaseInsensitive)
 		}
 	}
 	return naming.PolicyVersion + "+" + hex.EncodeToString(h.Sum(nil))[:12]
@@ -602,37 +630,54 @@ func parseDocument(body []byte) (FileConfig, error) {
 }
 
 // validateDocumentShape checks the parts that do not need the environment.
+//
+// It shares validateStorageRoots with startup rather than re-implementing a
+// subset. The two used to disagree in both directions: the document validator
+// omitted the equal-and-nested root checks that startup performed, and startup
+// skipped the range checks the document validator applied, because file values
+// reached intVal as its default and a default is returned unchecked. A
+// configuration could therefore be accepted by one and rejected by the other,
+// which makes validation worthless as a pre-restart gate.
 func validateDocumentShape(l *loader, fc FileConfig) {
 	if fc.Storage != nil {
-		for name, p := range map[string]string{
-			"incoming": fc.Storage.Incoming, "queued": fc.Storage.Queued,
-			"staging": fc.Storage.Staging, "consume": fc.Storage.Consume,
-			"failed": fc.Storage.Failed,
-		} {
-			if p == "" {
-				continue
-			}
-			if !filepath.IsAbs(p) {
-				l.fail("storage.%s must be an absolute path", name)
-			}
-			if p != filepath.Clean(p) {
-				l.fail("storage.%s must be a clean path", name)
+		// Only a complete root set can be checked for nesting and aliasing; a
+		// document that supplies some roots is checked for what it supplies,
+		// and the rest is left to startup, where the environment fills them in.
+		s := Storage{
+			Incoming: fc.Storage.Incoming, Queued: fc.Storage.Queued,
+			Staging: fc.Storage.Staging, Consume: fc.Storage.Consume,
+			Failed: fc.Storage.Failed,
+		}
+		if allRootsPresent(s) {
+			validateStorageRoots(l, s)
+		} else {
+			for name, p := range map[string]string{
+				"incoming": s.Incoming, "queued": s.Queued,
+				"staging": s.Staging, "consume": s.Consume, "failed": s.Failed,
+			} {
+				if p == "" {
+					continue
+				}
+				if !filepath.IsAbs(p) {
+					l.fail("storage.%s must be an absolute path", name)
+				}
+				if p != filepath.Clean(p) {
+					l.fail("storage.%s must be a clean path", name)
+				}
 			}
 		}
 	}
 	if fc.Processing != nil {
-		if c := fc.Processing.Concurrency; c != 0 && (c < 1 || c > 64) {
-			l.fail("processing.concurrency must be between 1 and 64")
-		}
-		if pf := fc.Processing.Prefetch; pf != 0 && (pf < 1 || pf > 1000) {
-			l.fail("processing.prefetch must be between 1 and 1000")
-		}
-		if a := fc.Processing.MaxDeliveryAttempts; a != 0 && (a < 1 || a > 100) {
-			l.fail("processing.max_delivery_attempts must be between 1 and 100")
-		}
+		checkRange(l, "processing.concurrency", fc.Processing.Concurrency, 1, 64)
+		checkRange(l, "processing.prefetch", fc.Processing.Prefetch, 1, 1000)
+		checkRange(l, "processing.max_delivery_attempts", fc.Processing.MaxDeliveryAttempts, 1, 100)
 		if fc.Processing.Concurrency > 0 && fc.Processing.Prefetch > 0 &&
 			fc.Processing.Prefetch < fc.Processing.Concurrency {
 			l.fail("processing.prefetch must be at least processing.concurrency")
 		}
 	}
+}
+
+func allRootsPresent(s Storage) bool {
+	return s.Incoming != "" && s.Queued != "" && s.Staging != "" && s.Consume != "" && s.Failed != ""
 }
