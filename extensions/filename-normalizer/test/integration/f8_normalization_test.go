@@ -147,7 +147,7 @@ func TestA1RequiredExamplesEndToEnd(t *testing.T) {
 		// the stem so the expected output is the same name with the same
 		// suffix -- the example's transformation is still what is asserted.
 		in := withRunID(c.in, e.RunID)
-		want := withRunID(c.want, e.RunID)
+		want := withRunID(c.want, publishedRunID(e))
 		content := []byte("%PDF-1.4 synthetic " + c.want + "\n")
 
 		sub := place(t, e, in, content)
@@ -193,6 +193,15 @@ func TestA1RequiredExamplesEndToEnd(t *testing.T) {
 	e.WriteEvidence(t, "a1-required-examples.txt", []byte(report.String()))
 }
 
+// publishedRunID is the run id as it appears in a published name.
+//
+// The orchestrator's run id contains uppercase letters and the naming policy
+// lowercases the stem, so any expectation about a published name -- or any
+// fixture planted at a name the pipeline will produce -- has to use this form.
+// Using e.RunID directly made five tests fail against the orchestrator's id
+// while passing against the lowercase ids used when running them by hand.
+func publishedRunID(e *Env) string { return strings.ToLower(e.RunID) }
+
 // withRunID inserts the run id before the extension.
 func withRunID(name, runID string) string {
 	i := strings.LastIndexByte(name, '.')
@@ -218,7 +227,7 @@ func TestA1UnicodeIsPreservedThroughTheRealPipeline(t *testing.T) {
 
 	for _, c := range cases {
 		in := withRunID(c.in, e.RunID)
-		want := withRunID(c.want, e.RunID)
+		want := withRunID(c.want, publishedRunID(e))
 		sub := place(t, e, in, []byte("%PDF-1.4 unicode "+c.want+"\n"))
 		job := awaitJob(t, e, led, in)
 		if job.State != jobs.StateDelivered {
@@ -357,7 +366,8 @@ func TestA3ExistingDestinationIsNeverOverwritten(t *testing.T) {
 	led := e.Ledger(t)
 
 	stem := "preexisting-" + e.RunID
-	occupied := filepath.Join(e.Cfg.Storage.Consume, stem+".pdf")
+	// Planted at the NORMALIZED name, or it would not collide at all.
+	occupied := filepath.Join(e.Cfg.Storage.Consume, strings.ToLower(stem)+".pdf")
 	foreign := []byte("NOT OURS: a file the normalizer did not publish\n")
 	// World-readable on purpose. This test is about content that is not this
 	// job's, not about an unreadable file: the renamer runs as a different uid
@@ -385,7 +395,7 @@ func TestA3ExistingDestinationIsNeverOverwritten(t *testing.T) {
 	}
 	// And ours must have gone somewhere else.
 	got := filepath.Base(publishedPath(t, e, led, job))
-	if got == stem+".pdf" {
+	if got == strings.ToLower(stem)+".pdf" {
 		t.Errorf("the submission took the occupied name %q", got)
 	}
 	ours, err := os.ReadFile(publishedPath(t, e, led, job))
@@ -504,6 +514,7 @@ func TestA4IneligibleEntriesAreNeverPublished(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the consume directory: %v", err)
 	}
+	tag = publishedRunID(e) // published names carry the lowercased run id
 	// Scope to the entries this test created. Other tests in this phase
 	// publish documents that legitimately carry the same run id, and counting
 	// those as leaks would make this assertion fail for the wrong reason.
@@ -810,7 +821,7 @@ func TestA10NoPartialFileIsEverVisibleUnderAPublishableName(t *testing.T) {
 		}
 		for _, de := range entries {
 			base := de.Name()
-			if !strings.Contains(base, "partialwatch-"+e.RunID) {
+			if !strings.Contains(base, "partialwatch-"+publishedRunID(e)) {
 				continue
 			}
 			if strings.HasPrefix(base, ".fn-") {
@@ -869,7 +880,9 @@ func TestA3UnreadableDestinationIsHeldNotRetriedForever(t *testing.T) {
 	led := e.Ledger(t)
 
 	stem := "unreadable-" + e.RunID
-	occupied := filepath.Join(e.Cfg.Storage.Consume, stem+".pdf")
+	// Planted at the NORMALIZED name, or the submission simply gets a
+	// different destination and the conflict never happens.
+	occupied := filepath.Join(e.Cfg.Storage.Consume, strings.ToLower(stem)+".pdf")
 	// 0600 and owned by this suite's uid, which is not the renamer's.
 	if err := os.WriteFile(occupied, []byte("unreadable by the renamer\n"), 0o600); err != nil {
 		t.Fatalf("plant an unreadable destination file: %v", err)

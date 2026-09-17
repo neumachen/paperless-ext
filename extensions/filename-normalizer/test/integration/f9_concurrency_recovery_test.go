@@ -248,7 +248,7 @@ func TestA6DuplicateDeliveryProducesOneDocument(t *testing.T) {
 	}
 	matches := 0
 	for _, de := range entries {
-		if strings.Contains(de.Name(), "a6duplicate-"+e.RunID) && !strings.HasPrefix(de.Name(), ".fn-") {
+		if strings.Contains(de.Name(), "a6duplicate-"+publishedRunID(e)) && !strings.HasPrefix(de.Name(), ".fn-") {
 			matches++
 		}
 	}
@@ -359,7 +359,7 @@ func TestA7ConcurrentWorkersOnOneJobProduceOneDocument(t *testing.T) {
 	}
 	var found []string
 	for _, de := range entries {
-		if strings.Contains(de.Name(), "a7stale-"+e.RunID) && !strings.HasPrefix(de.Name(), ".fn-") {
+		if strings.Contains(de.Name(), "a7stale-"+publishedRunID(e)) && !strings.HasPrefix(de.Name(), ".fn-") {
 			found = append(found, de.Name())
 		}
 	}

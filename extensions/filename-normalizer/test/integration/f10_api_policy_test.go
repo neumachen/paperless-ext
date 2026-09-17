@@ -94,6 +94,17 @@ func TestAPIProcessingStateCarriesNoDocumentIdentities(t *testing.T) {
 	ctx, cancel := apiCtx(t)
 	defer cancel()
 
+	// Publish a document first. Go runs tests in source order within a file
+	// and files in name order, so this one can run before any A-test has
+	// delivered anything; asserting on another test's side effects would make
+	// it pass or fail depending on ordering.
+	led := e.Ledger(t)
+	name := "apistate-" + e.RunID + ".pdf"
+	place(t, e, name, []byte("%PDF-1.4 api state probe\n"))
+	if job := awaitJob(t, e, led, name); job.State != jobs.StateDelivered {
+		t.Fatalf("the probe document reached %q (%s)", job.State, derefCategory(job))
+	}
+
 	resp, err := dialAPI(t, "watcher:9090").GetProcessingState(ctx, &pb.GetProcessingStateRequest{})
 	if err != nil {
 		t.Fatalf("GetProcessingState: %v", err)
