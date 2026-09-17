@@ -100,6 +100,13 @@ const (
 	// CategoryDestinationConflict records a destination occupied by content
 	// that is not this job's. Nothing is overwritten.
 	CategoryDestinationConflict Category = "destination_conflict"
+	// CategoryDestinationMismatch records a job accepted for a different
+	// destination root than this process is configured with. Publishing it
+	// here would redirect work that was already accepted elsewhere.
+	CategoryDestinationMismatch Category = "destination_mismatch"
+	// CategoryUnsupportedConfiguration records a job that cannot be processed
+	// because the running configuration does not support what it needs.
+	CategoryUnsupportedConfiguration Category = "unsupported_configuration"
 	// CategoryStorageUnavailable records an unreadable or unmounted root. It is
 	// never interpreted as an empty directory.
 	CategoryStorageUnavailable Category = "storage_unavailable"
@@ -139,6 +146,8 @@ func Categories() []Category {
 		CategoryRetryExhausted,
 		CategoryCollisionExhausted,
 		CategoryDestinationConflict,
+		CategoryDestinationMismatch,
+		CategoryUnsupportedConfiguration,
 		CategoryStorageUnavailable,
 		CategoryPermissionDenied,
 		CategoryStorageError,

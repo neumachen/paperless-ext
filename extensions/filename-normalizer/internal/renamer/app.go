@@ -50,8 +50,16 @@ func (a *App) Run(ctx context.Context) int {
 	// acknowledge on.
 	sup.AddInfrastructure("broker", a.base.Conn.Run)
 
-	proc := NewProcessor(a.base, a.cfg)
-	sup.Add("consumer", proc.Run)
+	// A dry run must not consume the work queue: previewed work has to remain
+	// processable afterwards, and an acknowledgement would destroy it. The
+	// consumer is therefore not started at all in that mode.
+	var proc *Processor
+	if a.cfg.DryRun {
+		sup.Add("preview", NewPreviewer(a.base, a.cfg).Run)
+	} else {
+		proc = NewProcessor(a.base, a.cfg)
+		sup.Add("consumer", proc.Run)
+	}
 
 	log.Info("renamer configured",
 		slog.String("event", "renamer_configured"),
@@ -59,9 +67,11 @@ func (a *App) Run(ctx context.Context) int {
 		slog.Int("concurrency", a.cfg.Concurrency),
 		slog.Int("prefetch", a.cfg.Prefetch),
 		slog.String("queue", a.cfg.Broker.Queue))
-	if a.cfg.DryRun {
-		log.Warn("dry run: names are computed and recorded, nothing is published",
-			slog.String("event", "dry_run_enabled"))
+	if a.cfg.Faults.Enabled() {
+		log.Error("INJECTED FAULT POINTS ARE ARMED: this instance will deliberately "+
+			"stop in the middle of publishing a document. Never run a real deployment like this.",
+			slog.String("event", "fault_points_armed"),
+			slog.Any("state", a.cfg.Faults.Names()))
 	}
 
 	if a.cfg.GRPCAddr != "" {
@@ -84,10 +94,14 @@ func (a *App) Run(ctx context.Context) int {
 
 	sup.OnDrain(func(context.Context) {
 		a.base.Health.SetNotReady("shutting_down")
+		inFlight := 0
+		if proc != nil {
+			inFlight = proc.InFlight()
+		}
 		log.Info("readiness withdrawn for drain",
 			slog.String("event", "readiness_withdrawn"),
 			slog.Bool("ready", false),
-			slog.Int("count", proc.InFlight()))
+			slog.Int("count", inFlight))
 	})
 	sup.OnClose(func(ctx context.Context) { a.base.Close(ctx) })
 

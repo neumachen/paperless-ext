@@ -169,7 +169,11 @@ func (p Policy) normalizeOnce(original, jobID string) (Result, error) {
 	}
 
 	var res Result
-	stem, res.RuleHits = p.Rules.apply(stem)
+	var rerr error
+	stem, res.RuleHits, rerr = p.Rules.apply(stem)
+	if rerr != nil {
+		return Result{}, rerr
+	}
 	stem = normalizeStem(stem)
 
 	if stem == "" {
@@ -424,7 +428,34 @@ func HoldCategory(err error) string {
 		return "policy_not_idempotent"
 	case errors.Is(err, ErrNameTooLong):
 		return "name_too_long"
+	case errors.Is(err, ErrExpansionTooLarge):
+		return "policy_expansion_too_large"
 	default:
 		return "normalization_failed"
 	}
+}
+
+// VerifyFinalName checks that a name the allocator is about to publish is
+// itself a fixed point of the policy.
+//
+// Normalize's own convergence check runs on the normalized stem, BEFORE the
+// collision suffix and any shortening are appended. Those are applied
+// afterwards, so a configured rule can make the final name normalize to
+// something else even though the policy passed its own idempotence gate. A
+// rule matching "^foo_01$" and replacing it with "foo", for instance, lets
+// foo.pdf normalize cleanly and then produces the collision candidate
+// foo_01.pdf, which normalizes back to foo.pdf -- a published name that is not
+// what the policy would produce for itself.
+//
+// The published name is what matters, so it is the published name that is
+// checked, immediately before the destination is reserved.
+func (p Policy) VerifyFinalName(name, jobID string) error {
+	again, err := p.normalizeOnce(name, jobID)
+	if err != nil {
+		return fmt.Errorf("%w: the final name is not acceptable to the policy: %v", ErrNotIdempotent, err)
+	}
+	if again.Name != name {
+		return fmt.Errorf("%w: the final name is not a fixed point", ErrNotIdempotent)
+	}
+	return nil
 }

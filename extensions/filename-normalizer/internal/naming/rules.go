@@ -1,6 +1,7 @@
 package naming
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -140,10 +141,31 @@ func safeRuleName(s string) bool {
 	return true
 }
 
+// maxIntermediateBytes bounds the stem WHILE rules are running.
+//
+// The final name is capped, but the cap is applied after every rule has run,
+// and nothing bounded the intermediate. A handful of rules of the form
+// ^(.+)$ -> ${1}${1} doubles the stem each time, so twenty such rules turn a
+// three-character name into eight megabytes and thirty turn it into eight
+// gigabytes. Because gRPC ValidateConfig and PreviewName run this work inside
+// the application process, a tiny, perfectly valid-looking candidate
+// configuration could exhaust the running watcher while merely being checked.
+//
+// The bound is generous relative to any legitimate rule -- a rule set needs
+// room to expand a name before later rules trim it -- and tiny relative to the
+// growth an unbounded expansion reaches within a few rules.
+const maxIntermediateBytes = 1 << 16
+
+// ErrExpansionTooLarge reports that rules grew the stem past the working bound.
+var ErrExpansionTooLarge = errors.New("configured rules expanded the name beyond the working limit")
+
 // apply runs every rule in order and reports which ones changed the stem.
-func (rs Rules) apply(stem string) (string, []string) {
+//
+// It stops as soon as the intermediate exceeds the working bound, rather than
+// continuing and letting the next doubling allocate.
+func (rs Rules) apply(stem string) (string, []string, error) {
 	if len(rs) == 0 {
-		return stem, nil
+		return stem, nil, nil
 	}
 	var hits []string
 	for _, r := range rs {
@@ -153,11 +175,15 @@ func (rs Rules) apply(stem string) (string, []string) {
 		} else {
 			stem = replaceFirst(r.Pattern, stem, r.Replacement)
 		}
+		if len(stem) > maxIntermediateBytes {
+			return "", hits, fmt.Errorf("%w: rule %q produced %d bytes, limit %d",
+				ErrExpansionTooLarge, r.Name, len(stem), maxIntermediateBytes)
+		}
 		if stem != before {
 			hits = append(hits, r.Name)
 		}
 	}
-	return stem, hits
+	return stem, hits, nil
 }
 
 // replaceFirst substitutes only the first match, with group expansion.
@@ -203,6 +229,61 @@ var idempotenceCorpus = []string{
 	"digits 2026 and 01",
 }
 
+// unicodePreservationProbes are names whose non-ASCII letters the owner's
+// confirmed direction requires to survive.
+//
+// The contract is "preserve Unicode rather than transliterate to ASCII", and
+// it is stated for these characters specifically. A configured rule can
+// violate it trivially -- a case-insensitive ü-to-u replacement converges
+// perfectly well and would have passed every other check -- so it is checked
+// directly rather than left to the character pipeline, which only decides
+// which classes survive, not what a rule replaced them with.
+var unicodePreservationProbes = []struct {
+	stem   string
+	expect []rune
+}{
+	{"Überweisung Straße", []rune{'ü', 'ß'}},
+	{"Ärztliche Prüfung", []rune{'ä', 'ü'}},
+	{"Öffnung", []rune{'ö'}},
+	{"請求書", []rune{'請', '求', '書'}},
+	{"Ελληνικά", []rune{'λ'}},
+	{"Документ", []rune{'д'}},
+}
+
+// checkUnicodePreservation reports rules that transliterate preserved letters.
+//
+// It asks a narrow, checkable question: after the rules run, is each probe
+// character still present? A rule that deletes a whole segment legitimately
+// removes it too, so the probe is only counted as violated when the character
+// is gone AND the stem still has content -- which is what a transliterating
+// substitution looks like, as opposed to a rule that drops text wholesale.
+func (p Policy) checkUnicodePreservation() []string {
+	if len(p.Rules) == 0 {
+		return nil
+	}
+	var problems []string
+	for _, probe := range unicodePreservationProbes {
+		after, _, err := p.Rules.apply(probe.stem)
+		if err != nil {
+			continue // reported separately by SelfCheck
+		}
+		lowered := strings.ToLower(after)
+		if strings.TrimSpace(lowered) == "" {
+			continue // the rules removed everything; not a transliteration
+		}
+		for _, r := range probe.expect {
+			if !strings.ContainsRune(lowered, r) && !strings.ContainsRune(strings.ToUpper(after), r) {
+				problems = append(problems, fmt.Sprintf(
+					"normalization.rules transliterate a preserved character: %q is no longer present "+
+						"after the rules run, and the accepted contract preserves Unicode rather than "+
+						"mapping it to ASCII", string(r)))
+				break
+			}
+		}
+	}
+	return problems
+}
+
 // SelfCheck runs the corpus through the policy twice and reports any input
 // whose name did not converge, plus any input the policy cannot name at all.
 //
@@ -227,7 +308,29 @@ func (p Policy) SelfCheck() []string {
 			problems = append(problems, fmt.Sprintf(
 				"normalization self-check: rules are not idempotent; a probe name changed again on the second pass (%d -> %d bytes)",
 				len(first.Name), len(second.Name)))
+			continue
+		}
+
+		// The collision suffixes and the shortening marker are appended AFTER
+		// the convergence check above, so they need their own. A rule that
+		// matches a suffixed name can make the published name normalize to
+		// something different from itself, and the published name is the one
+		// that has to satisfy the policy.
+		for _, n := range []int{1, 2, 99} {
+			candidate, cerr := p.Candidate(first, n)
+			if cerr != nil {
+				problems = append(problems, fmt.Sprintf(
+					"normalization self-check: collision candidate %d -> %v", n, cerr))
+				break
+			}
+			if verr := p.VerifyFinalName(candidate, probeJobID); verr != nil {
+				problems = append(problems, fmt.Sprintf(
+					"normalization self-check: collision candidate %d of a probe name is not a fixed "+
+						"point of the policy, so a published name would not survive its own rules", n))
+				break
+			}
 		}
 	}
+	problems = append(problems, p.checkUnicodePreservation()...)
 	return problems
 }

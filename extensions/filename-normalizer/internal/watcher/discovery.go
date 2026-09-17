@@ -111,6 +111,19 @@ func (d *Discoverer) Run(ctx context.Context) {
 func (d *Discoverer) scan(ctx context.Context, reconciling bool) {
 	root := d.cfg.Storage.Incoming
 
+	// The roots must still be the directories this process validated. A
+	// remount between startup and now would otherwise go unnoticed until a
+	// document had already been read from, or written to, the wrong place.
+	if err := d.cfg.Roots.Verify(); err != nil {
+		d.base.Metrics.DiscoveryRuns.WithLabelValues("error").Inc()
+		d.base.Metrics.Discovered.WithLabelValues("storage_error").Inc()
+		d.log.Error("a storage root is not the directory it was at startup; not scanning",
+			slog.String("event", "storage_root_changed"),
+			slog.String("dependency", "storage"),
+			slog.String("category", "storage_unavailable"))
+		return
+	}
+
 	// An unreadable or unmounted root is reported as unavailable storage. It
 	// must never be read as "the directory is empty", because that is
 	// indistinguishable from "there is no work" and would hide an outage.
@@ -209,7 +222,13 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 		return false
 	}
 
-	entry, err := storage.Inspect(root, name)
+	// In recursive mode the name is a relative subpath, which the non-recursive
+	// join deliberately refuses. Using the wrong one made every nested file
+	// rejected as an unsafe name while the option reported itself as enabled.
+	entry, err := storage.InspectRel(root, name)
+	if !d.cfg.Discovery.Recursive {
+		entry, err = storage.Inspect(root, name)
+	}
 	if err != nil {
 		reason := storage.RejectionCategory(err)
 		d.base.Metrics.Discovered.WithLabelValues(reason).Inc()
@@ -261,7 +280,10 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 	}
 
 	// The file must not have changed while it was being read.
-	after, err := storage.Inspect(root, name)
+	after, err := storage.InspectRel(root, name)
+	if !d.cfg.Discovery.Recursive {
+		after, err = storage.Inspect(root, name)
+	}
 	if err != nil || !storage.SameFile(entry, after) {
 		d.base.Metrics.Discovered.WithLabelValues("unstable").Inc()
 		d.log.Info("submission changed while it was being fingerprinted; leaving it for the next scan",
@@ -282,6 +304,10 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 		SourceInode:      &inode,
 		SourceDevice:     &device,
 		SourceModifiedAt: &modified,
+		// The destination is part of what this submission is accepted under.
+		// Recording it means a renamer configured with a different consume
+		// root refuses the job rather than silently redirecting it.
+		DestinationRoot: d.cfg.Storage.Consume,
 	})
 	if err != nil {
 		d.base.Metrics.Discovered.WithLabelValues("storage_error").Inc()
