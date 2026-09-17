@@ -49,7 +49,22 @@ x-app-env: &app-env
   # variables above still win over it, which is how one instance can be tuned
   # differently from its siblings. Credentials are not in it and cannot be:
   # the schema has no field to hold one.
-  FN_CONFIG_FILE: /etc/fn/normalizer.json
+  #
+  # Substitutable so the configuration-change exercise can point the
+  # applications at a file of its own instead of rewriting this one. The live
+  # configuration is bind-mounted read-only and shared by every service; an
+  # exercise that edited it in place would be mutating the thing it is
+  # supposed to leave untouched, and a crash mid-exercise would leave the
+  # stack running somebody else's test configuration.
+  FN_CONFIG_FILE: ${FN_CONFIG_FILE:-/etc/fn/normalizer.json}
+
+  # How old a publication claim must be before another attempt may take it
+  # over. Left empty so the application's own default applies; the exercise
+  # that has to observe two live attempts at once sets it, because the window
+  # is evaluated by the worker CONSIDERING a takeover, not by the one holding
+  # the claim. A variable compose does not name here never reaches the
+  # container, however carefully the caller exports it.
+  FN_PUBLISH_TAKEOVER_AFTER: ${FN_PUBLISH_TAKEOVER_AFTER:-}
 
 x-app-hardening: &app-hardening
   user: "65532:65532"
@@ -92,6 +107,13 @@ volumes:
   # a destination change has a real directory to point at that is not another
   # role's root.
   fn-consume-alt:
+
+  # State for the isolated Paperless instance used as a REAL consumer. It is
+  # its own database and its own media store: nothing here touches a real
+  # library, and the whole thing is created and destroyed by the exercise.
+  paperless-data:
+  paperless-media:
+  paperless-redis:
 
   # Cluster state. Separate volumes so the standby can be rebuilt without
   # touching the primary, and vice versa.
@@ -224,6 +246,7 @@ services:
       - fn-queued:/srv/fn/queued
       - fn-staging:/srv/fn/staging
       - fn-consume:/srv/fn/consume
+      - fn-consume-alt:/srv/fn/consume-alt
       - fn-failed:/srv/fn/failed
     networks: [fn]
     restart: "no"
@@ -391,7 +414,13 @@ services:
       - fn-failed:/srv/fn/failed
     tmpfs:
       - /srv/fn/staging:size=64m,mode=1777
-    ports: !reset []
+    # `ports: []`, not `ports: !reset []`. The !reset tag applies to Compose's
+    # multi-file merge, not to a YAML anchor merge, so every fault instance
+    # silently kept the anchor's published port -- renamer-1's. They took
+    # 18081 in turn, and the one scenario that needs renamer-1 running
+    # alongside a fault instance failed to start it, which read as "the
+    # sibling never contended for the job" when there was no sibling at all.
+    ports: []
 
   # -------------------------------------------------------------------------
   # The same, with a staging tmpfs far too small for the documents the A11
@@ -415,7 +444,7 @@ services:
       - fn-failed:/srv/fn/failed
     tmpfs:
       - /srv/fn/staging:size=1m,mode=1777
-    ports: !reset []
+    ports: []
 
   # -------------------------------------------------------------------------
   # A renamer that deliberately dies partway through publishing, so the
@@ -433,7 +462,177 @@ services:
       FN_DB_APPLY_MIGRATIONS: "false"
       FN_RENAMER_CONCURRENCY: "1"
       FN_FAULT_POINTS: ${FN_FAULT_POINTS:-after_link}
-    ports: !reset []
+    ports: []
+
+  # -------------------------------------------------------------------------
+  # A renamer that HOLDS its publication claim open instead of dying.
+  #
+  # Every other way of producing two attempts on one job leaves the first one
+  # dead, and a second attempt that only finds an existing receipt proves
+  # nothing about competing publication. This instance takes the claim, then
+  # sleeps FN_FAULT_HOLD with the claim held and the destination still empty,
+  # which is the only state in which a sibling's behaviour is decided by the
+  # claim itself rather than by an occupied directory.
+  #
+  # FN_SHUTDOWN_TIMEOUT is the takeover window: a claim older than this may be
+  # taken from a worker presumed dead. It is short here so the exercise can
+  # observe both halves -- the sibling standing down while the claim is fresh,
+  # and the takeover once it is not -- inside one hold.
+  # -------------------------------------------------------------------------
+  renamer-hold:
+    <<: *renamer
+    profiles: [fault]
+    restart: "no"
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-hold
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "1"
+      FN_FAULT_POINTS: hold_after_claim
+      FN_FAULT_HOLD: ${FN_FAULT_HOLD:-90s}
+    # Reset, like every other fault-profile instance. Inheriting the renamer
+    # anchor's published port means inheriting renamer-1's: this service would
+    # take 18081 and renamer-1 would fail to start with exit 128 -- which
+    # looked exactly like "the sibling never contended for the job", because
+    # there was no sibling.
+    ports: []
+
+  # -------------------------------------------------------------------------
+  # A real, isolated Paperless instance, used as a REAL consumer.
+  #
+  # # Why a real one
+  #
+  # Two of the guarantees are about what a consumer DOES to a published
+  # document: it takes the file out of the consume directory, promptly, and
+  # the normalizer must handle the file vanishing between the link and the
+  # moment it looks at it. A fake consumer that deletes files on a timer can
+  # be made to produce whichever timing makes the test pass, so it proves
+  # nothing about the real handoff.
+  #
+  # # Why this one is safe
+  #
+  # It is isolated in every way that matters: its own database, its own media
+  # volume, its own Redis, no port published to the host, and it consumes only
+  # the synthetic documents this stack produces. It has no connection to any
+  # real library, and it lives behind its own profile so the ordinary stack
+  # never starts it.
+  # -------------------------------------------------------------------------
+  paperless-redis:
+    image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    profiles: [consumer]
+    restart: "no"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - paperless-redis:/data
+    networks: [fn]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  paperless:
+    image: ghcr.io/paperless-ngx/paperless-ngx:2.18.4@sha256:3421ebe06ed27662d014046cf5089e612de853aae0c676a2bc72f73b38080e57
+    profiles: [consumer]
+    restart: "no"
+    depends_on:
+      paperless-redis:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    environment:
+      PAPERLESS_REDIS: redis://paperless-redis:6379
+      # SQLite, so this instance needs no database of its own and cannot be
+      # pointed at the normalizer's cluster by accident.
+      PAPERLESS_DBENGINE: sqlite
+      PAPERLESS_DATA_DIR: /usr/src/paperless/data
+      PAPERLESS_MEDIA_ROOT: /usr/src/paperless/media
+      # The normalizer's destination IS this consumer's inbox. That is the
+      # whole handoff, and it is the real thing here rather than a directory
+      # nothing watches.
+      PAPERLESS_CONSUMPTION_DIR: /usr/src/paperless/consume
+      PAPERLESS_CONSUMER_POLLING: ${FN_PAPERLESS_POLL:-1}
+      PAPERLESS_CONSUMER_POLLING_DELAY: "1"
+      PAPERLESS_CONSUMER_POLLING_RETRY_COUNT: "5"
+      # Synthetic fixtures are not real documents; OCR would spend minutes
+      # failing to read them and would tell us nothing about the handoff.
+      PAPERLESS_OCR_MODE: skip
+      PAPERLESS_TASK_WORKERS: "1"
+      PAPERLESS_THREADS_PER_WORKER: "1"
+      PAPERLESS_TIME_ZONE: UTC
+      PAPERLESS_SECRET_KEY: ${FN_PAPERLESS_SECRET:-local-synthetic-only-not-a-deployment-secret}
+      PAPERLESS_URL: http://paperless:8000
+    volumes:
+      - paperless-data:/usr/src/paperless/data
+      - paperless-media:/usr/src/paperless/media
+      - fn-consume:/usr/src/paperless/consume
+    # No host port. Nothing outside this stack can reach it, which is part of
+    # what makes running it locally acceptable.
+    networks: [fn]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "-S", "--max-time", "5", "http://localhost:8000"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+  # -------------------------------------------------------------------------
+  # A renamer used to produce a REAL permission denial at the publication.
+  #
+  # The denial cannot simply be configured: a destination that is unwritable
+  # at startup makes the application not-ready, so it never attempts the write
+  # that is supposed to be refused, and the exercise would prove nothing. So
+  # this instance holds its publication claim open instead, and the exercise
+  # revokes write on the destination during that window. The link is then
+  # refused by the kernel, as the unprivileged account the application really
+  # runs as -- which is the part the previous round's root-owned fixture
+  # could not show.
+  #
+  # It uses the ORDINARY consume root, not a private one. Pointing it
+  # somewhere else does not work and should not: a job carries the
+  # destination it was accepted for, so a renamer configured for a different
+  # root correctly refuses it as a destination mismatch and never reaches the
+  # write at all. The revocation is therefore brief, happens while this is
+  # the only consumer, and is undone on every exit path.
+  # -------------------------------------------------------------------------
+  renamer-permdenied:
+    <<: *renamer
+    profiles: [fault]
+    restart: "no"
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-permdenied
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "1"
+      FN_RENAMER_MAX_DELIVERY_ATTEMPTS: "2"
+      FN_FAULT_POINTS: hold_after_claim
+      FN_FAULT_HOLD: ${FN_PERM_HOLD:-45s}
+    ports: []
+
+  # -------------------------------------------------------------------------
+  # A renamer that holds open the window between the successful link and the
+  # read-back of the destination, so a REAL consumer can be observed taking
+  # the document inside it.
+  #
+  # The window is otherwise microseconds wide. Paperless watches the directory
+  # and ingests on its own schedule, so without the hold it would never win
+  # that race, and the only way to "demonstrate" the case would be to delete
+  # the file on a timer -- which says nothing about what a consumer does.
+  # Holding the window open changes only this instance's timing; the link, the
+  # ingestion and the removal are all real.
+  # -------------------------------------------------------------------------
+  renamer-consume-hold:
+    <<: *renamer
+    profiles: [consumer]
+    restart: "no"
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-consume-hold
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "1"
+      FN_FAULT_POINTS: hold_after_link
+      FN_FAULT_HOLD: ${FN_CONSUME_HOLD:-60s}
+    ports: []
 
   # -------------------------------------------------------------------------
   # A renamer in dry-run mode, for the A9 demonstration. It consumes the same
@@ -451,7 +650,7 @@ services:
       FN_RENAMER_CONCURRENCY: "1"
       FN_RENAMER_DRY_RUN: "true"
       FN_GRPC_ADDR: ":9090"
-    ports: !reset []
+    ports: []
 
   # -------------------------------------------------------------------------
   # A watcher whose incoming root was never mounted.

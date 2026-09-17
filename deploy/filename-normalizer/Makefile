@@ -203,6 +203,11 @@ test-dry-run: ## Prove a dry run preserves sources and the operational ledger (A
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-dry-run.sh
 
+.PHONY: test-consumer
+test-consumer: ## Run a real isolated Paperless instance against the consume directory and prove the handoff
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-consumer.sh
+
 .PHONY: test-cleanup-ownership
 test-cleanup-ownership: ## Prove the isolation wrapper's own cleanup cannot remove pre-existing resources
 	@mkdir -p $(EVIDENCE)

@@ -114,19 +114,40 @@ while [ "$_i" -lt 90 ]; do
 done
 [ "$JOB_SEEN" = "1" ] || bad "the submission was never registered, so nothing could be previewed"
 
+# A report emitted after the row appeared shows the dry run ran again. It does
+# not by itself show that THIS job was in it -- the report is aggregate counts
+# and names nothing, deliberately, because a name is document-derived text. So
+# the count is read as well: the number of jobs the policy would publish has to
+# rise by at least one across this submission, which is the observable trace
+# this particular job leaves in an aggregate report.
+count_in_last_report() {
+    compose logs renamer-dry-run 2>/dev/null | grep dry_run_report | tail -1 \
+        | sed -n 's/.*"count":\([0-9][0-9]*\).*/\1/p'
+}
 REPORTS_BEFORE="$(compose logs renamer-dry-run 2>/dev/null | grep -c dry_run_report || true)"
+COUNT_BEFORE="$(count_in_last_report)"
 _i=0
 REPORT_SEEN=0
-while [ "$_i" -lt 90 ]; do
+COUNT_AFTER=""
+while [ "$_i" -lt 120 ]; do
     _now="$(compose logs renamer-dry-run 2>/dev/null | grep -c dry_run_report || true)"
     if [ "${_now:-0}" -gt "${REPORTS_BEFORE:-0}" ]; then
+        COUNT_AFTER="$(count_in_last_report)"
         REPORT_SEEN=1
         break
     fi
     sleep 1
     _i=$((_i + 1))
 done
+emit "  reports before/after submission:  ${REPORTS_BEFORE:-0} -> ${_now:-0}"
+emit "  jobs it would publish, before:    ${COUNT_BEFORE:-unknown}"
+emit "  jobs it would publish, after:     ${COUNT_AFTER:-unknown}   (must have risen: this job was counted)"
 [ "$REPORT_SEEN" = "1" ] || bad "the dry run produced no report after the job was registered, so it may never have examined it"
+if [ -n "$COUNT_BEFORE" ] && [ -n "$COUNT_AFTER" ]; then
+    [ "$COUNT_AFTER" -gt "$COUNT_BEFORE" ] || bad "the dry run's count did not rise ($COUNT_BEFORE -> $COUNT_AFTER), so the submitted job was not among the jobs it examined"
+else
+    bad "the dry run's report count could not be read, so it is unknown whether this job was examined"
+fi
 
 # ---------------------------------------------------------------------------
 log "5/6: checking what did and did not change"

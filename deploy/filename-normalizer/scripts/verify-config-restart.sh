@@ -5,8 +5,9 @@
 # foreign policy identity and observed that a renamer refused it. That shows
 # the comparison works; it does not show that a REAL configuration change,
 # applied by a REAL restart, preserves what was already accepted. This script
-# changes the configuration on disk, restarts the services, and looks at what
-# happens to work that was accepted under the old one.
+# changes the configuration the applications actually run with, recreates the
+# services, and looks at what happens to work that was accepted under the old
+# one.
 #
 # Two changes are exercised:
 #
@@ -17,16 +18,35 @@
 #      for the old destination must be held rather than redirected -- its
 #      reservation covers a directory the new configuration does not use.
 #
-# The original configuration is restored at the end, whatever happens.
+# # What this exercise is not allowed to do
+#
+# The stack's configuration file is bind-mounted read-only into every service
+# and is shared: it is the deployment's own configuration, not this script's
+# scratch space. Earlier versions of this exercise edited it in place and kept
+# a single fixed-name backup, which meant a second run -- or a rerun after a
+# crash -- would copy the ALREADY-MODIFIED file over the only copy of the
+# original. So nothing here writes to that file at all. The changed
+# configuration is a new file this invocation creates, and the applications
+# are pointed at it through FN_CONFIG_FILE. Restoring is then a matter of
+# recreating the services without the override, which is checked against the
+# running processes rather than against the filesystem.
 . "$(dirname "$0")/lib.sh"
 
 OUT="$EVIDENCE_DIR/config-restart.txt"
-CONFIG="$DEPLOY_DIR/config/normalizer.json"
-BACKUP="$DEPLOY_DIR/config/.normalizer.json.before-restart-test"
+LIVE_CONFIG="$DEPLOY_DIR/config/normalizer.json"
 mkdir -p "$EVIDENCE_DIR"
 FAILURES=0
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOWER="$(printf '%s' "$STAMP" | tr 'A-Z' 'a-z')"
+
+# Per-invocation names. Nothing this script touches is shared with another run.
+EX_TAG="$$-$STAMP"
+EX_NAME=".exercise-$EX_TAG.json"
+EX_HOST="$DEPLOY_DIR/config/$EX_NAME"
+EX_IN_CONTAINER="/etc/fn/$EX_NAME"
+DEFAULT_CONFIG="/etc/fn/normalizer.json"
+DEFAULT_CONSUME="/srv/fn/consume"
+ALT_CONSUME="/srv/fn/consume-alt"
 
 emit() { printf '%s\n' "$*" >> "$OUT"; printf '%s\n' "$*"; }
 bad() { printf '    MISMATCH: %s\n' "$*" >&2; emit "    MISMATCH: $*"; FAILURES=$((FAILURES + 1)); }
@@ -53,31 +73,114 @@ await_state() {
     printf '%s' "${_aw_got:-absent}"; return 1
 }
 
-restart_apps() {
-    compose restart watcher renamer-1 renamer-2 >/dev/null 2>&1
+# apply_env recreates the application services with the given environment.
+#
+# `compose restart` is wrong here and was the defect this replaces: it restarts
+# the EXISTING container, which keeps the environment it was created with. An
+# exercise that recreated a renamer with an override could not undo the
+# override by restarting it -- the stack would be left pointing at the
+# exercise's configuration, and the script would report success. Recreation is
+# what makes the current environment take effect, in both directions.
+apply_env() {
+    _ae_cfg="$1"; _ae_consume="$2"
+    FN_CONFIG_FILE="$_ae_cfg" FN_STORAGE_CONSUME="$_ae_consume" \
+        compose up -d --force-recreate --wait --wait-timeout 180 \
+        watcher renamer-1 renamer-2 >/dev/null 2>&1 || true
     wait_healthy watcher 180 || true
     wait_healthy renamer-1 180 || true
     wait_healthy renamer-2 180 || true
 }
 
+# restore puts the stack back and PROVES it, on every exit path.
+#
+# It runs from a trap, so it runs after a failed assertion, after an
+# interruption, and after an unexpected error -- not only after a clean
+# finish. Restoration is judged by asking the running processes what
+# configuration they are using, because restoring a file proves nothing about
+# a process that read it before the change. A restoration that did not take
+# effect fails this target rather than being mentioned.
+RESTORED=0
 restore() {
-    log "restoring the original configuration and restarting"
-    if [ -f "$BACKUP" ]; then
-        mv "$BACKUP" "$CONFIG"
-    fi
-    restart_apps
-}
-trap restore EXIT INT TERM
+    if [ "$RESTORED" = "1" ]; then return 0; fi
+    RESTORED=1
+    log "restoring the original configuration and verifying the running state"
 
-cp "$CONFIG" "$BACKUP"
+    apply_env "$DEFAULT_CONFIG" "$DEFAULT_CONSUME"
+
+    _r_cfg="$(effective_value renamer-1 "d['config_file']")"
+    _r_consume="$(effective_value renamer-1 "d['storage']['consume']")"
+    _r_id="$(effective_value renamer-1 "d['policy']['identity']")"
+    _r_wcfg="$(watcher_effective_value "d['config_file']")"
+    _r_ok=1
+    if [ "$_r_cfg" != "$DEFAULT_CONFIG" ]; then _r_ok=0; fi
+    if [ "$_r_wcfg" != "$DEFAULT_CONFIG" ]; then _r_ok=0; fi
+    if [ "$_r_consume" != "$DEFAULT_CONSUME" ]; then _r_ok=0; fi
+    if [ -n "$BASELINE_ID" ] && [ "$_r_id" != "$BASELINE_ID" ]; then _r_ok=0; fi
+
+    # Remove only the file this invocation created. Nothing else in this
+    # directory belongs to this run, and nothing else is removed.
+    if [ -f "$EX_HOST" ]; then rm -f "$EX_HOST"; fi
+
+    {
+        printf '\nrestoration (read back from the running processes, not from disk):\n'
+        printf '  renamer-1 config_file:   %s   (expected %s)\n' "$_r_cfg" "$DEFAULT_CONFIG"
+        printf '  watcher   config_file:   %s   (expected %s)\n' "$_r_wcfg" "$DEFAULT_CONFIG"
+        printf '  renamer-1 consume root:  %s   (expected %s)\n' "$_r_consume" "$DEFAULT_CONSUME"
+        printf '  renamer-1 policy:        %s   (expected %s)\n' "$_r_id" "${BASELINE_ID:-unknown}"
+        if [ -f "$EX_HOST" ]; then
+            printf '  exercise config removed: no\n'
+        else
+            printf '  exercise config removed: yes\n'
+        fi
+    } >> "$OUT"
+
+    exercise_unlock
+
+    if [ "$_r_ok" != "1" ]; then
+        echo >&2
+        echo "FAILED: the stack was NOT restored to its prior effective configuration." >&2
+        echo "        config_file=$_r_cfg watcher=$_r_wcfg consume=$_r_consume policy=$_r_id" >&2
+        echo "        See $OUT. Restore by hand before running anything else." >&2
+        printf '\nRESTORATION FAILED — see the values above.\n' >> "$OUT"
+        exit 1
+    fi
+    note "restored: config_file=$_r_cfg consume=$_r_consume policy=$_r_id"
+}
+
+# Lock before anything is mutated. Two of these running at once would fight
+# over one stack's services and one configuration directory, and the loser
+# would restore over the winner's change mid-assertion.
+exercise_lock config-restart || exit 1
+BASELINE_ID=""
+trap 'restore' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ -e "$EX_HOST" ]; then
+    echo "error: $EX_HOST already exists; refusing to overwrite it." >&2
+    exit 1
+fi
+
 : > "$OUT"
 emit "FN-N006 — accepted configuration meaning across a real restart"
 emit ""
 
-BEFORE_ID="$(compose --profile tools run --rm fnctl status 2>/dev/null \
-    | python3 -c "import json,sys; print(json.load(sys.stdin)['policyIdentity'])" 2>/dev/null || echo unknown)"
-emit "policy identity before: $BEFORE_ID"
+# The baseline is read from the RUNNING renamer, which is what restoration is
+# later compared against.
+BASELINE_ID="$(effective_value renamer-1 "d['policy']['identity']")"
+BASELINE_CFG="$(effective_value renamer-1 "d['config_file']")"
+BASELINE_CONSUME="$(effective_value renamer-1 "d['storage']['consume']")"
+emit "baseline, read from the running renamer:"
+emit "  config_file:      $BASELINE_CFG"
+emit "  policy identity:  $BASELINE_ID"
+emit "  consume root:     $BASELINE_CONSUME"
 emit ""
+case "$BASELINE_ID" in unreadable|"") echo "error: cannot read the running configuration; is the stack up?" >&2; exit 1 ;; esac
+[ "$BASELINE_CFG" = "$DEFAULT_CONFIG" ] || {
+    echo "error: the stack is already running a non-default configuration ($BASELINE_CFG)." >&2
+    echo "       This exercise will not run on top of another one's changes." >&2
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 # 1. A naming change. Work accepted under the old policy must not be renamed
@@ -91,7 +194,7 @@ DOC1="cfg-policy-$STAMP.pdf"
 submit "$DOC1"
 _i=0
 while [ "$_i" -lt 60 ]; do
-    [ -n "$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC1';")" ] && break
+    if [ -n "$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC1';")" ]; then break; fi
     sleep 1; _i=$((_i + 1))
 done
 ACCEPTED_ID="$(psqlq "SELECT policy_version FROM jobs WHERE source_name = '$DOC1';")"
@@ -99,24 +202,31 @@ emit "1. naming change"
 emit "   job accepted under:           $ACCEPTED_ID"
 [ -n "$ACCEPTED_ID" ] || bad "the probe document was never registered"
 
-# Apply a real naming change and restart.
-python3 - "$CONFIG" <<'PY'
+# Build the changed configuration as a NEW file, derived from the live one and
+# written beside it. The live file is read, never written.
+docker run --rm -i \
+    -v "$DEPLOY_DIR/config:/cfg" \
+    "$UTIL_PY_IMAGE" python3 -c '
 import json, sys
-p = sys.argv[1]
-d = json.load(open(p))
+src, dst = sys.argv[1], sys.argv[2]
+d = json.load(open(src))
 d.setdefault("normalization", {}).setdefault("rules", []).append({
     "name": "cfg-restart-probe",
     "pattern": "^cfg-",
     "replacement": "configured-",
 })
-json.dump(d, open(p, "w"), indent=2)
-PY
-restart_apps
+json.dump(d, open(dst, "w"), indent=2)
+' /cfg/normalizer.json "/cfg/$EX_NAME" || { echo "could not write the exercise configuration" >&2; exit 1; }
+emit "   exercise configuration:       $EX_IN_CONTAINER (new file; the live one is untouched)"
 
-AFTER_ID="$(compose --profile tools run --rm fnctl status 2>/dev/null \
-    | python3 -c "import json,sys; print(json.load(sys.stdin)['policyIdentity'])" 2>/dev/null || echo unknown)"
+apply_env "$EX_IN_CONTAINER" "$DEFAULT_CONSUME"
+
+AFTER_CFG="$(effective_value renamer-1 "d['config_file']")"
+AFTER_ID="$(effective_value renamer-1 "d['policy']['identity']")"
+emit "   renamer now reading:          $AFTER_CFG"
 emit "   policy identity after:        $AFTER_ID"
-[ "$AFTER_ID" != "$BEFORE_ID" ] || bad "a naming change did not move the policy identity"
+[ "$AFTER_CFG" = "$EX_IN_CONTAINER" ] || bad "the change did not take effect: the renamer is still reading $AFTER_CFG"
+[ "$AFTER_ID" != "$BASELINE_ID" ] || bad "a naming change did not move the policy identity"
 
 STATE1="$(await_state "$DOC1" "delivered held uncertain" 120)"
 CAT1="$(psqlq "SELECT coalesce(failure_category,'-') FROM jobs WHERE source_name = '$DOC1';")"
@@ -137,10 +247,12 @@ emit "   new work under the new policy: $STATE1B   (expected delivered)"
 [ "$STATE1B" = "delivered" ] || bad "work submitted after the change reached '$STATE1B'"
 emit ""
 
-# Restore before the second scenario so it starts from a known policy.
-mv "$BACKUP" "$CONFIG"
-cp "$CONFIG" "$BACKUP"
-restart_apps
+# Back to the baseline configuration before the second scenario, and checked,
+# so scenario 2 is not measuring scenario 1's leftovers.
+apply_env "$DEFAULT_CONFIG" "$DEFAULT_CONSUME"
+MID_ID="$(effective_value renamer-1 "d['policy']['identity']")"
+emit "   between scenarios, policy back to: $MID_ID"
+[ "$MID_ID" = "$BASELINE_ID" ] || bad "the baseline policy was not restored between scenarios: $MID_ID"
 
 # ---------------------------------------------------------------------------
 # 2. A destination change. Work accepted for the old consume root must not be
@@ -152,7 +264,7 @@ DOC2="cfg-dest-$STAMP.pdf"
 submit "$DOC2"
 _i=0
 while [ "$_i" -lt 60 ]; do
-    [ -n "$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC2';")" ] && break
+    if [ -n "$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC2';")" ]; then break; fi
     sleep 1; _i=$((_i + 1))
 done
 ACCEPTED_ROOT="$(psqlq "SELECT coalesce(destination_root,'-') FROM jobs WHERE source_name = '$DOC2';")"
@@ -160,32 +272,37 @@ emit "2. destination change"
 emit "   job accepted for:             $ACCEPTED_ROOT"
 [ "$ACCEPTED_ROOT" != "-" ] || bad "no accepted destination was recorded on the job"
 
-# Point the renamers at a different consume root. The environment overrides the
-# file, which is the documented precedence, so this is a real configuration
-# change applied the supported way.
-compose stop renamer-1 renamer-2 >/dev/null 2>&1
-FN_STORAGE_CONSUME=/srv/fn/consume-alt compose up -d --wait --wait-timeout 180 renamer-1 >/dev/null 2>&1 || true
-sleep 6
-RUNNING_ROOT="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer check-config 2>/dev/null \
-    | python3 -c "import json,sys; print(json.load(sys.stdin)['storage']['consume'])" 2>/dev/null || echo unknown)"
-emit "   renamer now configured for:   $RUNNING_ROOT"
+# Point the applications at a different consume root, recreating them so the
+# change actually takes.
+apply_env "$DEFAULT_CONFIG" "$ALT_CONSUME"
+RUNNING_ROOT="$(effective_value renamer-1 "d['storage']['consume']")"
+emit "   renamer now configured for:   $RUNNING_ROOT   (expected $ALT_CONSUME)"
 
-STATE2="$(await_state "$DOC2" "delivered held uncertain" 120)"
-CAT2="$(psqlq "SELECT coalesce(failure_category,'-') FROM jobs WHERE source_name = '$DOC2';")"
-emit "   state after the change:       $STATE2   (expected held)"
-emit "   category:                     $CAT2   (expected destination_mismatch)"
-if [ "$RUNNING_ROOT" = "$ACCEPTED_ROOT" ]; then
-    emit "   NOTE: the destination did not actually change in this run, so this"
-    emit "         scenario did not exercise the mismatch. Reported, not claimed."
+# The scenario must OCCUR. Reporting that it did not and passing anyway is how
+# a change that silently failed to apply gets recorded as evidence for the
+# behaviour it never exercised.
+if [ "$RUNNING_ROOT" != "$ALT_CONSUME" ]; then
+    bad "the destination change did not take effect (renamer still on '$RUNNING_ROOT'), so this scenario did not run"
 else
+    STATE2="$(await_state "$DOC2" "delivered held uncertain" 120)"
+    CAT2="$(psqlq "SELECT coalesce(failure_category,'-') FROM jobs WHERE source_name = '$DOC2';")"
+    DEST2="$(compose run --rm --no-deps -T --entrypoint sh storage-init \
+        -c 'ls -1 /srv/fn/consume-alt 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r\n')"
+    emit "   state after the change:       $STATE2   (expected held)"
+    emit "   category:                     $CAT2   (expected destination_mismatch)"
+    emit "   entries in the new root:      $DEST2   (expected 0: not redirected)"
     [ "$STATE2" = "held" ] || bad "work accepted for another destination reached '$STATE2'"
     [ "$CAT2" = "destination_mismatch" ] || bad "category is '$CAT2'"
+    [ "${DEST2:-0}" = "0" ] || bad "the job was redirected into the new destination root"
 fi
 emit ""
 
 emit "Activation is a restart; nothing here reloads configuration in place."
 emit "Work accepted under one configuration is held for an operator rather than"
-emit "reinterpreted, and work submitted afterwards proceeds normally."
+emit "reinterpreted, and work submitted afterwards proceeds normally. The live"
+emit "configuration file was never written: the changed configuration was a"
+emit "separate file this run created and removed, and restoration is verified"
+emit "by reading it back out of the running processes."
 emit ""
 emit "mismatches: $FAILURES"
 
