@@ -29,6 +29,18 @@ for role in incoming queued staging consume failed; do
     echo "storage-init: prepared $dir"
 done
 
+# An alternate destination used only by the configuration-change exercise. It
+# is prepared the same way as the real roots and is optional, so the ordinary
+# stack does not depend on it being mounted here.
+for role in consume-alt; do
+    dir="$ROOT/$role"
+    if [ -d "$dir" ]; then
+        chown "$UID_RT:$GID_RT" "$dir"
+        chmod 0770 "$dir"
+        echo "storage-init: prepared $dir"
+    fi
+done
+
 # Synthetic fixtures live in a per-run subdirectory of incoming so a rerun
 # never disturbs files another run owns.
 FIX="$ROOT/incoming/synthetic"

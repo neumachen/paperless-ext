@@ -16,6 +16,10 @@ EVIDENCE_DIR="$EXT_DIR/.evidence"
 # host-side container utility work (reading a volume, generating a secret).
 UTIL_IMAGE="${UTIL_IMAGE:-postgres:17.11-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73}"
 
+# Pinned by digest like every other image. The exercises parse JSON, and that
+# is development tooling: it runs in a container, not on the host.
+UTIL_PY_IMAGE="${UTIL_PY_IMAGE:-python:3.13-alpine@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a}"
+
 APP_SERVICES="watcher renamer-1 renamer-2"
 ALL_LOG_SERVICES="watcher renamer-1 renamer-2 postgres-primary postgres-replica rabbitmq storage-init"
 
@@ -394,4 +398,115 @@ run_phase() {
     echo "$phase FAIL (exit $status)" >> "$EVIDENCE_DIR/phase-results.txt"
     PHASE_FAILURES=$((PHASE_FAILURES + 1))
     return 1
+}
+
+
+# ---------------------------------------------------------------------------
+# Exercise safety: ownership, isolation and restoration.
+#
+# The exercises in this directory stop services, rewrite the shared
+# configuration and disconnect containers. Each of those is a mutation of state
+# somebody else may be relying on, so three rules apply to all of them:
+#
+#   * take an exclusive lock before mutating, so two exercises cannot
+#     interleave on one stack;
+#   * never overwrite or remove something this invocation did not create;
+#   * restore on EVERY exit path, and fail the target if restoration did not
+#     take effect -- verified against the RUNNING state, not against a file.
+# ---------------------------------------------------------------------------
+
+# exercise_lock takes an exclusive lock for the duration of this invocation.
+# A second exercise is refused before it mutates anything, rather than racing.
+exercise_lock() {
+    _xl_name="$1"
+    _xl_dir="$EVIDENCE_DIR/.exercise.lock"
+    if ! mkdir "$_xl_dir" 2>/dev/null; then
+        _xl_owner="$(cat "$_xl_dir/owner" 2>/dev/null || echo unknown)"
+        echo "error: another exercise ($_xl_owner) holds the lock at $_xl_dir." >&2
+        echo "       Concurrent exercises mutate the same stack and configuration," >&2
+        echo "       so this invocation refuses rather than interleaving with it." >&2
+        echo "       Nothing has been changed. Remove the directory if it is stale." >&2
+        return 1
+    fi
+    printf '%s pid=%s at=%s\n' "$_xl_name" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_xl_dir/owner"
+    return 0
+}
+
+exercise_unlock() { rm -rf "$EVIDENCE_DIR/.exercise.lock" 2>/dev/null || true; }
+
+# backup_once copies a file to a per-invocation backup, refusing to clobber an
+# existing one. A fixed backup name shared between runs is how a recovery copy
+# gets overwritten by the very failure it was meant to survive.
+backup_once() {
+    _bo_src="$1"; _bo_dst="$2"
+    if [ -e "$_bo_dst" ]; then
+        echo "error: a backup already exists at $_bo_dst." >&2
+        echo "       It belongs to another invocation and will not be overwritten." >&2
+        return 1
+    fi
+    cp "$_bo_src" "$_bo_dst"
+}
+
+# own_service refuses to act on a service this invocation did not create.
+# The fault services are removed on the way out, and removing one that was
+# already running would destroy somebody else's work.
+own_service() {
+    _os_svc="$1"
+    if [ -n "$(compose --profile fault ps -aq "$_os_svc" 2>/dev/null)" ]; then
+        echo "error: service '$_os_svc' already exists." >&2
+        echo "       This invocation did not create it and will not remove it." >&2
+        return 1
+    fi
+    return 0
+}
+
+# recreate_service brings a service back with the CURRENT environment.
+#
+# `compose restart` restarts the existing container, which keeps whatever
+# environment it was created with -- so an exercise that recreated a service
+# with an override could not undo it by restarting. Recreation is what applies
+# the current configuration.
+recreate_service() {
+    compose up -d --force-recreate --wait --wait-timeout 180 "$@" >/dev/null 2>&1
+}
+
+# effective_value reads one field from a running application's own effective
+# configuration, so restoration is verified against what the process is
+# actually using rather than against a file on disk. A file can be correct
+# while the process that read it minutes ago is still running with the old
+# one -- which is exactly the failure this whole helper exists to catch.
+#
+# check-config prints JSON followed by a human line, so the JSON is decoded
+# with raw_decode rather than json.load: json.load would raise on the trailing
+# text and every reading would silently come back "unknown", which reads as a
+# difference and would make restoration checks pass or fail for the wrong
+# reason.
+effective_value() {
+    _ev_svc="$1"; _ev_expr="$2"
+    compose exec -T "$_ev_svc" /usr/local/bin/fn-renamer check-config 2>/dev/null \
+        | run_py "import json,sys
+try:
+    d, _ = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())
+    print($_ev_expr)
+except Exception:
+    print('unreadable')"
+}
+
+# watcher_effective_value is the same for the watcher, which ships its own
+# binary name.
+watcher_effective_value() {
+    compose exec -T watcher /usr/local/bin/fn-watcher check-config 2>/dev/null \
+        | run_py "import json,sys
+try:
+    d, _ = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())
+    print($1)
+except Exception:
+    print('unreadable')"
+}
+
+# run_py runs Python inside a container. Development tooling does not run on
+# the host; an exercise that shells out to a host interpreter has quietly
+# stepped outside the container-only rule the rest of the project follows.
+run_py() {
+    docker run --rm -i "$UTIL_PY_IMAGE" python3 -c "$1"
 }
