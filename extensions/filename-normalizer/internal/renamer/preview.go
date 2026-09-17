@@ -88,7 +88,7 @@ func (p *Previewer) report(ctx context.Context) {
 			switch {
 			case job.PolicyVersion != p.cfg.Policy.Identity:
 				byCategory[string(jobs.CategoryPolicyMismatch)]++
-			case job.DestinationRoot != nil && *job.DestinationRoot != p.cfg.Storage.Consume:
+			case job.DestinationRoot != nil && *job.DestinationRoot != "" && *job.DestinationRoot != p.cfg.Storage.Consume:
 				byCategory[string(jobs.CategoryDestinationMismatch)]++
 			default:
 				if _, err := p.cfg.Policy.Normalize(job.SourceName, job.JobID); err != nil {

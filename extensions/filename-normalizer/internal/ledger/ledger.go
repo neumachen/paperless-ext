@@ -246,6 +246,15 @@ type RegisterInput struct {
 	DestinationRoot string
 }
 
+// nullIfEmpty stores an unset destination as NULL rather than as the empty
+// string, so "no accepted destination recorded" is one value and not two.
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 // RegisterJob makes a submission durable and writes its first history row.
 // The job identity is assigned here and never changes, including across
 // republication and redelivery.
@@ -264,7 +273,7 @@ func (l *Ledger) RegisterJob(ctx context.Context, in RegisterInput) (Job, error)
 			id, jobs.ContractVersion, string(jobs.StatePendingDispatch),
 			in.SourceRoot, in.SourceName, in.SizeBytes, in.FingerprintAlgo,
 			in.Fingerprint, in.PolicyIdentity,
-			in.SourceInode, in.SourceDevice, in.SourceModifiedAt, in.DestinationRoot)
+			in.SourceInode, in.SourceDevice, in.SourceModifiedAt, nullIfEmpty(in.DestinationRoot))
 		var scanErr error
 		job, scanErr = scanJob(row)
 		if scanErr != nil {

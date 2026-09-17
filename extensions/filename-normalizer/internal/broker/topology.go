@@ -38,10 +38,19 @@ func TopologyFromConfig(c config.Broker) Topology {
 // Declare creates the durable topology.
 //
 // The work queue is a quorum queue: it is durable by construction and it
-// supports x-delivery-limit, which is how bounded retries are enforced at the
-// broker rather than by a counter the application could lose. Exhausted
-// messages are dead-lettered, and a dead-lettered message is a visible
-// artefact, not a substitute for the job ledger.
+// supports x-delivery-limit.
+//
+// x-delivery-limit is NOT how bounded retries are enforced here, despite what
+// an earlier version of this comment said. On RabbitMQ 4.3.6 an explicit
+// basic.nack(requeue=true) does not advance a quorum queue's x-delivery-count,
+// which the foundation work measured directly, so the broker-side limit cannot
+// bound a requeue loop driven by the consumer. The bound that actually holds
+// is the ledger's own delivery_attempts counter, incremented durably by
+// BeginDelivery; see internal/renamer/pipeline.go. The broker limit remains a
+// backstop for redelivery the broker itself initiates.
+//
+// Exhausted messages are dead-lettered, and a dead-lettered message is a
+// visible artefact, not a substitute for the job ledger.
 func Declare(ch *amqp.Channel, t Topology) error {
 	if err := ch.ExchangeDeclare(t.DeadLetterX, "topic", true, false, false, false, nil); err != nil {
 		return fmt.Errorf("declare dead-letter exchange: %w", err)

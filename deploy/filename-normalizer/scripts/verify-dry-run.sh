@@ -31,6 +31,14 @@ psql_primary() {
         postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d "${FN_DB_NAME:-filename_normalizer}" -tA -c "$1"
 }
 
+# queue_depth reads the real broker, because "queued work is unchanged" is a
+# statement about the queue and cannot be inferred from the ledger.
+queue_depth() {
+    compose exec -T rabbitmq rabbitmqctl list_queues -p "${FN_AMQP_VHOST:-filename-normalizer}" \
+        --quiet --no-table-headers name messages 2>/dev/null \
+        | awk -v q="${FN_AMQP_QUEUE:-filename_normalizer.jobs.v1}" '$1 == q {print $2}' | tr -d ' \r\n'
+}
+
 count_consume() {
     compose run --rm --no-deps -T --entrypoint sh storage-init \
         -c 'ls -1 /srv/fn/consume 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r\n'
@@ -51,11 +59,11 @@ emit "A9 — dry run preserves sources and the operational ledger"
 emit ""
 
 # ---------------------------------------------------------------------------
-log "1/5: stopping the ordinary renamers so the dry-run instance is the only consumer"
+log "1/6: stopping the ordinary renamers so the dry-run instance is the only consumer"
 compose stop renamer-1 renamer-2 >/dev/null 2>&1
 emit "ordinary renamers stopped"
 
-log "2/5: starting a renamer with dry_run enabled"
+log "2/6: starting a renamer with dry_run enabled"
 compose --profile fault up -d --wait --wait-timeout 180 renamer-dry-run >/dev/null 2>&1 || {
     echo "the dry-run renamer did not become healthy" >&2
     exit 1
@@ -64,43 +72,73 @@ emit "dry-run renamer started (FN_RENAMER_DRY_RUN=true)"
 emit ""
 
 # ---------------------------------------------------------------------------
-log "3/5: recording the before state"
+log "3/6: recording the before state"
 BEFORE_JOBS="$(psql_primary 'SELECT count(*) FROM jobs;')"
 BEFORE_RES="$(psql_primary 'SELECT count(*) FROM name_reservations;')"
 BEFORE_RECEIPTS="$(psql_primary 'SELECT count(*) FROM delivery_receipts;')"
 BEFORE_CONSUME="$(count_consume)"
+# The whole point of FN-N003: the previous oracle checked only reservations,
+# receipts and the consume directory, and accepted any non-delivered state. It
+# therefore passed while the dry run was writing delivery ownership, writing a
+# normalized name, and ACKNOWLEDGING the message -- destroying the very work it
+# was previewing. History rows and queue depth are what catch that.
+BEFORE_EVENTS="$(psql_primary 'SELECT count(*) FROM job_events;')"
+BEFORE_QUEUED="$(queue_depth)"
 emit "before:  jobs=$BEFORE_JOBS reservations=$BEFORE_RES receipts=$BEFORE_RECEIPTS consume_entries=$BEFORE_CONSUME"
+emit "         history_rows=$BEFORE_EVENTS queued_messages=$BEFORE_QUEUED"
 
 # ---------------------------------------------------------------------------
-log "4/5: submitting a document through the real watcher and broker"
+log "4/6: submitting a document through the real watcher and broker"
 compose run --rm --no-deps -T --entrypoint sh storage-init -c \
     "printf '%%PDF-1.4 dry run probe\\n' > /srv/fn/incoming/.wip-dryrun && \
      mv /srv/fn/incoming/.wip-dryrun '/srv/fn/incoming/$DOC'" >/dev/null 2>&1
 emit "submitted: $DOC"
 
-# Wait for the dry-run renamer to have handled it.
-_seen=0
+# Two waits, in order, because either alone is insufficient.
+#
+# First the job must actually exist: the checks below read its row, and an
+# absent row returns empty strings that look like violations. Then the dry run
+# must have produced a report AFTER the row appeared, which is what shows it
+# examined this job rather than an earlier one. Waiting a fixed interval, or
+# waiting for any report at all, would pass whether or not this document was
+# ever looked at -- and did, on the first run of this oracle.
 _i=0
-while [ "$_i" -lt 60 ]; do
-    if [ "$(psql_primary "SELECT count(*) FROM jobs WHERE source_name = '$DOC' AND normalized_name IS NOT NULL;")" = "1" ]; then
-        _seen=1
+JOB_SEEN=0
+while [ "$_i" -lt 90 ]; do
+    if [ -n "$(psql_primary "SELECT job_id FROM jobs WHERE source_name = '$DOC';" | tr -d ' ')" ]; then
+        JOB_SEEN=1
         break
     fi
     sleep 1
     _i=$((_i + 1))
 done
-if [ "$_seen" != "1" ]; then
-    bad "the dry-run renamer never recorded a normalized name for the submission"
-fi
+[ "$JOB_SEEN" = "1" ] || bad "the submission was never registered, so nothing could be previewed"
+
+REPORTS_BEFORE="$(compose logs renamer-dry-run 2>/dev/null | grep -c dry_run_report || true)"
+_i=0
+REPORT_SEEN=0
+while [ "$_i" -lt 90 ]; do
+    _now="$(compose logs renamer-dry-run 2>/dev/null | grep -c dry_run_report || true)"
+    if [ "${_now:-0}" -gt "${REPORTS_BEFORE:-0}" ]; then
+        REPORT_SEEN=1
+        break
+    fi
+    sleep 1
+    _i=$((_i + 1))
+done
+[ "$REPORT_SEEN" = "1" ] || bad "the dry run produced no report after the job was registered, so it may never have examined it"
 
 # ---------------------------------------------------------------------------
-log "5/5: checking what did and did not change"
+log "5/6: checking what did and did not change"
 AFTER_RES="$(psql_primary 'SELECT count(*) FROM name_reservations;')"
 AFTER_RECEIPTS="$(psql_primary 'SELECT count(*) FROM delivery_receipts;')"
 AFTER_CONSUME="$(count_consume)"
+AFTER_EVENTS="$(psql_primary 'SELECT count(*) FROM job_events;')"
+AFTER_QUEUED="$(queue_depth)"
 STATE="$(psql_primary "SELECT state FROM jobs WHERE source_name = '$DOC';")"
 NORMALIZED_RECORDED="$(psql_primary "SELECT coalesce(normalized_name,'-') FROM jobs WHERE source_name = '$DOC';")"
 RESERVED="$(psql_primary "SELECT coalesce(reserved_name,'-') FROM jobs WHERE source_name = '$DOC';")"
+ATTEMPTS="$(psql_primary "SELECT delivery_attempts FROM jobs WHERE source_name = '$DOC';")"
 SOURCE_PRESENT="$(compose run --rm --no-deps -T --entrypoint sh storage-init \
     -c "test -f '/srv/fn/incoming/$DOC' && echo yes || echo no" 2>/dev/null | tr -d ' \r\n')"
 STAGED="$(compose run --rm --no-deps -T --entrypoint sh storage-init \
@@ -109,25 +147,60 @@ STAGED="$(compose run --rm --no-deps -T --entrypoint sh storage-init \
 emit "after:   jobs=$(psql_primary 'SELECT count(*) FROM jobs;') reservations=$AFTER_RES receipts=$AFTER_RECEIPTS consume_entries=$AFTER_CONSUME"
 emit ""
 emit "the submitted job:"
-emit "  state:                 $STATE"
-emit "  normalized_name:       $NORMALIZED_RECORDED   (computed and recorded)"
-emit "  reserved_name:         $RESERVED   (must be '-': a dry run reserves nothing)"
+emit "  state:                 $STATE   (expected pending_dispatch or dispatched: untouched)"
+emit "  normalized_name:       $NORMALIZED_RECORDED   (must be '-': a dry run writes nothing)"
+emit "  reserved_name:         $RESERVED   (must be '-')"
+emit "  delivery_attempts:     $ATTEMPTS   (must be 0: no delivery was taken)"
 emit "  source still present:  $SOURCE_PRESENT"
 emit "  staging entries:       $STAGED"
 emit ""
+emit "after:   reservations=$AFTER_RES receipts=$AFTER_RECEIPTS consume_entries=$AFTER_CONSUME"
+emit "         history_rows=$AFTER_EVENTS queued_messages=$AFTER_QUEUED"
+emit ""
 
-[ "$NORMALIZED_RECORDED" = "$NORMALIZED" ] || bad "normalized name is '$NORMALIZED_RECORDED', expected '$NORMALIZED'"
+[ "$NORMALIZED_RECORDED" = "-" ] || bad "a dry run wrote a normalized name to the ledger: $NORMALIZED_RECORDED"
 [ "$RESERVED" = "-" ] || bad "a dry run reserved the destination name '$RESERVED'"
+[ "${ATTEMPTS:-0}" = "0" ] || bad "a dry run took $ATTEMPTS delivery/deliveries off the queue"
 [ "$AFTER_RES" = "$BEFORE_RES" ] || bad "reservations changed: $BEFORE_RES -> $AFTER_RES"
 [ "$AFTER_RECEIPTS" = "$BEFORE_RECEIPTS" ] || bad "delivery receipts changed: $BEFORE_RECEIPTS -> $AFTER_RECEIPTS"
 [ "$AFTER_CONSUME" = "$BEFORE_CONSUME" ] || bad "the consume directory changed: $BEFORE_CONSUME -> $AFTER_CONSUME entries"
 [ "$SOURCE_PRESENT" = "yes" ] || bad "the source was removed"
 [ "$STATE" != "delivered" ] || bad "a dry run marked the job delivered"
+case "$STATE" in
+    pending_dispatch|dispatched) ;;
+    *) bad "the job's state changed to '$STATE'; a dry run must not move it" ;;
+esac
 
-emit "A dry run computed the name and recorded it, and changed nothing else: no"
-emit "destination reservation, no delivery receipt, no file in the consume"
-emit "directory, and the source untouched. The name it computed is the name the"
-emit "ordinary pipeline would have published."
+# The job's own history must be exactly what discovery and dispatch wrote.
+JOB_EVENTS="$(psql_primary "SELECT count(*) FROM job_events e JOIN jobs j USING (job_id) WHERE j.source_name = '$DOC' AND e.event_type NOT IN ('registered','dispatch_claimed','dispatch_confirmed');")"
+emit "  history rows beyond registration/dispatch: $JOB_EVENTS   (must be 0)"
+[ "${JOB_EVENTS:-0}" = "0" ] || bad "a dry run wrote $JOB_EVENTS history row(s) for the job"
+
+# ---------------------------------------------------------------------------
+log "6/6: the previewed work must still be processable afterwards"
+compose stop renamer-dry-run >/dev/null 2>&1
+compose rm -f renamer-dry-run >/dev/null 2>&1
+compose start renamer-1 renamer-2 >/dev/null 2>&1
+wait_healthy renamer-1 120 || true
+_i=0
+FINAL_STATE=""
+while [ "$_i" -lt 120 ]; do
+    FINAL_STATE="$(psql_primary "SELECT state FROM jobs WHERE source_name = '$DOC';")"
+    case "$FINAL_STATE" in delivered|held|uncertain) break ;; esac
+    sleep 1
+    _i=$((_i + 1))
+done
+emit "after the dry run ended, with ordinary renamers running:"
+emit "  final state:           $FINAL_STATE   (expected delivered)"
+[ "$FINAL_STATE" = "delivered" ] || bad "previewed work reached '$FINAL_STATE'; a dry run must not consume it"
+emit ""
+
+emit "A dry run reported what would happen and changed nothing: no"
+emit "normalized name written, no delivery taken off the queue, no reservation,"
+emit "no receipt, no file in the consume directory, no history row beyond what"
+emit "discovery and dispatch had already written, and the source untouched."
+emit "The previewed job was then processed normally by an ordinary renamer,"
+emit "which is the property that matters: previewing work must not consume it."
 emit ""
 emit "mismatches: $FAILURES"
 

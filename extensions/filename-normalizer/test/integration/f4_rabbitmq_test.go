@@ -803,7 +803,7 @@ func TestF4EndToEndThroughTheRunningApplications(t *testing.T) {
 	// terminal reason is that the source is absent -- not a claim of delivery.
 	if final.FailureCategory == nil || *final.FailureCategory != string(jobs.CategorySourceAbsent) {
 		t.Fatalf("the recorded hold category is %v, expected %q",
-			final.FailureCategory, jobs.CategorySourceAbsent)
+			derefCategory(final), jobs.CategorySourceAbsent)
 	}
 	if final.DispatchedAt == nil {
 		t.Errorf("the job reached a renamer but no confirmed dispatch was recorded")

@@ -409,10 +409,16 @@ func TestA3ExistingDestinationIsNeverOverwritten(t *testing.T) {
 		filepath.Base(occupied), got, bytes.Equal(after, foreign))))
 }
 
-// TestA3RetainedNamesAreNotReusedAfterTheFileIsConsumed simulates Paperless
-// ingesting a document: the file leaves the consume directory, and the name
-// must still not be handed to a different submission.
-func TestA3RetainedNamesAreNotReusedAfterTheFileIsConsumed(t *testing.T) {
+// TestA3RetainedNamesAreNotReusedAfterTheFileDisappears removes a delivered
+// file directly.
+//
+// Stated accurately: this establishes FILESYSTEM-ABSENCE behaviour. It does
+// not prove anything about Paperless, which is not running here -- no consumer
+// observed the file, and nothing was ingested. What it does prove is the
+// property that matters for name reuse: once a name has been handed out, a
+// different submission never receives it, whether or not the file is still
+// there.
+func TestA3RetainedNamesAreNotReusedAfterTheFileDisappears(t *testing.T) {
 	e := Suite()
 	e.OnlyIn(t, PhaseNormalization)
 	led := e.Ledger(t)
@@ -426,11 +432,12 @@ func TestA3RetainedNamesAreNotReusedAfterTheFileIsConsumed(t *testing.T) {
 	firstPath := publishedPath(t, e, led, first)
 	firstName := filepath.Base(firstPath)
 
-	// The consumer takes the file away. This is not the normalizer deleting a
-	// document: it is the test standing in for Paperless's own ingestion,
-	// which is the real reason a delivered file disappears.
+	// The file is removed directly by this test. In production the usual
+	// reason a delivered file disappears is that Paperless ingested it, but no
+	// Paperless is running here and none is claimed: this is filesystem
+	// absence, nothing more.
 	if err := os.Remove(firstPath); err != nil {
-		t.Fatalf("simulate consumption: %v", err)
+		t.Fatalf("remove the delivered file: %v", err)
 	}
 
 	// A different submission that normalizes to the same name.
@@ -447,7 +454,8 @@ func TestA3RetainedNamesAreNotReusedAfterTheFileIsConsumed(t *testing.T) {
 	e.WriteEvidence(t, "a3-retained-names.txt", []byte(fmt.Sprintf(
 		"first delivered as   %s\nthen removed from the consume directory (as Paperless would)\n"+
 			"second delivered as  %s\nname reused: %t\n\n"+
-			"The reservation row outlives the file, so a consumed name is never offered again.\n",
+			"The reservation row outlives the file, so a name that has been handed out is\n"+
+			"never offered to a different submission. No consumer was involved.\n",
 		firstName, secondName, secondName == firstName)))
 }
 
@@ -763,11 +771,12 @@ then linked to their final name within that same directory. The cross-boundary
 work, when there is any, happens during the copy -- before anything is visible
 under a publishable name.
 
-Because both roots are Docker volumes on one host filesystem here, the
-same-filesystem path is what this run exercised. A genuinely separate
-filesystem for the destination is NOT demonstrated by this run and remains an
-unrun scenario; the code path that differs is the copy fallback in
-stageBesideDestination, which is exercised by unit-level coverage only.
+Both roots are Docker volumes on one host filesystem here, so the
+same-filesystem path is what THIS phase exercises. The cross-filesystem path
+is exercised separately by "make test-recovery", which runs a renamer whose
+staging root is a tmpfs: that evidence records the two device numbers read
+from the kernel and shows a document published across the boundary. There is
+no unit-level coverage of the copy fallback and none is claimed.
 `)
 	e.WriteEvidence(t, "a10-filesystem-topology.txt", []byte(report.String()))
 
