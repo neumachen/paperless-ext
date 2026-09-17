@@ -39,7 +39,7 @@ x-app-env: &app-env
   FN_STORAGE_INCOMING: /srv/fn/incoming
   FN_STORAGE_QUEUED: /srv/fn/queued
   FN_STORAGE_STAGING: /srv/fn/staging
-  FN_STORAGE_CONSUME: /srv/fn/consume
+  FN_STORAGE_CONSUME: ${FN_STORAGE_CONSUME:-/srv/fn/consume}
   FN_STORAGE_FAILED: /srv/fn/failed
   FN_STORAGE_REQUIRED: "true"
 
@@ -88,6 +88,11 @@ networks:
     driver: bridge
 
 volumes:
+  # An alternate destination, used only by the configuration-change exercise so
+  # a destination change has a real directory to point at that is not another
+  # role's root.
+  fn-consume-alt:
+
   # Cluster state. Separate volumes so the standby can be rebuilt without
   # touching the primary, and vice versa.
   pg-primary-data:
@@ -332,6 +337,7 @@ services:
       - fn-queued:/srv/fn/queued
       - fn-staging:/srv/fn/staging
       - fn-consume:/srv/fn/consume
+      - fn-consume-alt:/srv/fn/consume-alt
       - fn-failed:/srv/fn/failed
     ports:
       - "${FN_RENAMER1_PORT:-18081}:8080"
@@ -361,6 +367,73 @@ services:
       FN_RENAMER_CONCURRENCY: ${FN_RENAMER_CONCURRENCY:-2}
     ports:
       - "${FN_RENAMER2_PORT:-18082}:8080"
+
+  # -------------------------------------------------------------------------
+  # A renamer whose staging root is a tmpfs, so staging and consume are on
+  # genuinely different filesystems. Both roots being Docker volumes on one
+  # host filesystem is what left A10's cross-filesystem path unexercised; a
+  # tmpfs has its own device, which is the real thing rather than two
+  # different-looking paths.
+  # -------------------------------------------------------------------------
+  renamer-altfs:
+    <<: *renamer
+    profiles: [fault]
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-altfs
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "1"
+    volumes:
+      - ./config:/etc/fn:ro
+      - fn-incoming:/srv/fn/incoming:ro
+      - fn-queued:/srv/fn/queued
+      - fn-consume:/srv/fn/consume
+      - fn-failed:/srv/fn/failed
+    tmpfs:
+      - /srv/fn/staging:size=64m,mode=1777
+    ports: !reset []
+
+  # -------------------------------------------------------------------------
+  # The same, with a staging tmpfs far too small for the documents the A11
+  # exercise submits. A write that runs out of space mid-copy is a real
+  # ENOSPC, not a simulated one.
+  # -------------------------------------------------------------------------
+  renamer-tinyfs:
+    <<: *renamer
+    profiles: [fault]
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-tinyfs
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "1"
+      FN_RENAMER_MAX_DELIVERY_ATTEMPTS: "2"
+    volumes:
+      - ./config:/etc/fn:ro
+      - fn-incoming:/srv/fn/incoming:ro
+      - fn-queued:/srv/fn/queued
+      - fn-consume:/srv/fn/consume
+      - fn-failed:/srv/fn/failed
+    tmpfs:
+      - /srv/fn/staging:size=1m,mode=1777
+    ports: !reset []
+
+  # -------------------------------------------------------------------------
+  # A renamer that deliberately dies partway through publishing, so the
+  # interruption window between the destination link and the receipt is
+  # exercised for real. FN_FAULT_POINTS is inert everywhere else and the
+  # application logs loudly when it is armed.
+  # -------------------------------------------------------------------------
+  renamer-fault:
+    <<: *renamer
+    profiles: [fault]
+    restart: "no"
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-fault
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "1"
+      FN_FAULT_POINTS: ${FN_FAULT_POINTS:-after_link}
+    ports: !reset []
 
   # -------------------------------------------------------------------------
   # A renamer in dry-run mode, for the A9 demonstration. It consumes the same

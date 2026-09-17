@@ -26,6 +26,15 @@ type Effective struct {
 	Policy EffectivePolicy `json:"policy"`
 
 	Storage map[string]string `json:"storage"`
+	// StorageDevices reports the filesystem device backing each root. It is
+	// how "are staging and consume genuinely on different filesystems?" is
+	// answered from the kernel rather than inferred from two paths -- and the
+	// runtime images have no shell, so the application is the only thing that
+	// can answer it from inside the container.
+	StorageDevices map[string]uint64 `json:"storage_devices,omitempty"`
+	// StorageResolved reports the directory each root actually resolves to,
+	// so a symlinked root is visible as what it is.
+	StorageResolved map[string]string `json:"storage_resolved,omitempty"`
 
 	Discovery *EffectiveDiscovery `json:"discovery,omitempty"`
 
@@ -113,6 +122,8 @@ func (c Common) effectiveBase() Effective {
 			"consume":  c.Storage.Consume,
 			"failed":   c.Storage.Failed,
 		},
+		StorageDevices:  c.Roots.Devices(),
+		StorageResolved: c.Roots.Resolved(),
 		Dependencies: EffectiveDependencies{
 			DatabaseHost:   c.Database.PrimaryHost,
 			DatabasePort:   c.Database.PrimaryPort,

@@ -74,10 +74,15 @@ make test-project-isolation    # prove the guarded removal targets only its own
                                # project's volume
 make test-cleanup-ownership    # prove that check cannot delete pre-existing data
 make test-harness-ownership    # and that its own harness cannot either
+make test-recovery             # interruption around publication, a real stale
+                               # worker, a genuinely separate filesystem, and a
+                               # real out-of-space write (A6, A7, A10, A11)
+make test-config-restart       # a real configuration change across a restart
+make test-dry-run              # a dry run changes nothing (A9)
 make test-failure-propagation  # prove make verify and make build propagate
                                # a containerized failure
 
-# `make test` does NOT include the five exercises above. Two are destructive to
+# `make test` does NOT include the exercises above. Two are destructive to
 # a standby's data volume, one deliberately breaks the tree for a step, and two
 # create and destroy throwaway Compose projects, so all five are run explicitly
 # and their evidence is retained alongside the suite's.

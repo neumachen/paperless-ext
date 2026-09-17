@@ -188,6 +188,16 @@ test-normalization: ## Run only the end-to-end document phase
 	  FN_TEST_RUN_ID=$${FN_TEST_RUN_ID:-manual-$$(date -u +%Y%m%dT%H%M%SZ)} \
 	  $(COMPOSE) --profile test run --rm integration -test.v -test.timeout 20m
 
+.PHONY: test-config-restart
+test-config-restart: ## Prove accepted configuration meaning survives a real restart (FN-N006)
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-config-restart.sh
+
+.PHONY: test-recovery
+test-recovery: ## Interruption, stale worker, filesystem boundary and write failures (A6, A7, A10, A11)
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-recovery.sh
+
 .PHONY: test-dry-run
 test-dry-run: ## Prove a dry run preserves sources and the operational ledger (A9)
 	@mkdir -p $(EVIDENCE)

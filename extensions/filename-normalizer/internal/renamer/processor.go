@@ -131,7 +131,9 @@ func (p *Processor) handle(ctx context.Context, d broker.Delivery) broker.Decisi
 		return broker.Reject
 	case err != nil:
 		// The durable store is unavailable. Nothing was recorded, so the
-		// delivery must go back to the broker; x-delivery-limit bounds it.
+		// delivery must go back to the broker. What bounds the retry is the
+		// ledger's delivery_attempts counter, not x-delivery-limit: an
+		// explicit requeue does not advance a quorum queue's delivery count.
 		p.base.Metrics.Deliveries.WithLabelValues("requeued").Inc()
 		p.base.Metrics.LedgerErrors.WithLabelValues(logging.ErrorKind(err)).Inc()
 		log.Error("could not record delivery ownership; returning the delivery and pausing consumption",

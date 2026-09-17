@@ -136,7 +136,11 @@ func (p *Pipeline) Process(ctx context.Context, job ledger.Job, attempt int) Out
 	// restart would otherwise silently redirect work that was already
 	// registered and, for a reserved job, publish it somewhere its reservation
 	// does not cover.
-	if job.DestinationRoot != nil && *job.DestinationRoot != p.cfg.Storage.Consume {
+	// An empty recorded root means the same as no recorded root: jobs
+	// registered before this column existed, and callers that do not supply
+	// one, are compatible with any configuration.
+	if job.DestinationRoot != nil && *job.DestinationRoot != "" &&
+		*job.DestinationRoot != p.cfg.Storage.Consume {
 		log.Warn("job was accepted for a different destination root",
 			slog.String("event", "destination_mismatch"),
 			slog.String("category", string(jobs.CategoryDestinationMismatch)))
@@ -611,8 +615,12 @@ func (p *Pipeline) hold(ctx context.Context, job ledger.Job, cat jobs.Category, 
 // durable budget lasts.
 func (p *Pipeline) holdOr(ctx context.Context, job ledger.Job, cat jobs.Category, attempt int, cause error) (Outcome, bool) {
 	switch cat {
+	// Deliberately NOT including source_absent. A vanished source is almost
+	// always permanent, and retrying it spends the budget only to end in
+	// retry_exhausted -- which replaces an informative reason with a generic
+	// one. It is held immediately, with the reason intact.
 	case jobs.CategoryStorageUnavailable, jobs.CategoryStorageError,
-		jobs.CategoryPermissionDenied, jobs.CategorySourceAbsent:
+		jobs.CategoryPermissionDenied:
 		if job.DeliveryAttempts <= p.cfg.MaxDeliveryAttempts {
 			return unsettled(cause), false
 		}

@@ -148,11 +148,13 @@ func TestA2TwoRenamersOverlapOnRealDocuments(t *testing.T) {
 // A6 — worker and publication recovery
 // ---------------------------------------------------------------------------
 
-// TestA6ConsumedDocumentIsNotRepublished covers the case the contract calls
-// out explicitly: a durable delivery record exists but the destination is
-// gone, because Paperless consumed it. That must not be read as a failure and
-// must not cause redelivery.
-func TestA6ConsumedDocumentIsNotRepublished(t *testing.T) {
+// TestA6AbsentDeliveredDocumentIsNotRepublished covers the case the contract
+// calls out explicitly: a durable delivery record exists but the destination
+// is gone. In production the usual cause is Paperless ingesting it; here the
+// file is removed directly and no consumer is involved, so what is established
+// is the system's response to FILESYSTEM ABSENCE, not ingestion behaviour.
+// That response must not be "redeliver".
+func TestA6AbsentDeliveredDocumentIsNotRepublished(t *testing.T) {
 	e := Suite()
 	e.OnlyIn(t, PhaseNormalization)
 	led := e.Ledger(t)
@@ -168,9 +170,9 @@ func TestA6ConsumedDocumentIsNotRepublished(t *testing.T) {
 	path := publishedPath(t, e, led, job)
 	delivered := filepath.Base(path)
 
-	// The consumer takes it.
+	// Removed directly by this test. No consumer observed it.
 	if err := os.Remove(path); err != nil {
-		t.Fatalf("simulate consumption: %v", err)
+		t.Fatalf("remove the delivered file: %v", err)
 	}
 
 	// Republish the same job onto the queue. A redelivery of a job that
@@ -197,12 +199,13 @@ func TestA6ConsumedDocumentIsNotRepublished(t *testing.T) {
 		t.Errorf("the receipt changed from %q to %q", delivered, receipt.DeliveredName)
 	}
 
-	e.WriteEvidence(t, "a6-consumed-not-republished.txt", []byte(fmt.Sprintf(
-		"delivered as        %s\nremoved from consume (as Paperless would)\n"+
+	e.WriteEvidence(t, "a6-absent-not-republished.txt", []byte(fmt.Sprintf(
+		"delivered as        %s\nremoved directly by this test (filesystem absence; NOT ingestion)\n"+
 			"job redelivered on the queue\nstate after:        %s\nrepublished:        %t\n"+
 			"receipt unchanged:  %t\n\n"+
 			"An absent destination with a durable receipt is read as \"already delivered\",\n"+
-			"never as a failed delivery, so the consumer cannot trigger a duplicate.\n",
+			"never as a failed delivery. Whether a real Paperless instance behaves this way\n"+
+			"is NOT established here: no consumer took part.\n",
 		delivered, after.State, false, receipt.DeliveredName == delivered)))
 }
 
