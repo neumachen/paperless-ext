@@ -155,6 +155,39 @@ test-project-isolation: ## Prove an overridden-project failover cannot delete th
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-project-isolation.sh
 
+.PHONY: check-config
+check-config: ## Validate the configuration and print the effective, credential-free view
+	cd $(HERE) && $(COMPOSE) run --rm --no-deps --entrypoint /usr/local/bin/fn-watcher watcher check-config
+
+.PHONY: submit
+submit: ## Submit a document: make submit FILE=path  |  make submit NAME=... TEXT=...
+	@cd $(HERE) && if [ -n "$(FILE)" ]; then \
+	  base=$$(basename "$(FILE)"); \
+	  echo "submitting $$base"; \
+	  $(COMPOSE) run --rm --no-deps -T --entrypoint sh -v "$(FILE)":/in/src:ro storage-init -c \
+	    'cp /in/src "/srv/fn/incoming/.wip-submit" && mv "/srv/fn/incoming/.wip-submit" "/srv/fn/incoming/$$0"' "$$base"; \
+	elif [ -n "$(NAME)" ]; then \
+	  echo "submitting $(NAME)"; \
+	  $(COMPOSE) run --rm --no-deps -T --entrypoint sh storage-init -c \
+	    'printf "%s\n" "$$1" > "/srv/fn/incoming/.wip-submit" && mv "/srv/fn/incoming/.wip-submit" "/srv/fn/incoming/$$0"' \
+	    "$(NAME)" "$${TEXT:-synthetic document body}"; \
+	else \
+	  echo "usage: make submit FILE=<path>   or   make submit NAME=<filename> [TEXT=<body>]" >&2; exit 2; \
+	fi
+	@echo "The document is written to a temporary name and renamed into place, which is"
+	@echo "the strict completion contract. Watch it with: make api ARGS=state"
+
+.PHONY: api
+api: ## Call the gRPC inspection API: make api ARGS="status" (see fnctl -h)
+	@cd $(HERE) && $(COMPOSE) --profile tools run --rm fnctl $(ARGS)
+
+.PHONY: test-normalization
+test-normalization: ## Run only the end-to-end document phase
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && FN_TEST_PHASE=normalization \
+	  FN_TEST_RUN_ID=$${FN_TEST_RUN_ID:-manual-$$(date -u +%Y%m%dT%H%M%SZ)} \
+	  $(COMPOSE) --profile test run --rm integration -test.v -test.timeout 20m
+
 .PHONY: test-cleanup-ownership
 test-cleanup-ownership: ## Prove the isolation wrapper's own cleanup cannot remove pre-existing resources
 	@mkdir -p $(EVIDENCE)

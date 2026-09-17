@@ -4,37 +4,51 @@ The File Normalizer prepares incoming documents for Paperless-ngx without
 changing their contents. It is written in Go and ships as two independently
 deployable executables backed by a PostgreSQL cluster and a RabbitMQ broker.
 
-**Status: containerized foundation.** Configuration, process lifecycle,
-dependency integration and telemetry are implemented and exercised against
-real dependencies. **Filename normalization itself is not implemented.** See
-[foundation status](../../docs/foundation-status-001.md) for what is proven and
-what is not, and [the requirements](../../docs/filename-normalizer-requirements.md)
-for the behaviour the finished extension owes.
+**Status: locally runnable, synthetic only.** Discovery, normalization,
+destination reservation, safe publication, completion accounting, dry run,
+declarative configuration and a gRPC inspection API are implemented and
+exercised end to end against real PostgreSQL, RabbitMQ and filesystems.
+
+The naming policy is a **documented candidate** (`v1-candidate-2026-09-16`),
+not an owner-accepted production policy; every surface that reports it says so.
+Production filesystem, security, monitoring, backup and deployment
+qualification are separate and unfinished.
+
+- [Operations and configuration](../../docs/filename-normalizer-operations.md)
+  — the operator's reference.
+- [Requirements](../../docs/filename-normalizer-requirements.md) — the contract.
+- [Foundation status](../../docs/foundation-status-001.md) — what the
+  containerized foundation proved, and its correction history.
 
 ## The two applications
 
 | Executable | Role |
 |---|---|
-| `fn-watcher` | Hosts the workers that own job intake and accounting: **dispatch** (publishes durable jobs to the broker with publisher confirms, and returns stranded claims to the pending set) and **completion accounting** (aggregates the durable ledger into the exposed metrics). **Discovery** is the third worker this process is intended to host; it is not implemented, and `FN_WATCHER_DISCOVERY_ENABLED=true` is a hard startup error rather than an inert flag. |
-| `fn-renamer` | Consumes the work queue with manual acknowledgement and configurable bounded concurrency. Independently scalable: run as many instances as you like against one queue. Filename normalization, destination reservation and publication belong here and are **not implemented**; a delivery currently reaches a durably recorded hold with the category `normalization_unimplemented`. |
+| `fn-watcher` | Hosts three workers: **discovery** (registers eligible completed submissions from the incoming root, and reconciles work that arrived while the process was down), **dispatch** (publishes durable jobs with publisher confirms and returns stranded claims), and **completion accounting** (aggregates the ledger into the exposed metrics). |
+| `fn-renamer` | Consumes the work queue with manual acknowledgement and bounded concurrency, independently scalable. Owns normalization, destination reservation and publication: verified working copy, exclusive name reservation, publish intent, `link(2)` into the consume directory, durable receipt. |
+| `fnctl` | The gRPC inspection client, shipped as its own image. Read-only. |
 
 Both binaries accept four subcommands:
 
 | Subcommand | Purpose |
 |---|---|
 | `version` | Prints the stamped build identity, including the source digest. |
-| `check-config` | Validates the environment and exits. |
+| `check-config` | Validates the configuration and prints the effective, credential-free view. |
 | `healthcheck` | Queries the **running** process over its own HTTP surface. This is the container healthcheck; the runtime images are `FROM scratch` and have no shell, curl or wget. |
 | `probe [--require-ready] [--interval D --duration D] [--output FILE] URL...` | Reads `/readyz` from one or more targets, optionally sampling repeatedly into a JSON-lines file. Exits non-zero with `--require-ready` if any target is not ready. |
 
-## What the foundation actually does
-
-A job's path through the running stack today:
+## What a document's path actually is
 
 ```
-ledger.RegisterJob        durable job identity assigned (uuid), state pending_dispatch
-        │                 (discovery is unimplemented, so nothing calls this in production;
-        │                  the integration suite calls the same code the discovery worker will)
+incoming/                 a producer writes a temporary name and renames it into place
+        │
+        ▼
+watcher / discovery       selection patterns decide eligibility (never transform a name)
+        │                 completion contract: stability heuristic, or rename
+        │                 fingerprint + source identity (root+name+inode+device)
+        ▼
+ledger.RegisterJob        durable job identity (uuid), stamped with the POLICY IDENTITY
+        │                 it is accepted under; state pending_dispatch
         ▼
 watcher / dispatch        claim (FOR UPDATE SKIP LOCKED) → publish persistent message
         │                 → wait for publisher confirm → record dispatched
@@ -43,18 +57,38 @@ RabbitMQ                  durable direct exchange → quorum queue → DLX for r
         │                 payload is an opaque job reference only: no bytes, names, paths or hashes
         ▼
 renamer / consumer        manual ack, prefetch = concurrency
-        │                 record delivery ownership durably
-        │                 ── normalization would run here ──
+        │                 refuse a job whose policy identity is not this process's
         ▼
-ledger.RecordHold         state held, category normalization_unimplemented
+naming.Normalize          candidate policy; refuses rather than guesses a file type
+        │
+        ▼
+staging/<job>.work        verified working copy, checked against the recorded fingerprint;
+        │                 the source is re-inspected afterwards
+        ▼
+ReserveName               INSERT on a primary key: concurrent workers, one winner
+        │
+        ▼
+RecordPublishIntent       committed BEFORE the link, so a crash is recoverable as
+        │                 "may have published" rather than indistinguishable from
+        │                 "never started"
+        ▼
+link(2) into consume/     fails if the name exists; never overwrites; the staged target
+        │                 lives in the destination directory so the atomic step never
+        │                 crosses a filesystem boundary
+        ▼
+RecordDelivered           receipt + state delivered, in one transaction,
         │                 committed BEFORE the acknowledgement
         ▼
 basic.ack
 ```
 
-Nothing writes to the consume directory, and no code path can produce a
-`delivered` or `uncertain` job state. The integration suite asserts both, so
-the scaffold cannot quietly start claiming outcomes it does not produce.
+Every branch that cannot reach a receipt ends in a durable, visible outcome
+instead: `held` with a closed-set category, or `uncertain` when a publication
+may have happened and cannot be confirmed. `uncertain` is never redelivered —
+the consumer may already have the document.
+
+In a **dry run** everything from `staging/` onwards is skipped: the name is
+computed and recorded, and nothing else is touched.
 
 ## Layout
 
@@ -170,7 +204,13 @@ silently creating one would mask an incorrect mount.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FN_WATCHER_DISCOVERY_ENABLED` | `false` | **Setting this to true is a startup error.** Discovery is unimplemented. |
+| `FN_DISCOVERY_ENABLED` | `false` | Enables the discovery worker. Off unless a deployment declares it: a watcher that starts scanning a root nobody configured is a surprise, not a default. |
+| `FN_DISCOVERY_INTERVAL` | `10s` | Scan interval. |
+| `FN_DISCOVERY_STABILITY_INTERVAL` | `30s` | How long size and modification time must hold still. A heuristic, not proof. |
+| `FN_DISCOVERY_BATCH` | `100` | Registrations per scan. |
+| `FN_WATCHER_RECONCILE_ON_START` | `true` | Scan immediately at startup, so work that arrived during an outage is not delayed by a whole interval. |
+| `FN_CONFIG_FILE` | *(unset)* | The declarative configuration file. Selection patterns, transform rules and the completion contract live only there. |
+| `FN_GRPC_ADDR` | `:9090` | The inspection API's listen address. Empty disables it. Not published to the host, and unauthenticated. |
 | `FN_WATCHER_DISPATCH_INTERVAL` | `1s` | |
 | `FN_WATCHER_DISPATCH_BATCH` | `32` | |
 | `FN_WATCHER_DISPATCH_CLAIM_MAX_AGE` | `60s` | After this, a stranded dispatch claim is returned to `pending_dispatch`. |
@@ -182,6 +222,8 @@ silently creating one would mask an incorrect mount.
 |---|---|---|
 | `FN_RENAMER_CONCURRENCY` | `1` | Bounded simultaneous in-flight deliveries per instance (1–64). |
 | `FN_RENAMER_PREFETCH` | = concurrency | Must be at least the concurrency bound. |
+| `FN_RENAMER_MAX_DELIVERY_ATTEMPTS` | `5` | Bounds redelivery. Counted from the ledger's own durable counter, not from the broker message, which does not advance on a requeue. |
+| `FN_RENAMER_DRY_RUN` | `false` | Compute and record names; touch nothing. |
 
 ### Refused on purpose
 

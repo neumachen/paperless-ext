@@ -45,19 +45,42 @@ make up
 make status
 make ready
 
+# ---- configuration ----
+make check-config         # validate and print the effective, credential-free
+                          # configuration; exits non-zero if it is invalid
+
+# ---- submit a document ----
+# Write to a temporary name and rename it into place, which is the strict
+# completion contract. Everything runs in containers; nothing is copied to the
+# host.
+make submit FILE=/path/on/your/machine/Statement.pdf
+make submit NAME="Bank Statement - August (Final) 2026.PDF" TEXT="synthetic body"
+
+# ---- inspect (gRPC, from a container on the project network) ----
+make api ARGS="status"
+make api ARGS="state"
+make api ARGS="config"
+make api ARGS='preview "Bank Statement - August (Final) 2026.PDF"'
+make api ARGS="validate /etc/fn/normalizer.json"
+make api ARGS="inspect <job-id>"
+make api ARGS="inspect -restricted <job-id>"   # discloses document identities
+
 # ---- test ----
-make test                 # every phase, F1-F6
+make test                 # every phase, F1-F6 and A1-A11
 make test-baseline        # steady-state phase only
+make test-normalization   # the end-to-end document phase only
 make test-failover        # manual standby promotion, then rebuild the standby
 make test-project-isolation    # prove the guarded removal targets only its own
                                # project's volume
-make test-failure-propagation  # prove make verify and run-logged.sh propagate
+make test-cleanup-ownership    # prove that check cannot delete pre-existing data
+make test-harness-ownership    # and that its own harness cannot either
+make test-failure-propagation  # prove make verify and make build propagate
                                # a containerized failure
 
-# `make test` does NOT include the three exercises above. The first two are
-# destructive to a standby's data volume, and the third deliberately breaks the
-# tree for one step, so all three are run explicitly and their evidence is
-# retained alongside the suite's.
+# `make test` does NOT include the five exercises above. Two are destructive to
+# a standby's data volume, one deliberately breaks the tree for a step, and two
+# create and destroy throwaway Compose projects, so all five are run explicitly
+# and their evidence is retained alongside the suite's.
 
 # ---- observe (all from inside the project network) ----
 make logs                 # follow application logs

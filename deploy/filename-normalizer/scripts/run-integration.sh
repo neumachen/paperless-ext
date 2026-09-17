@@ -56,7 +56,9 @@ compose stop watcher >/dev/null 2>&1 || true
 
 _offline=""
 for i in 1 2 3; do
-    _name="offline-${FN_TEST_RUN_ID}-${i}.pdf"
+    # Lowercase, because the naming policy lowercases the stem and the test
+    # matches the published name.
+    _name="offline-$(printf '%s' "$RUN_ID" | tr 'A-Z' 'a-z')-${i}.pdf"
     compose run --rm --no-deps --entrypoint sh storage-init -c \
         "printf '%%PDF-1.4 arrived while the watcher was down\n' > '/srv/fn/incoming/.wip-${i}' && \
          mv '/srv/fn/incoming/.wip-${i}' '/srv/fn/incoming/${_name}'" >/dev/null 2>&1 || true
