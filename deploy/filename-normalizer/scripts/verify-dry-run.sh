@@ -44,15 +44,59 @@ count_consume() {
         -c 'ls -1 /srv/fn/consume 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r\n'
 }
 
+# This exercise stops shared services and starts a fault service, exactly like
+# the others, and it was the only one that did so without a lock, without
+# checking whether the service it starts already belonged to somebody else, and
+# without ever looking at whether its own restoration worked.
+CREATED=""
+RESTORED=0
 restore() {
+    if [ "$RESTORED" = "1" ]; then return 0; fi
+    RESTORED=1
     log "restarting the ordinary renamers"
-    compose stop renamer-dry-run >/dev/null 2>&1 || true
-    compose rm -f renamer-dry-run >/dev/null 2>&1 || true
+    _r_ok=1
+
+    for _r in $CREATED; do
+        compose --profile fault stop "$_r" >/dev/null 2>&1 || true
+        compose --profile fault rm -f "$_r" >/dev/null 2>&1 || true
+        if [ -n "$(compose --profile fault ps -aq "$_r" 2>/dev/null)" ]; then
+            echo "error: '$_r' could not be removed." >&2
+            _r_ok=0
+        fi
+    done
+
     compose start renamer-1 renamer-2 >/dev/null 2>&1 || true
     wait_healthy renamer-1 120 || true
     wait_healthy renamer-2 120 || true
+
+    # Readiness, not liveness: a renamer that is running but cannot reach its
+    # dependencies is not a restored stack, and `compose start` returning 0
+    # says nothing about either.
+    _r_ready="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck >/dev/null 2>&1 && echo yes || echo no)"
+    _r_ready2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck >/dev/null 2>&1 && echo yes || echo no)"
+    if [ "$_r_ready" != "yes" ] || [ "$_r_ready2" != "yes" ]; then _r_ok=0; fi
+    {
+        printf '\nrestoration (read back from the running stack):\n'
+        printf '  renamer-1 healthcheck:   %s\n' "$_r_ready"
+        printf '  renamer-2 healthcheck:   %s\n' "$_r_ready2"
+        printf '  dry-run service left:    %s\n' "$(compose --profile fault ps -aq renamer-dry-run 2>/dev/null | wc -l | tr -d ' ')"
+    } >> "$OUT"
+
+    exercise_unlock
+
+    if [ "$_r_ok" != "1" ]; then
+        echo >&2
+        echo "FAILED: the stack was NOT restored. See $OUT." >&2
+        printf '\nRESTORATION FAILED — see the values above.\n' >> "$OUT"
+        exit 1
+    fi
+    note "restored: ordinary renamers answering their own healthcheck"
 }
-trap restore EXIT INT TERM
+
+exercise_lock dry-run || exit 1
+trap 'restore' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 : > "$OUT"
 emit "A9 — dry run preserves sources and the operational ledger"
@@ -64,6 +108,15 @@ compose stop renamer-1 renamer-2 >/dev/null 2>&1
 emit "ordinary renamers stopped"
 
 log "2/6: starting a renamer with dry_run enabled"
+# Refused rather than adopted: this exercise removes the service afterwards, so
+# taking over one it did not create means destroying something another run or
+# an operator is using.
+if [ -n "$(compose --profile fault ps -aq renamer-dry-run 2>/dev/null)" ]; then
+    echo "error: 'renamer-dry-run' already exists; this invocation did not create it" >&2
+    echo "       and will not remove it. Refusing before anything is changed." >&2
+    exit 1
+fi
+CREATED="renamer-dry-run"
 compose --profile fault up -d --wait --wait-timeout 180 renamer-dry-run >/dev/null 2>&1 || {
     echo "the dry-run renamer did not become healthy" >&2
     exit 1
@@ -199,8 +252,14 @@ emit "  history rows beyond registration/dispatch: $JOB_EVENTS   (must be 0)"
 
 # ---------------------------------------------------------------------------
 log "6/6: the previewed work must still be processable afterwards"
-compose stop renamer-dry-run >/dev/null 2>&1
-compose rm -f renamer-dry-run >/dev/null 2>&1
+# Removed here because the scenario needs the ordinary renamers back, and
+# tracked so the restore trap does not try to remove it a second time or
+# report it as left behind.
+compose --profile fault stop renamer-dry-run >/dev/null 2>&1
+compose --profile fault rm -f renamer-dry-run >/dev/null 2>&1
+if [ -z "$(compose --profile fault ps -aq renamer-dry-run 2>/dev/null)" ]; then
+    CREATED=""
+fi
 compose start renamer-1 renamer-2 >/dev/null 2>&1
 wait_healthy renamer-1 120 || true
 _i=0

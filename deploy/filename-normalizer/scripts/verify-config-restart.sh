@@ -81,8 +81,22 @@ await_state() {
 # override by restarting it -- the stack would be left pointing at the
 # exercise's configuration, and the script would report success. Recreation is
 # what makes the current environment take effect, in both directions.
+# cleanup_exercise_file removes the configuration file THIS invocation wrote.
+#
+# Gated on having written it. The preflight refuses when a file with this
+# invocation's name already exists -- it belongs to somebody else -- and the
+# cleanup then deleted it anyway, which contradicted the refusal it had just
+# printed.
+CREATED_EX=0
+cleanup_exercise_file() {
+    if [ "$CREATED_EX" = "1" ] && [ -f "$EX_HOST" ]; then
+        rm -f "$EX_HOST"
+    fi
+}
+
 apply_env() {
     _ae_cfg="$1"; _ae_consume="$2"
+    MUTATED=1
     FN_CONFIG_FILE="$_ae_cfg" FN_STORAGE_CONSUME="$_ae_consume" \
         compose up -d --force-recreate --wait --wait-timeout 180 \
         watcher renamer-1 renamer-2 >/dev/null 2>&1 || true
@@ -100,9 +114,22 @@ apply_env() {
 # a process that read it before the change. A restoration that did not take
 # effect fails this target rather than being mentioned.
 RESTORED=0
+# Set immediately before the first change to the running stack. Until then,
+# there is nothing to restore -- and restoring anyway is not harmless: the
+# preflight refuses when the stack is already running a configuration that is
+# not the default, and "restoring" then force-recreated all three services onto
+# the hardcoded default, overwriting exactly the state the refusal existed to
+# protect, while reporting success.
+MUTATED=0
 restore() {
     if [ "$RESTORED" = "1" ]; then return 0; fi
     RESTORED=1
+    if [ "$MUTATED" = "0" ]; then
+        log "nothing was changed; leaving the stack alone"
+        cleanup_exercise_file
+        exercise_unlock
+        return 0
+    fi
     log "restoring the original configuration and verifying the running state"
 
     apply_env "$DEFAULT_CONFIG" "$DEFAULT_CONSUME"
@@ -117,9 +144,7 @@ restore() {
     if [ "$_r_consume" != "$DEFAULT_CONSUME" ]; then _r_ok=0; fi
     if [ -n "$BASELINE_ID" ] && [ "$_r_id" != "$BASELINE_ID" ]; then _r_ok=0; fi
 
-    # Remove only the file this invocation created. Nothing else in this
-    # directory belongs to this run, and nothing else is removed.
-    if [ -f "$EX_HOST" ]; then rm -f "$EX_HOST"; fi
+    cleanup_exercise_file
 
     {
         printf '\nrestoration (read back from the running processes, not from disk):\n'
@@ -217,6 +242,10 @@ d.setdefault("normalization", {}).setdefault("rules", []).append({
 })
 json.dump(d, open(dst, "w"), indent=2)
 ' /cfg/normalizer.json "/cfg/$EX_NAME" || { echo "could not write the exercise configuration" >&2; exit 1; }
+# Written by this invocation, so this invocation may remove it. Until this
+# point the cleanup must leave the path alone: a file already there belongs to
+# somebody else, which is what the preflight refusal is about.
+CREATED_EX=1
 emit "   exercise configuration:       $EX_IN_CONTAINER (new file; the live one is untouched)"
 
 apply_env "$EX_IN_CONTAINER" "$DEFAULT_CONSUME"

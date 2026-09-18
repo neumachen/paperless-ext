@@ -34,6 +34,9 @@ FAILURES=0
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOWER="$(printf '%s' "$STAMP" | tr 'A-Z' 'a-z')"
 CREATED=""
+# Empty until start_consumer establishes which volumes it created. `set -u` is
+# on, and restore runs on every exit path including a refusal before that.
+CREATED_VOLUMES=""
 
 emit() { printf '%s\n' "$*" >> "$OUT"; printf '%s\n' "$*"; }
 bad() { printf '    MISMATCH: %s\n' "$*" >&2; emit "    MISMATCH: $*"; FAILURES=$((FAILURES + 1)); }
@@ -89,6 +92,17 @@ start_consumer() {
         if [ -n "$(compose --profile consumer ps -aq "$_sc" 2>/dev/null)" ]; then
             echo "error: '$_sc' already exists; this invocation did not create it and will not remove it." >&2
             return 1
+        fi
+    done
+    # Only volumes that did not exist before this invocation may be removed
+    # afterwards. The cleanup used to delete three fixed names unconditionally,
+    # so a pre-existing Paperless instance -- the very thing the refusal above
+    # protects -- lost its database and media the moment this exercise ran, and
+    # so did a run that refused to start at all.
+    CREATED_VOLUMES=""
+    for _v in paperless-data paperless-media paperless-redis; do
+        if [ -z "$(docker volume ls -q --filter "name=^${PROJECT}_${_v}$" 2>/dev/null)" ]; then
+            CREATED_VOLUMES="$CREATED_VOLUMES $_v"
         fi
     done
     CREATED="paperless paperless-redis"
@@ -157,12 +171,22 @@ restore() {
         compose --profile consumer stop "$_r" >/dev/null 2>&1 || true
         compose --profile consumer rm -f -v "$_r" >/dev/null 2>&1 || true
     done
-    # The consumer's own state volumes go too. They were created by this
-    # exercise and hold nothing anybody else wants; leaving them behind would
-    # make a later run start against a half-ingested library.
-    for _v in paperless-data paperless-media paperless-redis; do
+    # The consumer's own state volumes go too -- but only the ones this
+    # invocation created. Leaving its own behind would make a later run start
+    # against a half-ingested library; removing somebody else's would destroy a
+    # Paperless instance this exercise explicitly refused to touch.
+    for _v in $CREATED_VOLUMES; do
         docker volume rm "${PROJECT}_$_v" >/dev/null 2>&1 || true
+        if [ -n "$(docker volume ls -q --filter "name=^${PROJECT}_${_v}$" 2>/dev/null)" ]; then
+            echo "error: volume ${PROJECT}_${_v} could not be removed." >&2
+            _r_ok=0
+        fi
     done
+    if [ -n "$(printf '%s' "$CREATED_VOLUMES" | tr -d ' ')" ]; then
+        printf '  volumes created and removed by this run:%s\n' "$CREATED_VOLUMES" >> "$OUT"
+    else
+        printf '  volumes: none created by this run; none removed\n' >> "$OUT"
+    fi
     _r_left="$(compose --profile consumer ps -aq paperless paperless-redis renamer-consume-hold 2>/dev/null | wc -l | tr -d ' ')"
     if [ "${_r_left:-0}" != "0" ]; then _r_ok=0; fi
 
@@ -195,6 +219,9 @@ trap 'exit 143' TERM
 emit "A real consumer takes the published document, and the handoff survives it"
 emit ""
 
+# The moment before the consumer exists, so deliveries made by other work
+# while it runs can be told from what was already there.
+T0="$(psqlq "SELECT now();")"
 BEFORE_CONSUME="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | wc -l")"
 log "1/4: starting an isolated Paperless instance against the real consume directory"
 start_consumer || exit 1
@@ -402,6 +429,26 @@ emit ""
 LEFT_ALONE="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -vc '^consumer-' || true")"
 emit "documents from earlier runs still in the directory: ${LEFT_ALONE:-unknown} of ${IGNORED_COUNT:-unknown}"
 [ "${LEFT_ALONE:-0}" = "${IGNORED_COUNT:-0}" ] || bad "the consumer took ${IGNORED_COUNT} - ${LEFT_ALONE} documents this exercise did not create"
+
+# The ignore list is a snapshot taken before the consumer started, so it cannot
+# protect a document some OTHER work delivers while this exercise is running:
+# that document is not in the list, and the consumer is entitled to ingest it
+# into a media store this exercise destroys on the way out. Nothing here can
+# stop that from a snapshot, so it is detected and reported rather than assumed
+# not to happen.
+ARRIVED="$(psqlq "SELECT count(*) FROM delivery_receipts r JOIN jobs j USING (job_id)
+                   WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';")"
+ARRIVED_GONE=0
+if [ "${ARRIVED:-0}" -gt 0 ]; then
+    for _n in $(psqlq "SELECT r.delivered_name FROM delivery_receipts r JOIN jobs j USING (job_id)
+                        WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';"); do
+        if [ "$(in_storage "test -e '/srv/fn/consume/$_n' && echo yes || echo no")" = "no" ]; then
+            ARRIVED_GONE=$((ARRIVED_GONE + 1))
+        fi
+    done
+fi
+emit "documents other work delivered while this ran:     ${ARRIVED:-0}, of which ${ARRIVED_GONE} were consumed"
+[ "${ARRIVED_GONE:-0}" = "0" ] || bad "$ARRIVED_GONE document(s) belonging to other work were ingested by this exercise's consumer"
 emit ""
 
 emit "The handoff is a filesystem handoff and it ends at the link. A real"
