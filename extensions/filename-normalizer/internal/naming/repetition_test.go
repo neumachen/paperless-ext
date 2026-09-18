@@ -3,6 +3,8 @@ package naming
 import (
 	"strings"
 	"testing"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ruled builds the default policy with one extra rule, or fails the test.
@@ -61,5 +63,44 @@ func TestPreservingRulesAreStillAccepted(t *testing.T) {
 		if !strings.Contains(res.Name, r) {
 			t.Errorf("%q is missing from %q", r, res.Name)
 		}
+	}
+}
+
+// A decomposed input defeats a guard that counts LETTERS.
+//
+// "für" is f, u, COMBINING DIAERESIS, r. The combining mark is Mn, not a
+// letter, so a rule anchored on that exact stem and replacing it with "fur"
+// removed the diaeresis while the count of non-ASCII letters was zero on both
+// sides. The document's name silently lost a character the contract preserves.
+func TestADecomposedLetterCannotBeTransliteratedAway(t *testing.T) {
+	p := ruled(t, "decomposed_fuer", "^für$", "fur")
+
+	if _, err := p.Normalize("für.pdf", testJobID); err == nil {
+		t.Fatal("a rule that removed a combining diaeresis survived the guard")
+	} else if HoldCategory(err) != "policy_transliterates" {
+		t.Fatalf("category = %q, want policy_transliterates", HoldCategory(err))
+	}
+}
+
+// The composed and decomposed spellings of the same name are protected alike.
+func TestTheComposedSpellingIsProtectedToo(t *testing.T) {
+	p := ruled(t, "composed_fuer", "^für$", "fur")
+
+	if _, err := p.Normalize("für.pdf", testJobID); err == nil {
+		t.Fatal("a rule that transliterated a composed ü survived the guard")
+	}
+}
+
+// A rule that only rearranges a decomposed name is still accepted: the guard
+// must not become a ban on rules that touch non-ASCII text at all.
+func TestADecomposedNameSurvivesAPreservingRule(t *testing.T) {
+	p := ruled(t, "prefix_it", "^(für.*)$", "rechnung-$1")
+
+	res, err := p.Normalize("für maerz.pdf", testJobID)
+	if err != nil {
+		t.Fatalf("a preserving rule was refused: %v", err)
+	}
+	if !strings.Contains(norm.NFC.String(res.Name), "ü") {
+		t.Fatalf("the letter did not survive: %q", res.Name)
 	}
 }

@@ -347,7 +347,9 @@ func (s *Server) ValidateConfig(_ context.Context, req *pb.ValidateConfigRequest
 
 const previewDisclaimer = "A preview is not a destination reservation. It shows what the policy would " +
 	"produce for these names right now; the actual destination is allocated only when a real " +
-	"submission is published, and a name shown here may be taken by then."
+	"submission is published, and a name shown here may be taken by then. This is a POLICY " +
+	"answer only: it reads no reservations and inspects no directory, so it cannot say which " +
+	"collision suffix a real submission would receive."
 
 // PreviewName applies the policy to caller-supplied names.
 //

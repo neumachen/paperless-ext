@@ -221,3 +221,31 @@ func TestAllowListCoversTheKeysTheApplicationsUse(t *testing.T) {
 		}
 	}
 }
+
+// The dry run's per-category counts must reach the operator.
+//
+// Its entire output is counts by closed-set category, and every key is built as
+// would_hold_<category>. The allow-list matches exact strings, so all of them
+// were redacted: the report an operator reads to decide whether a
+// configuration change is safe printed a marker where each number should have
+// been. The value is an integer and the suffix is a closed-set identifier, so
+// admitting the shape admits nothing document-derived.
+func TestCategoryCountsAreSafeAndDocumentNamesAreNot(t *testing.T) {
+	for _, k := range []string{
+		"would_hold_policy_transliterates",
+		"would_hold_destination_mismatch",
+		"would_hold_name_too_long",
+	} {
+		if !IsSafeKey(k) {
+			t.Errorf("%q is redacted; dry-run counts cannot be read", k)
+		}
+	}
+	for _, k := range []string{
+		"would_hold_", "would_hold_../etc", "would_hold_Bank Statement.pdf",
+		"delivered_as", "source_name", "destination_path", "password",
+	} {
+		if IsSafeKey(k) {
+			t.Errorf("%q is accepted into ordinary output and must not be", k)
+		}
+	}
+}

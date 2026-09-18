@@ -130,6 +130,26 @@ func (l *Ledger) ActiveReservation(ctx context.Context, jobID, root string) (Res
 	return r, nil
 }
 
+// ReservationOwner reports which job holds a destination name, if any, and
+// whether that holder has already found it occupied.
+//
+// It is a read for callers that must reason about the name a job WOULD get
+// without taking it -- the dry run, which may not reserve anything.
+func (l *Ledger) ReservationOwner(ctx context.Context, root, key string) (jobID string, blocked bool, err error) {
+	var owner string
+	var blockedAt *time.Time
+	row := l.primary.QueryRow(ctx, `
+		SELECT job_id, blocked_at FROM name_reservations
+		 WHERE destination_root = $1 AND reservation_key = $2`, root, key)
+	switch err := row.Scan(&owner, &blockedAt); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return "", false, nil
+	case err != nil:
+		return "", false, fmt.Errorf("read reservation owner: %w", err)
+	}
+	return owner, blockedAt != nil, nil
+}
+
 // RecordNormalized stores the computed name and moves the job to processing.
 func (l *Ledger) RecordNormalized(ctx context.Context, jobID, normalized string, attempt int) error {
 	return l.tx(ctx, func(tx pgx.Tx) error {
