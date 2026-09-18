@@ -208,6 +208,11 @@ test-consumer: ## Run a real isolated Paperless instance against the consume dir
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-consumer.sh
 
+.PHONY: test-reconcile-resume
+test-reconcile-resume: ## Prove a reconciled receipt does not make the published document a duplicate
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-reconcile-resume.sh
+
 .PHONY: test-refusal-safety
 test-refusal-safety: ## Prove a refusal changes nothing and cleanup respects ownership
 	@mkdir -p $(EVIDENCE)

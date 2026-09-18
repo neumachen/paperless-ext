@@ -1249,6 +1249,21 @@ emit ""
 # one. Concurrency 2, prefetch 2, and two deliveries of a single job.
 # ---------------------------------------------------------------------------
 log "10/12: same-instance overlap -- two handlers of one process on one job"
+
+# Put the watcher back on the ordinary destination first.
+#
+# Scenario 9 recreates it pointing at the tmpfs root and leaves the restore trap
+# to undo that at the very end of the run. Everything submitted in between is
+# therefore ACCEPTED FOR a destination the ordinary renamers are not configured
+# for, and is held as destination_mismatch before any publication is attempted
+# -- which is what happened on the first run of these three scenarios: no claim,
+# no link, and three scenarios reporting failures that were really this.
+compose up -d --force-recreate --wait --wait-timeout 180 watcher >/dev/null 2>&1 || true
+wait_healthy watcher 180 || true
+WATCHER_DEST10="$(watcher_effective_value "d['storage']['consume']")"
+emit "watcher destination root before these scenarios: $WATCHER_DEST10   (expected /srv/fn/consume)"
+[ "$WATCHER_DEST10" = "/srv/fn/consume" ] || bad "the watcher is still accepting work for '$WATCHER_DEST10'; scenarios 10-12 would be held as destination_mismatch"
+
 stop_ordinary
 DOC10="a7-same-instance-$STAMP.pdf"
 NAME10="a7-same-instance-$LOWER.pdf"
