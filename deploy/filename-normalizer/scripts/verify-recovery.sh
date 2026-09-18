@@ -345,7 +345,7 @@ emit ""
 # ---------------------------------------------------------------------------
 # 1. A6: a real interruption between the link and the receipt.
 # ---------------------------------------------------------------------------
-log "1/9: A6 — interrupting a renamer between the destination link and the receipt"
+log "1/12: A6 — interrupting a renamer between the destination link and the receipt"
 stop_ordinary
 DOC1="a6-after-link-$STAMP.pdf"
 NAME1="a6-after-link-$LOWER.pdf"
@@ -400,7 +400,7 @@ emit ""
 # 2. A6: interrupted BEFORE the link -- the destination never appears -- and
 #    the uncertain outcome must survive a LATER DELIVERY, not merely a reread.
 # ---------------------------------------------------------------------------
-log "2/9: A6 — interrupting before the link, so the destination never appears"
+log "2/12: A6 — interrupting before the link, so the destination never appears"
 stop_ordinary
 DOC2="a6-before-link-$STAMP.pdf"
 NAME2="a6-before-link-$LOWER.pdf"
@@ -549,7 +549,7 @@ emit ""
 # Both attempts are then observed by name, with timestamps, and the durable
 # result must contain exactly one publication.
 # ---------------------------------------------------------------------------
-log "3/9: A7 — two live attempts on one job at the publication boundary"
+log "3/12: A7 — two live attempts on one job at the publication boundary"
 stop_ordinary
 DOC3="a7-overlap-$STAMP.pdf"
 NAME3="a7-overlap-$LOWER.pdf"
@@ -717,7 +717,7 @@ emit ""
 # must produce two documents and two receipts. Anything that deduplicated them
 # would be discarding a document nobody asked it to discard.
 # ---------------------------------------------------------------------------
-log "4/9: two distinct submissions with identical bytes stay distinct"
+log "4/12: two distinct submissions with identical bytes stay distinct"
 compose start renamer-1 renamer-2 >/dev/null 2>&1 || true
 wait_healthy renamer-1 120 || true
 DOC4A="twin-a-$STAMP.pdf"
@@ -755,7 +755,7 @@ emit ""
 # content, recovery must refuse it: adopting it would both take a file this
 # job never wrote and merge two submissions the contract keeps distinct.
 # ---------------------------------------------------------------------------
-log "5/9: recovery refuses a foreign file at the reserved name, even byte-identical"
+log "5/12: recovery refuses a foreign file at the reserved name, even byte-identical"
 stop_ordinary
 DOC5="a6-foreign-$STAMP.pdf"
 NAME5="a6-foreign-$LOWER.pdf"
@@ -841,7 +841,7 @@ emit ""
 # the two claims are easy to confuse: an incoming/consume split alone would
 # not exercise the fallback at all.
 # ---------------------------------------------------------------------------
-log "6/9: A10 — staging on a tmpfs, so the copy fallback is actually taken"
+log "6/12: A10 — staging on a tmpfs, so the copy fallback is actually taken"
 stop_ordinary
 DOC6="a10-altfs-$STAMP.pdf"
 NAME6="a10-altfs-$LOWER.pdf"
@@ -903,7 +903,7 @@ emit ""
 # ---------------------------------------------------------------------------
 # 7. A11: the working copy runs out of space mid-write, accounted in full.
 # ---------------------------------------------------------------------------
-log "7/9: A11 — a real ENOSPC while writing the working copy"
+log "7/12: A11 — a real ENOSPC while writing the working copy"
 stop_ordinary
 DOC7="a11-nospace-$STAMP.pdf"
 start_fault renamer-tinyfs || exit 1
@@ -1029,7 +1029,7 @@ emit ""
 # INCLUDING an interruption, because a consume root left root-owned and
 # unwritable would stop the whole stack.
 # ---------------------------------------------------------------------------
-log "8/9: a real permission denial at the publication"
+log "8/12: a real permission denial at the publication"
 stop_ordinary
 DOC8="perm-denied-$STAMP.pdf"
 NAME8="perm-denied-$LOWER.pdf"
@@ -1190,7 +1190,7 @@ emit ""
 # into a tmpfs-backed destination and compares the bytes that arrive with the
 # bytes that were submitted.
 # ---------------------------------------------------------------------------
-log "9/9: A10 — incoming and consume on different filesystems, bytes compared"
+log "9/12: A10 — incoming and consume on different filesystems, bytes compared"
 stop_ordinary
 TMPFS_DEST="/srv/fn/consume-tmpfs"
 DOC9="a10-crossfs-$STAMP.pdf"
