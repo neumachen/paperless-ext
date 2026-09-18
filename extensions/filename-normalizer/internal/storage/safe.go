@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -97,6 +98,51 @@ func (r RootID) Verify() error {
 	if now.Device != r.Device || now.Inode != r.Inode {
 		return fmt.Errorf("%w: %s was device %d inode %d and is now device %d inode %d",
 			ErrRootChanged, r.Role, r.Device, r.Inode, now.Device, now.Inode)
+	}
+	return nil
+}
+
+// expectedRoots records the identity each accepted root had when it was
+// validated, keyed by the configured path.
+//
+// It is package state on purpose: every read and write in this package goes
+// through Open, and the check belongs with the operation rather than with a
+// caller who might forget it.
+var expectedRoots sync.Map // string -> RootID
+
+// ExpectRoot records what a root's identity must be from now on. Called for
+// each root once it has been validated; later opens are checked against it.
+func ExpectRoot(id RootID) { expectedRoots.Store(id.Path, id) }
+
+// ForgetRoots drops every expectation. It exists for tests.
+func ForgetRoots() {
+	expectedRoots.Range(func(k, _ any) bool {
+		expectedRoots.Delete(k)
+		return true
+	})
+}
+
+// verifyRootDescriptor checks an opened root directory against its recorded
+// identity. A root with no expectation recorded is not checked: this package is
+// also used before configuration has been validated, and inventing an
+// expectation there would refuse legitimate work.
+func verifyRootDescriptor(root string, dir *os.File) error {
+	v, ok := expectedRoots.Load(root)
+	if !ok {
+		return nil
+	}
+	want := v.(RootID)
+	fi, err := dir.Stat()
+	if err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrRootChanged, want.Role, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	if uint64(st.Dev) != want.Device || uint64(st.Ino) != want.Inode {
+		return fmt.Errorf("%w: %s was device %d inode %d and the open reached device %d inode %d",
+			ErrRootChanged, want.Role, want.Device, want.Inode, uint64(st.Dev), uint64(st.Ino))
 	}
 	return nil
 }
@@ -275,6 +321,18 @@ func Open(root, name string, allowSubdirs bool) (*os.File, Entry, error) {
 		return nil, Entry{}, fmt.Errorf("open root: %w", err)
 	}
 	defer func() { _ = dir.Close() }()
+
+	// The root this open actually reached must be the root that was accepted.
+	//
+	// Verifying roots on their own, before the work, leaves a gap between the
+	// check and every use: a root repointed afterwards redirects the reads and
+	// writes that follow, and a periodic Verify call cannot close a window it
+	// is not inside. The identity is therefore checked HERE, against the
+	// descriptor this call is about to walk from, so a replaced root is caught
+	// by the operation it would have redirected.
+	if err := verifyRootDescriptor(root, dir); err != nil {
+		return nil, Entry{}, err
+	}
 
 	for i, part := range parts[:len(parts)-1] {
 		next, derr := openatDir(dir, part)

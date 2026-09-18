@@ -456,6 +456,34 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		return out, true
 	}
 
+	// Verify the bytes that are about to become visible, through a descriptor
+	// checked against that identity, immediately before the link.
+	//
+	// Everything earlier in this path verified a PATHNAME: the source was
+	// verified and then copied by name, the working copy was verified and then
+	// linked by name, and each of those names could have been pointed at
+	// something else afterwards. The previous design noticed a mismatch by
+	// hashing the destination AFTER publishing it, which is too late -- the
+	// consumer can already have taken it. Reading it here costs one pass over
+	// the file and makes "only complete, verified content becomes visible" a
+	// fact about the bytes rather than about the last name that referred to
+	// them.
+	stagedSum, stagedSize, verr := fingerprintPublished(root, filepath.Base(tmp), staged)
+	if verr != nil {
+		cat := jobs.Category(storage.RejectionCategory(verr))
+		log.Error("could not verify the staged document before publishing it",
+			slog.String("event", "staged_verification_failed"),
+			slog.String("category", string(cat)))
+		out, _ := p.holdOr(ctx, job, cat, attempt, verr)
+		return out, true
+	}
+	if job.Fingerprint != nil && !bytes.Equal(stagedSum, job.Fingerprint) {
+		log.Error("the staged document is not this job's content; not publishing it",
+			slog.String("event", "staged_content_mismatch"),
+			slog.String("category", string(jobs.CategorySourceMutated)))
+		return p.hold(ctx, job, jobs.CategorySourceMutated, attempt), true
+	}
+
 	// Claim the right to publish. Exclusive per ATTEMPT, not per process: the
 	// token below is what the ledger guards on, because every handler in one
 	// renamer shares the instance name and two of them holding "the exclusive
@@ -543,27 +571,16 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		// destination now is a separate question: a consumer may already have
 		// taken it. Reading the destination is therefore best-effort evidence,
 		// never the thing that decides whether we published.
-		size, fp := int64(0), job.Fingerprint
-		if job.SizeBytes != nil {
-			size = *job.SizeBytes
-		}
+		// The content was verified BEFORE the link, from the descriptor of the
+		// very inode that was linked, so the receipt records what was
+		// published without reading it again. The only question left is
+		// whether the document is still there, and the answer changes nothing
+		// about whether it was published.
+		size, fp := stagedSize, stagedSum
 		absent := false
-		// Read back through a descriptor whose identity is checked against the
-		// inode that was linked, not by reopening the pathname and trusting it
-		// still leads to the same file. Between the link and the read a
-		// consumer can take the document and anything at all can take the
-		// name; a plain reopen would hash a stranger's bytes and compare them
-		// to this job's fingerprint.
-		switch sum, n, ferr := fingerprintPublished(root, candidate, staged); {
-		case ferr == nil:
-			if job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint) {
-				log.Error("the published file is not this job's content",
-					slog.String("event", "published_content_mismatch"),
-					slog.String("category", string(jobs.CategoryDestinationConflict)))
-				return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt), true
-			}
-			fp, size = sum, n
-		case errors.Is(ferr, fs.ErrNotExist):
+		switch _, ierr := storage.Identify(final); {
+		case ierr == nil:
+		case errors.Is(ierr, fs.ErrNotExist):
 			// Gone between the link and the read. The old code ran this
 			// through the generic storage classifier and held the job as
 			// source_absent -- reporting a missing SOURCE for a document that
@@ -572,7 +589,7 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			absent = true
 			log.Info("the destination was removed immediately after publication; recording the delivery",
 				slog.String("event", "destination_consumed_immediately"))
-		case errors.Is(ferr, storage.ErrMutated):
+		case errors.Is(ierr, storage.ErrMutated):
 			// The name now leads to a different file: this job's document was
 			// taken and something else was put there, or it was replaced
 			// outright. The publication still happened -- the link returned
@@ -585,9 +602,13 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			log.Warn("the destination was replaced immediately after publication; the delivery stands",
 				slog.String("event", "destination_replaced_after_publication"))
 		default:
-			cat := jobs.Category(storage.RejectionCategory(ferr))
-			out, _ := p.holdOr(ctx, job, cat, attempt, ferr)
-			return out, true
+			// The document is published and the receipt is what records it.
+			// An unreadable destination is worth saying out loud, but it
+			// cannot unpublish anything, and holding the job here would lose a
+			// completed delivery from the accounting.
+			log.Warn("the published destination could not be examined afterwards",
+				slog.String("event", "destination_unexaminable"),
+				slog.String("error_kind", storage.RejectionCategory(ierr)))
 		}
 
 		receipt := ledger.Receipt{
