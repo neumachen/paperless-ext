@@ -67,6 +67,12 @@ cleanup() {
     # going: it holds the exercise lock, it is mid-way through creating fault
     # services and revoking permissions, and nothing is left watching it. It is
     # sent the same signal its own trap handles, so its restoration runs.
+    if [ -n "${PART_PID:-}" ] && kill -0 "$PART_PID" 2>/dev/null; then
+        echo "stopping the child exercise ($PART_PID) so it restores what it changed" >&2
+        kill -TERM "$PART_PID" 2>/dev/null || true
+        wait "$PART_PID" 2>/dev/null || true
+        PART_PID=""
+    fi
     if [ -n "${INT_PID:-}" ] && kill -0 "$INT_PID" 2>/dev/null; then
         echo "stopping the child exercise ($INT_PID) so it restores what it changed" >&2
         kill -TERM "$INT_PID" 2>/dev/null || true
@@ -105,7 +111,7 @@ BEFORE="$(snapshot)"
 # ---------------------------------------------------------------------------
 # 1. Every exercise refuses while another holds the lock, and mutates nothing.
 # ---------------------------------------------------------------------------
-log "1/3: each exercise must refuse while the lock is held, without touching anything"
+log "1/4: each exercise must refuse while the lock is held, without touching anything"
 # `mkdir`, not `mkdir -p`. With -p this succeeds against a lock another
 # exercise is holding, and the cleanup at the end of this script would then
 # remove somebody else's lock -- an ownership failure in the exercise whose
@@ -151,7 +157,7 @@ emit ""
 # 2. The consumer exercise refuses a pre-existing instance AND leaves its state
 #    alone. This is the one that used to destroy a database on the way past.
 # ---------------------------------------------------------------------------
-log "2/3: a pre-existing consumer volume must survive the refusal"
+log "2/4: a pre-existing consumer volume must survive the refusal"
 if [ -n "$(docker volume ls -q --filter "name=^${DECOY_VOL}$" 2>/dev/null)" ]; then
     emit "2. SKIPPED: $DECOY_VOL already exists and is not this exercise's to use"
 else
@@ -240,7 +246,7 @@ emit ""
 # the same restoration an operator's ^C would reach -- because an interactive
 # ^C goes to the foreground process GROUP, where SIGINT is not ignored.
 # ---------------------------------------------------------------------------
-log "3/3: an exercise stopped mid-run must restore what it changed"
+log "3/4: an exercise stopped mid-run must restore what it changed"
 INT_LOG="$EVIDENCE_DIR/refusal-interrupted-recovery.log"
 PERM_BEFORE_INT="$(in_storage "stat -c '%a:%u:%g' /srv/fn/consume")"
 VOLS_BEFORE_INT="$(docker volume ls -q --filter "name=^${PROJECT}_" 2>/dev/null | sort | tr '\n' ',')"
@@ -304,6 +310,71 @@ else
     [ "$PERM_AFTER_INT" = "$PERM_BEFORE_INT" ] || bad "destination permissions are $PERM_AFTER_INT, were $PERM_BEFORE_INT"
     [ "$VOLS_AFTER_INT" = "$VOLS_BEFORE_INT" ] || bad "the set of project volumes changed across the stopped run"
     [ "$LOCK_LEFT" = "no" ] || bad "the stopped exercise left the exercise lock held"
+fi
+emit ""
+
+# ---------------------------------------------------------------------------
+# 4. A run stopped in its PARTIAL-MUTATION window.
+#
+# Case 3 stops an exercise that has finished changing something. This one stops
+# one in the gap between its first change and the point at which it used to
+# admit having changed anything: verify-config-restart stopped both renamers
+# and only set its mutation flag when it later recreated them, so a stop in
+# between left two workers down and a restoration that declined to act. The
+# window is a second or two wide, so the exercise is stopped the moment the
+# renamers are observed stopped -- which is inside it by construction.
+# ---------------------------------------------------------------------------
+log "4/4: a run stopped between its first change and its restoration"
+PARTIAL_LOG="$EVIDENCE_DIR/refusal-partial-config-restart.log"
+sh "$SCRIPT_DIR/verify-config-restart.sh" > "$PARTIAL_LOG" 2>&1 &
+PART_PID=$!
+
+_i=0
+STOPPED_SEEN=no
+while [ "$_i" -lt 240 ]; do
+    _r1="$(docker inspect -f '{{.State.Status}}' "$(compose ps -aq renamer-1 2>/dev/null | head -1)" 2>/dev/null || echo unknown)"
+    if [ "$_r1" = "exited" ] || [ "$_r1" = "created" ]; then
+        STOPPED_SEEN=yes
+        break
+    fi
+    kill -0 "$PART_PID" 2>/dev/null || break
+    sleep 1
+    _i=$((_i + 1))
+done
+
+if [ "$STOPPED_SEEN" != "yes" ]; then
+    kill -TERM "$PART_PID" 2>/dev/null || true
+    wait "$PART_PID" 2>/dev/null || true
+    emit "4. SKIPPED: the partial-mutation window was not observed in this run"
+    emit "   (the renamers were never seen stopped; nothing was interrupted)"
+else
+    kill -TERM "$PART_PID" 2>/dev/null || true
+    PART_RC=0
+    wait "$PART_PID" 2>/dev/null || PART_RC=$?
+
+    P_RDY1="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    P_RDY2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    P_RDYW="$(compose exec -T watcher /usr/local/bin/fn-watcher healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    P_CFG="$(effective_value renamer-1 "d['config_file']")"
+    P_CONSUME="$(effective_value renamer-1 "d['storage']['consume']")"
+    P_LOCK="$([ -d "$EVIDENCE_DIR/.exercise.lock" ] && echo yes || echo no)"
+    P_EXFILES="$(ls "$DEPLOY_DIR/config"/.exercise-* 2>/dev/null | wc -l | tr -d ' ')"
+
+    emit "4. the configuration exercise, stopped after it stopped the renamers"
+    emit "   renamers were seen stopped:   $STOPPED_SEEN   (the window was entered)"
+    emit "   exit status:                  $PART_RC   (non-zero: it was stopped)"
+    emit "   renamer-1 / renamer-2 ready:  $P_RDY1 / $P_RDY2   (expected yes/yes: brought back)"
+    emit "   watcher ready:                $P_RDYW   (expected yes)"
+    emit "   configuration in use:         $P_CFG"
+    emit "   consume root in use:          $P_CONSUME"
+    emit "   exercise lock left held:      $P_LOCK   (expected no)"
+    emit "   exercise config files left:   $P_EXFILES   (expected 0)"
+    [ "${PART_RC:-0}" != "0" ] || bad "the interrupted configuration exercise exited 0"
+    [ "$P_RDY1" = "yes" ] || bad "renamer-1 was left stopped or unready by a run interrupted mid-change"
+    [ "$P_RDY2" = "yes" ] || bad "renamer-2 was left stopped or unready by a run interrupted mid-change"
+    [ "$P_RDYW" = "yes" ] || bad "the watcher was left unready by a run interrupted mid-change"
+    [ "$P_LOCK" = "no" ] || bad "the interrupted configuration exercise left the lock held"
+    [ "${P_EXFILES:-0}" = "0" ] || bad "$P_EXFILES exercise configuration file(s) were left behind"
 fi
 emit ""
 

@@ -156,7 +156,18 @@ func (p *Previewer) wouldPublishAs(ctx context.Context, job ledger.Job) (string,
 		return naming.HoldCategory(err), false
 	}
 	root := p.cfg.Storage.Consume
-	for n := 0; n <= p.cfg.Policy.MaxCollisionSuffix; n++ {
+	// Bounded, and the bound is part of the claim.
+	//
+	// Publication may walk to MaxCollisionSuffix, which is 9999: a dry run that
+	// did the same would issue ten thousand reservation lookups for one job to
+	// answer a question nobody asked. It walks a short way and says so when it
+	// stops, which is the difference between a cheap report and a confident
+	// wrong one.
+	limit := p.cfg.Policy.MaxCollisionSuffix
+	if limit > previewCollisionProbe {
+		limit = previewCollisionProbe
+	}
+	for n := 0; n <= limit; n++ {
 		candidate, cerr := p.cfg.Policy.Candidate(res, n)
 		if cerr != nil {
 			return string(jobs.CategoryNameTooLong), false
@@ -174,5 +185,15 @@ func (p *Previewer) wouldPublishAs(ctx context.Context, job ledger.Job) (string,
 			return "", true
 		}
 	}
-	return string(jobs.CategoryCollisionExhausted), false
+	// Not decided within the probe. Reported as its own category rather than
+	// counted publishable: "we did not look far enough" is not "it is fine".
+	return previewCollisionUndecided, false
 }
+
+// previewCollisionProbe bounds how many collision candidates a dry run tries
+// before reporting that it did not decide.
+const previewCollisionProbe = 32
+
+// previewCollisionUndecided is the category for a job whose destination name
+// could not be settled within that probe.
+const previewCollisionUndecided = "collision_undecided"
