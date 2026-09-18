@@ -69,16 +69,18 @@ restore() {
     wait_healthy renamer-1 120 || true
     wait_healthy renamer-2 120 || true
 
-    # Readiness, not liveness: a renamer that is running but cannot reach its
-    # dependencies is not a restored stack, and `compose start` returning 0
-    # says nothing about either.
-    _r_ready="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck >/dev/null 2>&1 && echo yes || echo no)"
-    _r_ready2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck >/dev/null 2>&1 && echo yes || echo no)"
+    # Readiness, not liveness -- and `healthcheck` on its own is LIVENESS. It
+    # reads /healthz, which answers 200 for a process that is running with
+    # every dependency unreachable, so the comment here described a check the
+    # command did not make. `--require-ready` reads /readyz, which is the
+    # statement restoration needs: the service is back AND usable.
+    _r_ready="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    _r_ready2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
     if [ "$_r_ready" != "yes" ] || [ "$_r_ready2" != "yes" ]; then _r_ok=0; fi
     {
         printf '\nrestoration (read back from the running stack):\n'
-        printf '  renamer-1 healthcheck:   %s\n' "$_r_ready"
-        printf '  renamer-2 healthcheck:   %s\n' "$_r_ready2"
+        printf '  renamer-1 ready:         %s\n' "$_r_ready"
+        printf '  renamer-2 ready:         %s\n' "$_r_ready2"
         printf '  dry-run service left:    %s\n' "$(compose --profile fault ps -aq renamer-dry-run 2>/dev/null | wc -l | tr -d ' ')"
     } >> "$OUT"
 
@@ -90,7 +92,7 @@ restore() {
         printf '\nRESTORATION FAILED — see the values above.\n' >> "$OUT"
         exit 1
     fi
-    note "restored: ordinary renamers answering their own healthcheck"
+    note "restored: ordinary renamers report themselves READY, not merely alive"
 }
 
 exercise_lock dry-run || exit 1

@@ -232,9 +232,14 @@ restore() {
 
     # Effective readiness, not just "the container is up": a renamer that is
     # running but cannot reach the broker is not a restored stack.
-    _r_ready="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck >/dev/null 2>&1 && echo yes || echo no)"
-    _r_ready2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck >/dev/null 2>&1 && echo yes || echo no)"
-    _r_readyw="$(compose exec -T watcher /usr/local/bin/fn-watcher healthcheck >/dev/null 2>&1 && echo yes || echo no)"
+    # READINESS. Plain `healthcheck` reads /healthz and answers 200 for a
+    # process whose database, broker and storage are all unreachable -- and
+    # this exercise cuts services off the network and revokes directory
+    # permissions, so "alive" is exactly the state a failed restoration leaves
+    # behind. /readyz is the statement being made here.
+    _r_ready="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    _r_ready2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    _r_readyw="$(compose exec -T watcher /usr/local/bin/fn-watcher healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
     if [ "$_r_ready" != "yes" ] || [ "$_r_ready2" != "yes" ] || [ "$_r_readyw" != "yes" ]; then _r_ok=0; fi
 
     # No fault service this run created may be left behind.
@@ -243,9 +248,9 @@ restore() {
 
     {
         printf '\nrestoration (read back from the running stack):\n'
-        printf '  renamer-1 healthcheck:   %s\n' "$_r_ready"
-        printf '  renamer-2 healthcheck:   %s\n' "$_r_ready2"
-        printf '  watcher   healthcheck:   %s\n' "$_r_readyw"
+        printf '  renamer-1 ready:         %s\n' "$_r_ready"
+        printf '  renamer-2 ready:         %s\n' "$_r_ready2"
+        printf '  watcher   ready:         %s\n' "$_r_readyw"
         printf '  fault services left:     %s\n' "${_r_left:-none}"
         printf '  containers reconnected:  yes\n'
     } >> "$OUT"
@@ -258,7 +263,7 @@ restore() {
         printf '\nRESTORATION FAILED — see the values above.\n' >> "$OUT"
         exit 1
     fi
-    note "restored: all application services on $NET and answering their own healthcheck"
+    note "restored: all application services on $NET and reporting themselves READY"
 }
 
 exercise_lock recovery || exit 1
