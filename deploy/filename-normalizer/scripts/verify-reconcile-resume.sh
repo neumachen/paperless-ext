@@ -122,7 +122,17 @@ MUTATED=1
 compose stop renamer-1 renamer-2 >/dev/null 2>&1
 
 # A pauses AFTER the link, with a claim that expires long before it wakes.
-start_fault renamer-hold FN_FAULT_POINTS=hold_after_link FN_FAULT_HOLD=75s FN_PUBLISH_TAKEOVER_AFTER=10s || exit 1
+# Prefetch 1, or the paused holder starves the sibling.
+#
+# A renamer prefetches two deliveries by default. The holder pauses after its
+# link while still holding BOTH -- including the duplicate this exercise
+# publishes for the sibling to pick up -- so the sibling never sees the job, no
+# reconciliation happens, and the holder eventually wakes up and records its own
+# receipt. That is correct behaviour and a useless observation: the sequence
+# under test never occurs. One message at a time is what makes the sibling the
+# one that finds it.
+start_fault renamer-hold FN_FAULT_POINTS=hold_after_link FN_FAULT_HOLD=75s \
+    FN_PUBLISH_TAKEOVER_AFTER=10s FN_RENAMER_PREFETCH=1 || exit 1
 sleep 6
 compose run --rm --no-deps -T --entrypoint sh storage-init -c \
     "printf '%%PDF-1.4 reconcile resume probe\n' > /srv/fn/incoming/.wip-rr && \
