@@ -211,7 +211,7 @@ restore() {
 # would restore over the winner's change mid-assertion.
 exercise_lock config-restart || exit 1
 BASELINE_ID=""
-trap 'report_keep; restore' EXIT
+trap 'restore; report_keep' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
