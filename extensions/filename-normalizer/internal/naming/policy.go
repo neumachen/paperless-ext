@@ -513,10 +513,23 @@ func checkPreservedRunes(before, after string) error {
 	// most of the text, which is a real restriction -- and the right way to be
 	// wrong here, because the alternative is silently altering somebody's
 	// document names.
+	// Composed first, and marks count as well as letters.
+	//
+	// Counting letters of the string as it arrives misses the decomposed form
+	// entirely. "fu\u0308r" is f, u, COMBINING DIAERESIS, r: the combining mark
+	// is Mn, not a letter, so a rule anchored on that exact stem and replacing
+	// it with "fur" removed the diaeresis while the count of non-ASCII LETTERS
+	// stayed zero on both sides and the guard saw nothing to complain about.
+	// The document's name lost a character the contract says is preserved.
+	//
+	// NFC composes "u" + diaeresis into "ü" so the comparison is about the
+	// letter a reader sees rather than about a particular encoding of it, and
+	// marks are counted too, so a combining character that composes with
+	// nothing is still protected.
 	counts := func(s string) map[rune]int {
 		out := map[rune]int{}
-		for _, r := range s {
-			if r < 0x80 || !unicode.IsLetter(r) {
+		for _, r := range norm.NFC.String(s) {
+			if r < 0x80 || !(unicode.IsLetter(r) || unicode.IsMark(r)) {
 				continue
 			}
 			out[r]++

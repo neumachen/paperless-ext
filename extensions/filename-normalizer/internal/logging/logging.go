@@ -44,6 +44,15 @@ func init() {
 		"collision_sequence", "used_fallback", "shortened", "recursive",
 		"completion_contract", "interval_seconds", "stability_seconds",
 		"max_sequence", "job_policy", "process_policy",
+		// Aggregate booleans and closed-set identifiers about an operation.
+		// None is document-derived: `held_by` is an instance name, which is
+		// process identity and already logged under `instance`; `fault_point`
+		// names a configured injection point from a closed set; the rest are
+		// booleans about what this process did. `delivered_as`,
+		// `destination_path` and `source_name` are deliberately NOT here --
+		// those are document names.
+		"held_by", "fault_point", "content_matches", "removed",
+		"destination_already_absent",
 	}
 	for _, k := range keys {
 		safeKeys[k] = struct{}{}
@@ -53,10 +62,37 @@ func init() {
 // Redacted replaces the value of any attribute outside the allow-list.
 const Redacted = "[redacted:unapproved-log-key]"
 
+// countPrefix marks keys whose value is a COUNT of jobs in one closed-set
+// category, such as would_hold_policy_transliterates.
+//
+// The dry run's whole output is aggregate counts by category, and every one of
+// them was redacted: the key is built from the category, the allow-list matches
+// exact strings, and so the report an operator reads to decide whether a
+// configuration change is safe printed "[redacted]" where every number should
+// have been. The suffix is bounded to the closed-set identifier shape the
+// caller has already filtered on, and the VALUE is an integer, so this admits
+// counts without admitting anything document-derived.
+const countPrefix = "would_hold_"
+
 // IsSafeKey reports whether key may carry a value into ordinary output.
 func IsSafeKey(key string) bool {
-	_, ok := safeKeys[key]
-	return ok
+	if _, ok := safeKeys[key]; ok {
+		return true
+	}
+	return isCategoryCount(key)
+}
+
+func isCategoryCount(key string) bool {
+	rest, ok := strings.CutPrefix(key, countPrefix)
+	if !ok || rest == "" || len(rest) > 64 {
+		return false
+	}
+	for _, r := range rest {
+		if (r < 'a' || r > 'z') && r != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // Options configures the process logger.
