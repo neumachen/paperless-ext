@@ -306,6 +306,32 @@ func Open(root, name string, allowSubdirs bool) (*os.File, Entry, error) {
 	if strings.HasPrefix(filepath.Base(name), ".") {
 		return nil, Entry{}, ErrHidden
 	}
+	return openWithin(root, name, allowSubdirs)
+}
+
+// OpenOwnTemp opens a temporary file THIS process staged, and requires it to be
+// the file the caller observed.
+//
+// Every attempt-private temporary is a dotfile on purpose -- the destination
+// directory is watched by a consumer, and a leading dot is the conventional
+// signal for "not a submission" -- so Open refuses them, correctly, because a
+// dotfile appearing in incoming is somebody else's business. Verifying our own
+// staged bytes still has to read one, and it is not the same question: the name
+// carries a per-attempt nonce this process generated, and the identity is
+// checked against the entry the caller already saw.
+func OpenOwnTemp(root, name string, expect Entry) (*os.File, Entry, error) {
+	f, got, err := openWithin(root, name, false)
+	if err != nil {
+		return nil, Entry{}, err
+	}
+	if got.Inode != expect.Inode || got.Device != expect.Device {
+		f.Close()
+		return nil, Entry{}, fmt.Errorf("%w: identity changed", ErrMutated)
+	}
+	return f, got, nil
+}
+
+func openWithin(root, name string, allowSubdirs bool) (*os.File, Entry, error) {
 	if _, err := safeJoin(root, name, allowSubdirs); err != nil {
 		return nil, Entry{}, err
 	}

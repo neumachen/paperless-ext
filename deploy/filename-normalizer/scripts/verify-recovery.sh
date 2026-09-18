@@ -40,6 +40,7 @@ NET="${PROJECT}_fn"
 CREATED=""
 # Containers this invocation disconnected from the network, and must reconnect.
 DISCONNECTED=""
+WATCHER_OVERRIDDEN=0
 
 emit() { printf '%s\n' "$*" >> "$OUT"; printf '%s\n' "$*"; }
 bad() { printf '    MISMATCH: %s\n' "$*" >&2; emit "    MISMATCH: $*"; FAILURES=$((FAILURES + 1)); }
@@ -187,11 +188,14 @@ restore() {
     # left disconnected is the most damaging thing this script can leave behind.
     heal_network
     restore_perm || _r_perm_failed=1
-    drop_fault renamer-fault renamer-hold renamer-altfs renamer-tinyfs renamer-permdenied
+    drop_fault renamer-fault renamer-hold renamer-altfs renamer-tinyfs renamer-permdenied renamer-tmpfsdest
 
     # Recreate rather than start: a service that was recreated with an
-    # environment override keeps that environment across a plain restart.
-    compose up -d --force-recreate --wait --wait-timeout 180 renamer-1 renamer-2 >/dev/null 2>&1 || true
+    # environment override keeps that environment across a plain restart. The
+    # watcher is included because the separate-filesystem scenario points it at
+    # a different destination root, and a restart would keep that.
+    compose up -d --force-recreate --wait --wait-timeout 180 renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
+    wait_healthy watcher 180 || true
     wait_healthy renamer-1 120 || true
     wait_healthy renamer-2 120 || true
 
@@ -212,6 +216,19 @@ restore() {
         fi
         printf '  %-12s networks: %s\n' "$_r_svc" "$_r_nets" >> "$OUT"
     done
+
+    # The watcher's destination root must be back to the stack's own. Read
+    # from the RUNNING container's environment, which is what the process was
+    # started with, rather than from a fresh process asked what it would load.
+    _r_wconsume="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' \
+        "$(compose ps -q watcher 2>/dev/null | head -1)" 2>/dev/null \
+        | sed -n 's/^FN_STORAGE_CONSUME=//p' | head -1)"
+    case "${_r_wconsume:-/srv/fn/consume}" in
+        /srv/fn/consume) ;;
+        *) _r_ok=0 ;;
+    esac
+    printf '  watcher destination root: %s   (expected /srv/fn/consume)\n' \
+        "${_r_wconsume:-/srv/fn/consume}" >> "$OUT"
 
     # Effective readiness, not just "the container is up": a renamer that is
     # running but cannot reach the broker is not a restored stack.
@@ -256,7 +273,7 @@ emit ""
 # ---------------------------------------------------------------------------
 # 1. A6: a real interruption between the link and the receipt.
 # ---------------------------------------------------------------------------
-log "1/8: A6 — interrupting a renamer between the destination link and the receipt"
+log "1/9: A6 — interrupting a renamer between the destination link and the receipt"
 stop_ordinary
 DOC1="a6-after-link-$STAMP.pdf"
 NAME1="a6-after-link-$LOWER.pdf"
@@ -311,7 +328,7 @@ emit ""
 # 2. A6: interrupted BEFORE the link -- the destination never appears -- and
 #    the uncertain outcome must survive a LATER DELIVERY, not merely a reread.
 # ---------------------------------------------------------------------------
-log "2/8: A6 — interrupting before the link, so the destination never appears"
+log "2/9: A6 — interrupting before the link, so the destination never appears"
 stop_ordinary
 DOC2="a6-before-link-$STAMP.pdf"
 NAME2="a6-before-link-$LOWER.pdf"
@@ -381,13 +398,34 @@ PUBLISHED2B="$(in_storage "test -f '/srv/fn/consume/$NAME2' && echo yes || echo 
 emit "   a later delivery was published to the real queue: $REPUB2"
 emit "   delivery_received events:     $DELIV_BEFORE2 -> $DELIV_AFTER2   (the delivery really arrived)"
 emit "   what that delivery wrote:     ${NEWEVENTS2:-none}"
-emit "   its disposition:              settled against the existing outcome ($SETTLED2 log line(s))"
+# "Settled" has to be shown durably, not by counting log lines: a handler can
+# print anything and still leave the delivery unacknowledged, and a redelivery
+# that is quietly requeued forever prints exactly the same thing.
+#
+# The broker's queue-level numbers cannot carry this claim either, and an
+# earlier version of this check used them anyway: the work queue is SHARED, so
+# `messages_unacknowledged` counts whatever else the stack is doing and says
+# nothing about this job. The job's own history does say it -- a requeued
+# delivery comes back, so a delivery count that stops climbing is a delivery
+# that was acknowledged.
+DELIV_SETTLE_A="$(psqlq "SELECT count(*) FROM job_events WHERE job_id = '$JOB2' AND event_type = 'delivery_received';")"
+sleep 12
+DELIV_SETTLE_B="$(psqlq "SELECT count(*) FROM job_events WHERE job_id = '$JOB2' AND event_type = 'delivery_received';")"
+UNACKED2="$(queue_field "${FN_AMQP_QUEUE:-filename_normalizer.jobs.v1}" messages_unacknowledged)"
+READY2="$(queue_field "${FN_AMQP_QUEUE:-filename_normalizer.jobs.v1}" messages_ready)"
+emit "   its disposition:              $SETTLED2 log line(s), and the delivery did"
+emit "                                 not come back: $DELIV_SETTLE_A -> $DELIV_SETTLE_B"
+emit "                                 over 12s (a requeued delivery returns)"
+emit "   broker queue at that moment:  ${UNACKED2:-unknown} unacknowledged, ${READY2:-unknown} ready"
+emit "                                 (context only: the queue is shared, so these"
+emit "                                 numbers are about the stack, not this job)"
 emit "   state after that delivery:    $STATE2B   (expected uncertain: not reopened)"
 emit "   destination after it:         $PUBLISHED2B   (expected no: nothing was published)"
 [ "$REPUB2" = "yes" ] || bad "the redelivery could not be published, so the uncertain job was never re-offered"
 [ "${DELIV_AFTER2:-0}" -gt "${DELIV_BEFORE2:-0}" ] || bad "no further delivery reached the uncertain job, so nothing was proven about it"
 [ "$STATE2B" = "uncertain" ] || bad "an uncertain job was reopened to '$STATE2B' by a later delivery"
 [ "$PUBLISHED2B" = "no" ] || bad "a later delivery of an uncertain job published a document"
+[ "${DELIV_SETTLE_B:-0}" = "${DELIV_SETTLE_A:-0}" ] || bad "the delivery came back ($DELIV_SETTLE_A -> $DELIV_SETTLE_B): it was requeued, not settled"
 case "${NEWEVENTS2:-}" in
     *reserved*|*publish_attempted*|*delivered*) bad "a later delivery of an uncertain job did real work: $NEWEVENTS2" ;;
 esac
@@ -418,7 +456,7 @@ emit ""
 # Both attempts are then observed by name, with timestamps, and the durable
 # result must contain exactly one publication.
 # ---------------------------------------------------------------------------
-log "3/8: A7 — two live attempts on one job at the publication boundary"
+log "3/9: A7 — two live attempts on one job at the publication boundary"
 stop_ordinary
 DOC3="a7-overlap-$STAMP.pdf"
 NAME3="a7-overlap-$LOWER.pdf"
@@ -586,7 +624,7 @@ emit ""
 # must produce two documents and two receipts. Anything that deduplicated them
 # would be discarding a document nobody asked it to discard.
 # ---------------------------------------------------------------------------
-log "4/8: two distinct submissions with identical bytes stay distinct"
+log "4/9: two distinct submissions with identical bytes stay distinct"
 compose start renamer-1 renamer-2 >/dev/null 2>&1 || true
 wait_healthy renamer-1 120 || true
 DOC4A="twin-a-$STAMP.pdf"
@@ -624,7 +662,7 @@ emit ""
 # content, recovery must refuse it: adopting it would both take a file this
 # job never wrote and merge two submissions the contract keeps distinct.
 # ---------------------------------------------------------------------------
-log "5/8: recovery refuses a foreign file at the reserved name, even byte-identical"
+log "5/9: recovery refuses a foreign file at the reserved name, even byte-identical"
 stop_ordinary
 DOC5="a6-foreign-$STAMP.pdf"
 NAME5="a6-foreign-$LOWER.pdf"
@@ -706,7 +744,7 @@ emit ""
 # the two claims are easy to confuse: an incoming/consume split alone would
 # not exercise the fallback at all.
 # ---------------------------------------------------------------------------
-log "6/8: A10 — staging on a tmpfs, so the copy fallback is actually taken"
+log "6/9: A10 — staging on a tmpfs, so the copy fallback is actually taken"
 stop_ordinary
 DOC6="a10-altfs-$STAMP.pdf"
 NAME6="a10-altfs-$LOWER.pdf"
@@ -768,7 +806,7 @@ emit ""
 # ---------------------------------------------------------------------------
 # 7. A11: the working copy runs out of space mid-write, accounted in full.
 # ---------------------------------------------------------------------------
-log "7/8: A11 — a real ENOSPC while writing the working copy"
+log "7/9: A11 — a real ENOSPC while writing the working copy"
 stop_ordinary
 DOC7="a11-nospace-$STAMP.pdf"
 start_fault renamer-tinyfs || exit 1
@@ -794,6 +832,13 @@ SHARED_STAGE7="$(in_storage "ls -1a /srv/fn/staging 2>/dev/null | grep -c \"$JOB
 # that scenario's artifact, not evidence about this failed write.
 OTHER_TMP7="$(in_storage "ls -1a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-' || true")"
 
+TINY_LEFT7="$(in_storage "ls -1a /srv/fn/staging-tiny 2>/dev/null | grep -c '\.work$' || true")"
+TINY_BYTES7="$(in_storage "du -sb /srv/fn/staging-tiny 2>/dev/null | cut -f1 || echo unknown")"
+# Existence and size are not preservation: a file can keep its length and lose
+# its contents. The source is hashed and compared with what discovery recorded.
+SRCSUM7="$(in_storage "sha256sum '/srv/fn/incoming/$DOC7' 2>/dev/null | cut -c1-64")"
+REGSUM7="$(psqlq "SELECT encode(content_fingerprint,'hex') FROM jobs WHERE source_name = '$DOC7';")"
+
 emit "7. A11 — out of space while writing the working copy"
 emit "   final state:                  $STATE7   (expected held)"
 emit "   category:                     $CAT7"
@@ -810,13 +855,18 @@ emit "       this exercise kills containers mid-publication on purpose, and a"
 emit "       process stopped between staging and linking cannot unlink what it"
 emit "       staged. Scenario 3's holder is removed exactly that way.)"
 emit "     source still present:       $SRC7 ($SRCSIZE7 bytes, unchanged and complete)"
-emit "   LIMITATION, stated rather than papered over: the filesystem that ran"
-emit "   out of space is a tmpfs private to renamer-tinyfs, and the runtime"
-emit "   image is FROM scratch with no shell, so no process outside that"
-emit "   container can list it. Whether a partial .work file remains inside"
-emit "   that tmpfs until the container exits is therefore NOT observed here."
-emit "   Everything durable and everything in shared storage is accounted for"
-emit "   above, and the tmpfs is discarded with the container either way."
+emit "   the failing filesystem itself, now that it can be read:"
+emit "     partial .work files left in the 1 MB filesystem: $TINY_LEFT7"
+emit "     bytes still occupied there:                      $TINY_BYTES7"
+emit "   (This replaces the previous round's stated limitation. The filesystem"
+emit "    that runs out of space is a tmpfs-backed NAMED volume now, so an"
+emit "    inspector can mount the very filesystem the write failed on. It used"
+emit "    to be a container-private tmpfs that nothing outside could list --"
+emit "    the runtime image is FROM scratch -- so what the failed write left"
+emit "    behind was genuinely unobserved and the evidence said so.)"
+emit "   source preservation is byte-verified, not inferred from its size:"
+emit "     source sha256 now:          ${SRCSUM7:-unreadable}"
+emit "     recorded at registration:   ${REGSUM7:-none}   (must be equal)"
 [ "$STATE7" = "held" ] || bad "an out-of-space write reached '$STATE7'"
 [ "${PUB7:-0}" = "0" ] || bad "$PUB7 documents were published despite the failed copy"
 [ "${RECEIPTS7:-0}" = "0" ] || bad "$RECEIPTS7 receipts exist for a job that never published"
@@ -824,6 +874,7 @@ emit "   above, and the tmpfs is discarded with the container either way."
 [ "${CONSUME_TMP7:-0}" = "0" ] || bad "$CONSUME_TMP7 attempt temporaries were left in the consume directory"
 [ "${SHARED_STAGE7:-0}" = "0" ] || bad "$SHARED_STAGE7 attempt temporaries were left in the shared staging directory"
 [ "${ATTEMPTS7:-0}" -ge 2 ] || bad "the failure was not retried before being held (attempts=$ATTEMPTS7)"
+[ -n "$SRCSUM7" ] && [ "$SRCSUM7" = "$REGSUM7" ] || bad "the source's bytes are not what discovery recorded; preservation is not established"
 [ "${EVENTS7:-0}" -le 60 ] || bad "$EVENTS7 history rows; the retry bound did not hold"
 [ "$SRC7" = "yes" ] || bad "the source was removed by a failed publication"
 [ "${SRCSIZE7:-0}" = "5000000" ] || bad "the source is $SRCSIZE7 bytes, not the 5000000 submitted"
@@ -862,7 +913,7 @@ emit ""
 # INCLUDING an interruption, because a consume root left root-owned and
 # unwritable would stop the whole stack.
 # ---------------------------------------------------------------------------
-log "8/8: a real permission denial at the publication"
+log "8/9: a real permission denial at the publication"
 stop_ordinary
 DOC8="perm-denied-$STAMP.pdf"
 NAME8="perm-denied-$LOWER.pdf"
@@ -1000,6 +1051,63 @@ emit "and redelivered until the durable budget is spent and the job is held. An"
 emit "immediate destination_conflict, which the previous round offered as"
 emit "evidence, settles on the first attempt and never touches the budget."
 emit "   attempts recorded in scenario 7: $ATTEMPTS7 against a budget of 2"
+emit ""
+
+# ---------------------------------------------------------------------------
+# 9. A10, completed: the SOURCE and the DESTINATION on different filesystems.
+#
+# Scenario 6 crosses staging/consume, which is the boundary the copy fallback
+# actually depends on. The acceptance criterion names a different one --
+# incoming to consume -- and the two are not interchangeable, so this publishes
+# into a tmpfs-backed destination and compares the bytes that arrive with the
+# bytes that were submitted.
+# ---------------------------------------------------------------------------
+log "9/9: A10 — incoming and consume on different filesystems, bytes compared"
+stop_ordinary
+TMPFS_DEST="/srv/fn/consume-tmpfs"
+DOC9="a10-crossfs-$STAMP.pdf"
+NAME9="a10-crossfs-$LOWER.pdf"
+
+# The watcher records the destination a submission is accepted for, so it has
+# to be pointed at the same destination as the renamer that will publish it.
+# The restore trap recreates it from the plain environment afterwards.
+(
+    export FN_STORAGE_CONSUME="$TMPFS_DEST"
+    compose up -d --force-recreate --wait --wait-timeout 180 watcher >/dev/null 2>&1
+) || true
+WATCHER_OVERRIDDEN=1
+start_fault renamer-tmpfsdest || exit 1
+wait_healthy renamer-tmpfsdest 180 || true
+
+submit "$DOC9" 300000
+STATE9="$(await_state "$DOC9" "delivered held uncertain" 240)"
+DEV_IN9="$(in_storage "stat -c %d /srv/fn/incoming")"
+DEV_OUT9="$(in_storage "stat -c %d $TMPFS_DEST")"
+SRC_SUM9="$(in_storage "sha256sum '/srv/fn/incoming/$DOC9' 2>/dev/null | cut -c1-64")"
+PUB_SUM9="$(in_storage "sha256sum '$TMPFS_DEST/$NAME9' 2>/dev/null | cut -c1-64")"
+PUB_SIZE9="$(in_storage "wc -c < '$TMPFS_DEST/$NAME9' 2>/dev/null || echo 0")"
+RECEIPT_SUM9="$(psqlq "SELECT encode(r.content_fingerprint,'hex') FROM delivery_receipts r JOIN jobs j USING (job_id) WHERE j.source_name = '$DOC9';")"
+PUB_COUNT9="$(in_storage "ls -1 $TMPFS_DEST 2>/dev/null | grep -c '^a10-crossfs-$LOWER' || true")"
+TMP_LEFT9="$(in_storage "ls -1a $TMPFS_DEST 2>/dev/null | grep -c '^\.fn-' || true")"
+
+emit "9. A10 — the source and the destination on different filesystems"
+emit "   device behind incoming:       $DEV_IN9"
+emit "   device behind the destination:$DEV_OUT9   (a tmpfs: a different filesystem)"
+emit "   final state:                  $STATE9   (expected delivered)"
+emit "   published copies:             $PUB_COUNT9   (expected 1)"
+emit "   published size:               $PUB_SIZE9 bytes   (expected 300000: a complete copy)"
+emit "   source sha256:                ${SRC_SUM9:-unreadable}"
+emit "   published sha256:             ${PUB_SUM9:-unreadable}   (must equal the source)"
+emit "   receipt records:              ${RECEIPT_SUM9:-none}   (must equal both)"
+emit "   staged temporaries left:      $TMP_LEFT9   (expected 0: nothing partial is visible)"
+[ "$DEV_IN9" != "$DEV_OUT9" ] || bad "incoming and the destination are the same filesystem; the case was not exercised"
+[ "$STATE9" = "delivered" ] || bad "publication across the boundary reached '$STATE9'"
+[ "${PUB_COUNT9:-0}" = "1" ] || bad "$PUB_COUNT9 copies exist for one submission"
+[ "${PUB_SIZE9:-0}" = "300000" ] || bad "the published document is $PUB_SIZE9 bytes, not the 300000 submitted"
+[ -n "$SRC_SUM9" ] && [ "$SRC_SUM9" = "$PUB_SUM9" ] || bad "the published bytes differ from the source bytes"
+[ "$PUB_SUM9" = "$RECEIPT_SUM9" ] || bad "the receipt records a different fingerprint than the file on disk"
+[ "${TMP_LEFT9:-0}" = "0" ] || bad "$TMP_LEFT9 staged temporaries are visible in the destination"
+drop_fault renamer-tmpfsdest
 emit ""
 
 emit "mismatches: $FAILURES"

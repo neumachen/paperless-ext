@@ -294,8 +294,19 @@ if [ "${RECEIPTS:-0}" = "1" ]; then
 else
     TAKEN="not applicable (nothing was published)"
 fi
+# WHICH document it ingested, not how many it holds. A count proves only that
+# something arrived; the claim is that THIS exercise's document was taken by
+# the consumer, so the consumer is asked for the original filename it recorded.
+INGESTED_THIS="$(compose --profile consumer exec -T paperless sh -c \
+    "python3 -c \"
+import sqlite3
+db = sqlite3.connect('/usr/src/paperless/data/db.sqlite3')
+print(db.execute(
+    'select count(*) from documents_document where original_filename = ?',
+    ('$NAME',)).fetchone()[0])
+\"" 2>/dev/null | tr -d ' \r\n' || echo unknown)"
 INGESTED="$(compose --profile consumer exec -T paperless sh -c \
-    "python3 manage.py document_exporter --help >/dev/null 2>&1; python3 -c \"
+    "python3 -c \"
 import sqlite3
 db = sqlite3.connect('/usr/src/paperless/data/db.sqlite3')
 print(db.execute('select count(*) from documents_document').fetchone()[0])
@@ -303,7 +314,9 @@ print(db.execute('select count(*) from documents_document').fetchone()[0])
 
 emit "   the consumer removed it:      $TAKEN (after ~${_i}s)"
 emit "   documents in its library:     $INGESTED"
+emit "   THIS document in its library: $INGESTED_THIS   (expected 1, matched by original filename)"
 [ "$TAKEN" = "yes" ] || bad "the real consumer never took the file, so the disappearance case was not exercised"
+[ "${INGESTED_THIS:-0}" = "1" ] || bad "the consumer's library does not hold this exercise's document ($INGESTED_THIS); its disappearance is unexplained"
 emit ""
 
 # ---------------------------------------------------------------------------
@@ -319,7 +332,10 @@ emit "3. after the consumer took the document"
 emit "   state:                        $STATE_AFTER   (expected delivered: a taken file is not a failure)"
 emit "   category:                     $CAT_AFTER   (expected '-')"
 emit "   delivery receipts:            $RECEIPTS_AFTER   (expected 1: not withdrawn)"
+PUBLISH_EVENTS="$(psqlq "SELECT count(*) FROM job_events WHERE job_id = '$JOB' AND event_type = 'publish_attempted';")"
 emit "   copies in the directory:      $REPUB   (expected 0: taken, and not delivered again)"
+emit "   publication attempts recorded:$PUBLISH_EVENTS   (expected 1: a directory count cannot"
+emit "                                 prove this, because the consumer empties it)"
 emit "   source preserved:             $SRC_AFTER"
 [ "$STATE_AFTER" = "delivered" ] || bad "a delivered job became '$STATE_AFTER' once the consumer took the file"
 [ "$CAT_AFTER" = "-" ] || bad "a completed delivery acquired the failure category '$CAT_AFTER'"
@@ -332,6 +348,10 @@ if [ "$TAKEN" = "yes" ]; then
 else
     [ "${REPUB:-0}" -le 1 ] || bad "$REPUB copies exist for one publication"
 fi
+# The durable count is what rules out a second publication. An empty directory
+# is equally consistent with "published once" and "published twice and both
+# consumed", so it cannot carry this claim on its own.
+[ "${PUBLISH_EVENTS:-0}" = "1" ] || bad "$PUBLISH_EVENTS publication attempts are recorded for one job"
 [ "$SRC_AFTER" = "yes" ] || bad "the source was removed"
 
 # And a redelivery afterwards must settle against the existing outcome rather

@@ -184,6 +184,24 @@ safe_remove_volume() {
     docker volume rm "$_srv_vol" >/dev/null
 }
 
+# queue_field reads one integer from the broker's own view of a queue.
+#
+# "The delivery was settled" is a statement about the BROKER, and reading it
+# from the application's log lines is reading the wrong party: a handler can
+# log anything and still leave the delivery unacknowledged. Asking the broker
+# how many messages are unacknowledged answers the question the log cannot.
+queue_field() {
+    _qf_queue="$1"; _qf_field="$2"
+    _qf_user="$(sed -n 's/^FN_AMQP_USER=//p' .env)"; _qf_user="${_qf_user:-fn_app}"
+    _qf_pass="$(sed -n 's/^FN_AMQP_PASSWORD=//p' .env)"
+    _qf_vhost="$(sed -n 's/^FN_AMQP_VHOST=//p' .env)"; _qf_vhost="${_qf_vhost:-filename-normalizer}"
+    _qf_auth="$(printf '%s:%s' "$_qf_user" "$_qf_pass" | base64 | tr -d '\n')"
+    _qf_body="$(compose exec -T rabbitmq sh -c \
+        "wget -q -O - --header='Authorization: Basic $_qf_auth' 'http://127.0.0.1:15672/api/queues/$_qf_vhost/$_qf_queue'" \
+        2>/dev/null || true)"
+    printf '%s' "$_qf_body" | sed -n "s/.*\"$_qf_field\":\([0-9]*\).*/\\1/p" | head -1
+}
+
 # wait_for_unacked blocks until the broker reports at least N unacknowledged
 # deliveries on the work queue, i.e. until a delivery is genuinely in flight.
 #

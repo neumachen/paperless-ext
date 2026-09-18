@@ -468,7 +468,7 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	// the file and makes "only complete, verified content becomes visible" a
 	// fact about the bytes rather than about the last name that referred to
 	// them.
-	stagedSum, stagedSize, verr := fingerprintPublished(root, filepath.Base(tmp), staged)
+	stagedSum, stagedSize, verr := fingerprintOwnTemp(root, filepath.Base(tmp), staged)
 	if verr != nil {
 		cat := jobs.Category(storage.RejectionCategory(verr))
 		log.Error("could not verify the staged document before publishing it",
@@ -819,6 +819,21 @@ func (p *Pipeline) withdrawDuplicate(ctx context.Context, job ledger.Job, final 
 // A changed identity comes back as ErrMutated and is handled as what it is.
 func fingerprintPublished(root, candidate string, expect storage.Entry) ([]byte, int64, error) {
 	f, _, err := storage.OpenExpected(root, candidate, expect, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+	return storage.FingerprintFile(f)
+}
+
+// fingerprintOwnTemp is fingerprintPublished for a temporary this attempt
+// staged. Those are dotfiles by design -- the destination directory is watched
+// by a consumer, and a leading dot is how a file says "not a submission" --
+// which the ordinary opener refuses, rightly, because a dotfile appearing in a
+// watched directory is somebody else's business. This one is ours: the name
+// carries a nonce this attempt generated, and the identity is still checked.
+func fingerprintOwnTemp(root, name string, expect storage.Entry) ([]byte, int64, error) {
+	f, _, err := storage.OpenOwnTemp(root, name, expect)
 	if err != nil {
 		return nil, 0, err
 	}

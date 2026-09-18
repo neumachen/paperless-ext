@@ -208,6 +208,11 @@ test-consumer: ## Run a real isolated Paperless instance against the consume dir
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-consumer.sh
 
+.PHONY: test-refusal-safety
+test-refusal-safety: ## Prove a refusal changes nothing and cleanup respects ownership
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-refusal-safety.sh
+
 .PHONY: test-cleanup-ownership
 test-cleanup-ownership: ## Prove the isolation wrapper's own cleanup cannot remove pre-existing resources
 	@mkdir -p $(EVIDENCE)

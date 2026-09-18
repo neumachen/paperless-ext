@@ -108,6 +108,28 @@ volumes:
   # role's root.
   fn-consume-alt:
 
+  # Two filesystems that are genuinely not the one the named volumes live on,
+  # and are still SHAREABLE.
+  #
+  # A service-level `tmpfs:` mount is private to its container, which is why
+  # the disk-full scenario could not say what its failed write left behind and
+  # why a tmpfs destination could not be examined at all: the runtime image is
+  # FROM scratch, so nothing inside can list a directory, and nothing outside
+  # can see it. A tmpfs-backed named volume is a different filesystem by
+  # construction AND can be mounted into an inspector container.
+  fn-consume-tmpfs:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=64m
+  fn-staging-tiny:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=1m
+
   # State for the isolated Paperless instance used as a REAL consumer. It is
   # its own database and its own media store: nothing here touches a real
   # library, and the whole thing is created and destroyed by the exercise.
@@ -247,6 +269,8 @@ services:
       - fn-staging:/srv/fn/staging
       - fn-consume:/srv/fn/consume
       - fn-consume-alt:/srv/fn/consume-alt
+      - fn-consume-tmpfs:/srv/fn/consume-tmpfs
+      - fn-staging-tiny:/srv/fn/staging-tiny
       - fn-failed:/srv/fn/failed
     networks: [fn]
     restart: "no"
@@ -281,6 +305,10 @@ services:
       # Publication belongs to the renamer, so the watcher gets the consumer's
       # directory read-only. The application's probe expects exactly this.
       - fn-consume:/srv/fn/consume:ro
+      # Mounted so the watcher can also be pointed at the tmpfs destination for
+      # the separate-filesystem scenario: it records the destination a
+      # submission is accepted for, so it has to be able to see the one in use.
+      - fn-consume-tmpfs:/srv/fn/consume-tmpfs:ro
       - fn-failed:/srv/fn/failed
     ports:
       - "${FN_WATCHER_PORT:-18080}:8080"
@@ -442,8 +470,10 @@ services:
       - fn-queued:/srv/fn/queued
       - fn-consume:/srv/fn/consume
       - fn-failed:/srv/fn/failed
-    tmpfs:
-      - /srv/fn/staging:size=1m,mode=1777
+      # A 1 MB filesystem that an inspector can also mount, so what the failed
+      # write left behind is observable rather than "inside a container-private
+      # tmpfs nothing can list".
+      - fn-staging-tiny:/srv/fn/staging
     ports: []
 
   # -------------------------------------------------------------------------
@@ -650,6 +680,36 @@ services:
       FN_RENAMER_CONCURRENCY: "1"
       FN_FAULT_POINTS: hold_after_link
       FN_FAULT_HOLD: ${FN_CONSUME_HOLD:-150s}
+    ports: []
+
+  # -------------------------------------------------------------------------
+  # A renamer whose DESTINATION is on a different filesystem from incoming.
+  #
+  # A10 asks for publication across a real filesystem boundary between the
+  # source and the destination. The existing tmpfs-staging service crosses
+  # staging/consume, which is the boundary the copy fallback depends on, but it
+  # is not the topology the acceptance criterion names. This one publishes into
+  # a tmpfs-backed named volume: a genuinely different device from the incoming
+  # volume, and still mountable by an inspector, so the published bytes can be
+  # compared with the source.
+  # -------------------------------------------------------------------------
+  renamer-tmpfsdest:
+    <<: *renamer
+    profiles: [fault]
+    restart: "no"
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-tmpfsdest
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "1"
+      FN_STORAGE_CONSUME: /srv/fn/consume-tmpfs
+    volumes:
+      - ./config:/etc/fn:ro
+      - fn-incoming:/srv/fn/incoming:ro
+      - fn-queued:/srv/fn/queued
+      - fn-staging:/srv/fn/staging
+      - fn-consume-tmpfs:/srv/fn/consume-tmpfs
+      - fn-failed:/srv/fn/failed
     ports: []
 
   # -------------------------------------------------------------------------
