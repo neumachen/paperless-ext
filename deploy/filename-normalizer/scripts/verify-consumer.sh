@@ -94,6 +94,9 @@ start_consumer() {
             return 1
         fi
     done
+    # Past this point the stack is being changed, so restoration has something
+    # to restore. Before it, restoration must do nothing: see MUTATED.
+    MUTATED=1
     # Only volumes that did not exist before this invocation may be removed
     # afterwards. The cleanup used to delete three fixed names unconditionally,
     # so a pre-existing Paperless instance -- the very thing the refusal above
@@ -159,12 +162,25 @@ claim_service() {
 # The ordinary renamers are stopped for the window scenario so the holding
 # instance is the only consumer of the queue. The restore trap recreates them
 # from the plain environment on every exit path.
-stop_ordinary() { compose stop renamer-1 renamer-2 >/dev/null 2>&1; }
+stop_ordinary() { MUTATED=1; compose stop renamer-1 renamer-2 >/dev/null 2>&1; }
 
 RESTORED=0
+# Set the moment this invocation first changes the running stack. Until then a
+# restoration is not harmless: the preflight refuses a consumer service it did
+# not create, and "restoring" afterwards force-recreated renamer-1, renamer-2
+# and the watcher -- three services this invocation had not touched, dropping
+# whatever they were doing -- while reporting that a refusal had changed
+# nothing. The configuration exercise had exactly this defect and this is the
+# same guard.
+MUTATED=0
 restore() {
     if [ "$RESTORED" = "1" ]; then return 0; fi
     RESTORED=1
+    if [ "$MUTATED" = "0" ]; then
+        log "nothing was changed; leaving the stack alone"
+        exercise_unlock
+        return 0
+    fi
     log "removing the consumer and restoring the stack"
     _r_ok=1
     for _r in $CREATED; do

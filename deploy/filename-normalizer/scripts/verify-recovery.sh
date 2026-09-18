@@ -90,13 +90,14 @@ await_registered() {
     return 1
 }
 
-stop_ordinary() { compose stop renamer-1 renamer-2 >/dev/null 2>&1; }
+stop_ordinary() { MUTATED=1; compose stop renamer-1 renamer-2 >/dev/null 2>&1; }
 
 # start_fault creates a fault-profile service, refusing one that already
 # exists. Removing a container this run did not create would destroy another
 # exercise's subject mid-assertion.
 start_fault() {
     _sf_svc="$1"; shift
+    MUTATED=1
     if [ -n "$(compose --profile fault ps -aq "$_sf_svc" 2>/dev/null)" ]; then
         echo "error: service '$_sf_svc' already exists; this invocation did not create it" >&2
         echo "       and will not remove it. Refusing before anything is changed." >&2
@@ -179,9 +180,19 @@ heal_network() {
 restore_perm() { :; }
 
 RESTORED=0
+# Set the moment this invocation first changes the running stack. Before that
+# there is nothing to restore, and restoring anyway is a mutation of its own:
+# force-recreating three application services after a refusal changes exactly
+# what the refusal was protecting.
+MUTATED=0
 restore() {
     if [ "$RESTORED" = "1" ]; then return 0; fi
     RESTORED=1
+    if [ "$MUTATED" = "0" ]; then
+        log "nothing was changed; leaving the stack alone"
+        exercise_unlock
+        return 0
+    fi
     log "restoring the stack and verifying the running state"
 
     # Reconnect first. Everything below needs the network back, and a container
@@ -270,6 +281,21 @@ exercise_lock recovery || exit 1
 trap 'restore' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Every fault service this exercise creates, checked before anything is
+# touched. start_fault refuses one it did not create, but scenario 1 refused
+# only AFTER stop_ordinary had already stopped two renamers -- so a refusal
+# stopped services belonging to whoever else was using this stack, and the
+# restore trap then restarted them. Refusing here means refusing before the
+# first change.
+for _pf in renamer-fault renamer-hold renamer-altfs renamer-tinyfs \
+           renamer-permdenied renamer-tmpfsdest; do
+    if [ -n "$(compose --profile fault ps -aq "$_pf" 2>/dev/null)" ]; then
+        echo "error: service '$_pf' already exists; this invocation did not create it" >&2
+        echo "       and will not remove it. Refusing before anything is changed." >&2
+        exit 1
+    fi
+done
 
 : > "$OUT"
 emit "FN-N010 — interruption, stale worker, filesystem boundaries, write failures"
