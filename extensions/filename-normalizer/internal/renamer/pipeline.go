@@ -619,6 +619,26 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			slog.String("event", "publication_in_progress"),
 			slog.String("held_by", pre.Holder))
 		return deferred(pre.Holder, ledger.ErrPublicationInProgress), true
+	case jobs.IsTerminal(jobs.State(pre.State)):
+		// Somebody has already decided this job's outcome while this attempt
+		// was between its claim and its link. That is the ordinary shape of a
+		// takeover: the claim expires, a sibling recovers the job, finds no
+		// destination, and records `uncertain` because a filesystem handoff
+		// cannot tell a publication that never happened from one whose file was
+		// taken. Linking now would put a consumable document into the
+		// consumer's directory for a job whose durable record says it is closed
+		// -- a file no receipt describes and nothing will reconcile.
+		//
+		// The attempt stands down and settles against what stands. Its source
+		// is untouched, so an operator resolving the uncertain job has
+		// everything they need.
+		log.Warn("this job reached a terminal outcome while this attempt was publishing; not linking",
+			slog.String("event", "publication_superseded"),
+			slog.String("state", pre.State))
+		if out, ok := p.settleAgainstPreserved(ctx, job.JobID, log); ok {
+			return out, true
+		}
+		return unsettled(ledger.ErrOutcomeAlreadyRecorded), true
 	}
 
 	published, err := storage.PublishFromDescriptor(dir, stagedFile, filepath.Base(tmp), candidate)
