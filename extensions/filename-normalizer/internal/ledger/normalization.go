@@ -32,6 +32,11 @@ type Receipt struct {
 	Attempt          int
 	DeliveredAt      time.Time
 	AbsentObservedAt *time.Time
+	// PublishedDevice and PublishedInode identify the file this receipt
+	// describes. Zero means unknown, which is the honest answer for a delivery
+	// reconciled from a destination the consumer had already taken.
+	PublishedDevice int64
+	PublishedInode  int64
 }
 
 // ErrReservedByAnother reports that a destination name belongs to a different
@@ -279,6 +284,47 @@ func (l *Ledger) ClaimPublication(ctx context.Context, jobID, reserved string, i
 	return claim, nil
 }
 
+// MarkPublicationLinked records that this job actually linked an inode into
+// the destination directory.
+//
+// Ownership is decided by this, not by the claim. A claim records what an
+// attempt INTENDS to link; a temporary that is staged and then removed without
+// being linked leaves that record behind, and inodes are reused. Without this
+// distinction a file some other writer creates later at this job's reserved
+// name can carry a recycled device/inode pair the job still claims, and
+// recovery adopts it. Only an inode that was linked can have been this job's
+// document at that name.
+func (l *Ledger) MarkPublicationLinked(ctx context.Context, jobID string, device, inode int64) error {
+	_, err := l.primary.Exec(ctx, `
+		UPDATE job_publication_inodes
+		   SET linked_at = COALESCE(linked_at, now())
+		 WHERE job_id = $1 AND device = $2 AND inode = $3`,
+		jobID, device, inode)
+	if err != nil {
+		return fmt.Errorf("record the linked publication identity: %w", err)
+	}
+	return nil
+}
+
+// ForgetStagedInode drops the record of an inode that was staged and then
+// removed without ever being linked.
+//
+// The row exists so that an attempt resuming after a takeover can recognise a
+// sibling's document. A temporary this attempt removed itself is not that: it
+// is gone, its inode is free for the filesystem to hand to anyone, and keeping
+// the claim on it is how a stranger's file becomes adoptable. A row that has
+// been linked is never forgotten here.
+func (l *Ledger) ForgetStagedInode(ctx context.Context, jobID string, device, inode int64) error {
+	_, err := l.primary.Exec(ctx, `
+		DELETE FROM job_publication_inodes
+		 WHERE job_id = $1 AND device = $2 AND inode = $3 AND linked_at IS NULL`,
+		jobID, device, inode)
+	if err != nil {
+		return fmt.Errorf("forget a staged publication identity: %w", err)
+	}
+	return nil
+}
+
 // OwnsDestination reports whether a file identity belongs to this job.
 //
 // It asks about the JOB, across every attempt that ever staged a file for it,
@@ -294,7 +340,8 @@ func (l *Ledger) OwnsDestination(ctx context.Context, jobID string, device, inod
 	err := l.primary.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM job_publication_inodes
-			 WHERE job_id = $1 AND device = $2 AND inode = $3)`,
+			 WHERE job_id = $1 AND device = $2 AND inode = $3
+			   AND linked_at IS NOT NULL)`,
 		jobID, device, inode).Scan(&owns)
 	if err != nil {
 		return false, fmt.Errorf("check destination ownership: %w", err)
@@ -311,6 +358,10 @@ type PublicationStanding struct {
 	HasReceipt bool
 	// DeliveredName is set when a receipt exists.
 	DeliveredName string
+	// ReceiptDevice and ReceiptInode identify the file the receipt describes,
+	// when it could be identified. Zero means the receipt does not say.
+	ReceiptDevice int64
+	ReceiptInode  int64
 }
 
 // Standing reports whether this attempt's claim still stands and whether some
@@ -329,15 +380,19 @@ func (l *Ledger) Standing(ctx context.Context, jobID, token string) (Publication
 		holder    *string
 		held      *string
 		delivered *string
+		rdev      *int64
+		rino      *int64
 	)
 	err := l.primary.QueryRow(ctx, `
 		SELECT j.state,
 		       j.publish_claimed_by,
 		       j.publish_claim_token,
-		       r.delivered_name
+		       r.delivered_name,
+		       r.published_device,
+		       r.published_inode
 		  FROM jobs j
 		  LEFT JOIN delivery_receipts r ON r.job_id = j.job_id
-		 WHERE j.job_id = $1`, jobID).Scan(&st.State, &holder, &held, &delivered)
+		 WHERE j.job_id = $1`, jobID).Scan(&st.State, &holder, &held, &delivered, &rdev, &rino)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return PublicationStanding{}, ErrNotFound
@@ -351,6 +406,12 @@ func (l *Ledger) Standing(ctx context.Context, jobID, token string) (Publication
 	if delivered != nil {
 		st.HasReceipt = true
 		st.DeliveredName = *delivered
+	}
+	if rdev != nil {
+		st.ReceiptDevice = *rdev
+	}
+	if rino != nil {
+		st.ReceiptInode = *rino
 	}
 	return st, nil
 }
@@ -505,11 +566,12 @@ func (l *Ledger) RecordDelivered(ctx context.Context, r Receipt, reconciled bool
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO delivery_receipts
 				(job_id, destination_root, delivered_name, size_bytes,
-				 content_fingerprint, attempt)
-			VALUES ($1, $2, $3, $4, $5, $6)
+				 content_fingerprint, attempt, published_device, published_inode)
+			VALUES ($1, $2, $3, $4, $5, $6,
+			        NULLIF($7::bigint, 0), NULLIF($8::bigint, 0))
 			ON CONFLICT (job_id) DO NOTHING`,
 			r.JobID, r.DestinationRoot, r.DeliveredName, r.SizeBytes,
-			r.Fingerprint, r.Attempt); err != nil {
+			r.Fingerprint, r.Attempt, r.PublishedDevice, r.PublishedInode); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `

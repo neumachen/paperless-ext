@@ -9,10 +9,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // FingerprintAlgorithm names the content hash recorded for every submission.
@@ -604,6 +607,41 @@ func PublishExclusive(src, dst string) (published bool, err error) {
 	return true, nil
 }
 
+// PublishFromDescriptor makes the bytes behind an open descriptor visible under
+// dstName in dir, and never overwrites.
+//
+// It is PublishExclusive with the check/use gap removed. The old form took two
+// PATHNAMES: the caller verified the temporary's content through a descriptor,
+// closed it, and then asked the kernel to resolve that name again for the link.
+// Whatever the name led to at that second resolution is what became visible, so
+// the bytes that were verified and the bytes that were published were only
+// probably the same file. Linking from the descriptor makes them the same file
+// by construction.
+//
+// `published` is reported separately from `err` for the same reason as before:
+// the link either created the directory entry or it did not, and everything
+// after it happens to a document a consumer can already see. An errno cannot
+// answer that question -- EACCES from the post-link unlink and EACCES from the
+// link are the same value and opposite facts.
+func PublishFromDescriptor(dir *Dir, src *os.File, srcName, dstName string) (published bool, err error) {
+	if src == nil {
+		return false, errors.New("publish: no verified descriptor")
+	}
+	if err := dir.LinkFromDescriptor(src, dstName); err != nil {
+		if errors.Is(err, ErrDestinationExists) {
+			return false, err
+		}
+		return false, fmt.Errorf("link into place: %w", err)
+	}
+	// From here the document IS published: it is visible at dstName under a
+	// name nothing else may take. Failures below are reported, never
+	// reclassified.
+	if err := dir.Sync(); err != nil {
+		return true, fmt.Errorf("sync destination directory: %w", err)
+	}
+	return true, nil
+}
+
 // LinkExclusive links src to dst and reports whether dst already existed.
 //
 // It is how a verified working copy is promoted to its canonical name without
@@ -696,5 +734,231 @@ func Identify(path string) (Entry, error) {
 		return Entry{}, err
 	}
 	f.Close()
+	return e, nil
+}
+
+// ---------------------------------------------------------------------------
+// Dir: operations that happen to a verified directory, not to a pathname
+// ---------------------------------------------------------------------------
+
+// Dir is an open, identity-verified directory.
+//
+// # Why this exists
+//
+// Verifying a root and then acting on a pathname underneath it are two
+// different operations on two different things. `Open` already closed that gap
+// for reads: it walks from the root a component at a time and checks the root's
+// identity against the descriptor it is about to walk from. Everything that
+// CREATES, LINKS or REMOVES still went through a pathname, so a root -- or a
+// component of it -- replaced after the verification redirected exactly the
+// operations the verification existed to protect. A window between a check and
+// an operation cannot be closed by checking more often; it is closed by making
+// the check and the operation use the same descriptor.
+//
+// Every method here is relative to that descriptor. Nothing re-resolves the
+// root, so replacing the root's pathname after OpenDir returns cannot redirect
+// a create, a link or a removal issued through this handle.
+type Dir struct {
+	f    *os.File
+	root string
+}
+
+// OpenDir opens a root and verifies it is the directory that was accepted.
+func OpenDir(root string) (*Dir, error) {
+	real, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve root: %w", err)
+	}
+	f, err := os.OpenFile(real, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open root: %w", err)
+	}
+	if err := verifyRootDescriptor(root, f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &Dir{f: f, root: root}, nil
+}
+
+// Close releases the directory descriptor.
+func (d *Dir) Close() error { return d.f.Close() }
+
+// Sync flushes the directory so a link survives a crash.
+func (d *Dir) Sync() error { return d.f.Sync() }
+
+// Identify reports the identity of one entry, without following a symlink and
+// without resolving the name through the filesystem root.
+func (d *Dir) Identify(name string) (Entry, error) {
+	if err := checkLeaf(name); err != nil {
+		return Entry{}, err
+	}
+	var st unix.Stat_t
+	if err := unix.Fstatat(int(d.f.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return Entry{}, &os.PathError{Op: "fstatat", Path: filepath.Join(d.root, name), Err: err}
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return Entry{}, fmt.Errorf("%w: %s", ErrNotRegular, name)
+	}
+	return Entry{
+		Name: name, Path: filepath.Join(d.root, name),
+		Size: st.Size, ModTime: time.Unix(st.Mtim.Sec, st.Mtim.Nsec),
+		Inode: uint64(st.Ino), Device: uint64(st.Dev),
+	}, nil
+}
+
+// CreateExclusive creates a new file that must not already exist and returns it
+// open for writing.
+func (d *Dir) CreateExclusive(name string, perm os.FileMode) (*os.File, error) {
+	if err := checkLeaf(name); err != nil {
+		return nil, err
+	}
+	fd, err := syscall.Openat(int(d.f.Fd()), name,
+		syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC,
+		uint32(perm.Perm()))
+	if err != nil {
+		return nil, &os.PathError{Op: "openat", Path: filepath.Join(d.root, name), Err: err}
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(d.root, name)), nil
+}
+
+// OpenOwn opens an entry this process created and requires it to still be the
+// file the caller observed.
+//
+// The dotfile refusal that guards submissions does not apply: these are this
+// attempt's own temporaries, named with a nonce this process generated, and the
+// identity is checked rather than assumed.
+func (d *Dir) OpenOwn(name string, expect Entry) (*os.File, Entry, error) {
+	if err := checkLeaf(name); err != nil {
+		return nil, Entry{}, err
+	}
+	fd, err := syscall.Openat(int(d.f.Fd()), name,
+		syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, Entry{}, &os.PathError{Op: "openat", Path: filepath.Join(d.root, name), Err: err}
+	}
+	f := os.NewFile(uintptr(fd), filepath.Join(d.root, name))
+	got, err := identifyFile(f, name, d.root)
+	if err != nil {
+		_ = f.Close()
+		return nil, Entry{}, err
+	}
+	if got.Inode != expect.Inode || got.Device != expect.Device {
+		_ = f.Close()
+		return nil, Entry{}, fmt.Errorf("%w: identity changed", ErrMutated)
+	}
+	return f, got, nil
+}
+
+// LinkFromDescriptor publishes the bytes behind an OPEN DESCRIPTOR under name.
+//
+// This is the difference between publishing what was verified and publishing
+// whatever the verified name happens to lead to now. The old sequence opened
+// the staged temporary, hashed it, closed it, and then linked its PATHNAME:
+// anything that replaced the temporary in between was published instead, and
+// the receipt described bytes that were never at the destination. linkat from
+// /proc/self/fd/N links the inode the descriptor holds, so the file that
+// appears at the destination is the file that was verified, whatever happened
+// to its name.
+//
+// It returns ErrDestinationExists for EEXIST, which is the kernel deciding the
+// absence check and the claim in one step.
+func (d *Dir) LinkFromDescriptor(src *os.File, name string) error {
+	if err := checkLeaf(name); err != nil {
+		return err
+	}
+	err := linkat(-1, "/proc/self/fd/"+strconv.Itoa(int(src.Fd())),
+		int(d.f.Fd()), name, atSymlinkFollow)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, syscall.EEXIST):
+		return fmt.Errorf("%w: %s", ErrDestinationExists, name)
+	default:
+		return &os.PathError{Op: "linkat", Path: filepath.Join(d.root, name), Err: err}
+	}
+}
+
+// RemoveOwned removes an entry only while it is still the file the caller
+// identified, and reports whether the file it removed was that one.
+//
+// The identity check and the removal are issued against the same directory
+// descriptor, so neither re-resolves the root or the parent. That leaves one
+// unavoidable window -- the kernel has no "unlink this inode" -- so the file is
+// held open across the removal and its link count is read afterwards: if the
+// descriptor still has links, the name led to a different file by then and this
+// call removed somebody else's. That cannot be undone, and it is reported as a
+// failure rather than counted as a successful cleanup.
+func (d *Dir) RemoveOwned(name string, expect Entry) (bool, error) {
+	f, _, err := d.OpenOwn(name, expect)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := unlinkat(int(d.f.Fd()), name); err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return false, nil
+		}
+		return false, &os.PathError{Op: "unlinkat", Path: filepath.Join(d.root, name), Err: err}
+	}
+	var st unix.Stat_t
+	if ferr := unix.Fstat(int(f.Fd()), &st); ferr == nil && st.Nlink > 0 {
+		return false, fmt.Errorf("%w: %s was replaced between the identity check and the removal; a file this process does not own was removed",
+			ErrMutated, name)
+	}
+	return true, nil
+}
+
+// RemoveIfOurs removes an entry created by this process, tolerating a name that
+// is already gone. It is the cleanup counterpart of CreateExclusive.
+func (d *Dir) RemoveIfOurs(name string, expect Entry) error {
+	_, err := d.RemoveOwned(name, expect)
+	return err
+}
+
+// checkLeaf refuses anything but a single, contained path component.
+func checkLeaf(name string) error {
+	if name == "" || strings.ContainsRune(name, '/') {
+		return fmt.Errorf("%w: %q is not a single path component", ErrUnsafeName, name)
+	}
+	switch name {
+	case ".", "..":
+		return fmt.Errorf("%w: unsafe path component", ErrUnsafeName)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Directory-relative syscalls
+// ---------------------------------------------------------------------------
+
+// atSymlinkFollow asks linkat to resolve /proc/self/fd/N to the file the
+// descriptor holds rather than to the magic symlink itself.
+const atSymlinkFollow = unix.AT_SYMLINK_FOLLOW
+
+func linkat(oldDirFd int, oldPath string, newDirFd int, newPath string, flags int) error {
+	return unix.Linkat(oldDirFd, oldPath, newDirFd, newPath, flags)
+}
+
+func unlinkat(dirfd int, name string) error {
+	return unix.Unlinkat(dirfd, name, 0)
+}
+
+// identifyFile describes an open descriptor.
+func identifyFile(f *os.File, name, root string) (Entry, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return Entry{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		return Entry{}, fmt.Errorf("%w: %s", ErrNotRegular, name)
+	}
+	e := Entry{Name: name, Path: filepath.Join(root, name), Size: fi.Size(), ModTime: fi.ModTime()}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		e.Inode, e.Device = uint64(st.Ino), uint64(st.Dev)
+	}
 	return e, nil
 }
