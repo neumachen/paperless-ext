@@ -500,14 +500,34 @@ func checkPreservedRunes(before, after string) error {
 		return nil
 	}
 
-	seen := map[rune]bool{}
-	for _, r := range strings.ToLower(before) {
-		if r < 0x80 || !unicode.IsLetter(r) || seen[r] {
-			continue
+	// Counted, not merely looked for. Asking "does this rune still appear
+	// somewhere" passes any input that contains the letter twice: a rule
+	// matching `^für für$` and replacing with `fur für` transliterates the
+	// first ü while the second one answers the question, and `für für.pdf`
+	// becomes `fur_für.pdf`. How many times a letter survives is the thing
+	// that has to be preserved, and it is a property of the actual input
+	// rather than of any list of examples.
+	//
+	// A letter whose count only DROPS is refused. That also refuses a rule
+	// that deletes one occurrence of a repeated non-ASCII word while keeping
+	// most of the text, which is a real restriction -- and the right way to be
+	// wrong here, because the alternative is silently altering somebody's
+	// document names.
+	counts := func(s string) map[rune]int {
+		out := map[rune]int{}
+		for _, r := range s {
+			if r < 0x80 || !unicode.IsLetter(r) {
+				continue
+			}
+			out[r]++
 		}
-		seen[r] = true
-		if !strings.ContainsRune(lowerAfter, r) {
-			return fmt.Errorf("%w: %q is no longer present after the rules ran", ErrTransliterated, string(r))
+		return out
+	}
+	afterCounts := counts(lowerAfter)
+	for r, n := range counts(strings.ToLower(before)) {
+		if got := afterCounts[r]; got < n {
+			return fmt.Errorf("%w: %q appears %d time(s) before the rules and %d after",
+				ErrTransliterated, string(r), n, got)
 		}
 	}
 	return nil
