@@ -294,16 +294,24 @@ func TestF3AccountingReflectsTheLedger(t *testing.T) {
 	e.OnlyIn(t, PhaseBaseline)
 	led := e.Ledger(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	snap, err := led.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("ledger snapshot: %v", err)
-	}
-
+	// The gauge and the ledger are read together, repeatedly, until they
+	// agree -- rather than once, with the ledger read first and the gauge
+	// afterwards.
+	//
+	// A single pair of readings compares two observations of a MOVING
+	// quantity: the accounting worker refreshes the gauge on its own interval,
+	// so any job that settles between the two readings makes them differ by
+	// one, and the test reported that as the metrics disagreeing with the
+	// ledger. It failed exactly that way on a stack where an earlier exercise's
+	// last job settled during the window. The claim worth making is that the
+	// gauge agrees with committed rows, and a system that converges says so;
+	// a system that invents outcomes never converges and still fails here.
 	var body string
-	err = waitForErr(30*time.Second, func() error {
+	var snap ledger.Counts
+	err := waitForErr(60*time.Second, func() error {
 		var gerr error
 		body, gerr = GetMetrics(e.WatcherURL)
 		if gerr != nil {
@@ -315,6 +323,21 @@ func TestF3AccountingReflectsTheLedger(t *testing.T) {
 		}
 		if runs < 1 {
 			return fmt.Errorf("the accounting worker has not completed a pass yet")
+		}
+		var serr error
+		snap, serr = led.Snapshot(ctx)
+		if serr != nil {
+			return fmt.Errorf("ledger snapshot: %w", serr)
+		}
+		for _, state := range []jobs.State{jobs.StateDelivered, jobs.StateUncertain, jobs.StateHeld} {
+			want := float64(snap.ByState[state])
+			got, verr := requireMetricErr(body, "fn_jobs", map[string]string{"state": string(state)})
+			if verr != nil {
+				return verr
+			}
+			if got != want {
+				return fmt.Errorf("fn_jobs{state=%q} is %v but the ledger holds %v", state, got, want)
+			}
 		}
 		return nil
 	})
@@ -332,13 +355,8 @@ func TestF3AccountingReflectsTheLedger(t *testing.T) {
 	// that neither state ever appears -- would fail on the system working.
 	// What still has to hold is that the metric agrees with the ledger: a
 	// gauge that reported deliveries the ledger does not have would be
-	// claiming an outcome that did not happen.
-	for _, state := range []jobs.State{jobs.StateDelivered, jobs.StateUncertain, jobs.StateHeld} {
-		want := float64(snap.ByState[state])
-		if v := metricValue(t, body, "fn_jobs", map[string]string{"state": string(state)}); v != want {
-			t.Errorf("fn_jobs{state=%q} is %v but the ledger holds %v", state, v, want)
-		}
-	}
+	// claiming an outcome that did not happen. That agreement is established
+	// by the loop above, on readings taken together.
 
 	e.WriteEvidence(t, "f3-accounting.txt", []byte(describeSamples(body, "fn_jobs")))
 }

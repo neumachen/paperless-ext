@@ -389,6 +389,20 @@ func (p *Pipeline) makeWorkingCopy(ctx context.Context, job ledger.Job, src *os.
 func (p *Pipeline) publish(ctx context.Context, job ledger.Job, res naming.Result, working string, attempt int, log *slog.Logger) Outcome {
 	root := p.cfg.Storage.Consume
 
+	// One token for the whole ATTEMPT, not one per candidate name.
+	//
+	// The claim is what makes publication exclusive, and it is guarded by this
+	// token. Minting a fresh one for each candidate made an attempt that
+	// advanced past an occupied name compete with ITSELF: it had claimed under
+	// the first candidate's token, and the claim for the second candidate
+	// arrived with a different one, so the ledger correctly reported that a
+	// live attempt already held the job. The attempt stood down in favour of
+	// itself, the delivery went back, and the next one recovered a job whose
+	// reserved name was occupied by the foreign file -- so a collision with a
+	// file the system did not publish ended as a hold instead of the suffixed
+	// delivery the contract requires.
+	token := nonce()
+
 	for n := 0; n <= p.cfg.Policy.MaxCollisionSuffix; n++ {
 		candidate, err := p.cfg.Policy.Candidate(res, n)
 		if err != nil {
@@ -415,7 +429,7 @@ func (p *Pipeline) publish(ctx context.Context, job ledger.Job, res naming.Resul
 			return unsettled(err)
 		}
 
-		out, done := p.linkIntoPlace(ctx, job, root, candidate, key, working, attempt, n, log)
+		out, done := p.linkIntoPlace(ctx, job, root, candidate, key, working, attempt, n, token, log)
 		if done {
 			return out
 		}
@@ -428,7 +442,10 @@ func (p *Pipeline) publish(ctx context.Context, job ledger.Job, res naming.Resul
 }
 
 // linkIntoPlace performs the claim-link-receipt sequence for one candidate.
-func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, candidate, key, working string, attempt, seq int, log *slog.Logger) (Outcome, bool) {
+//
+// `token` identifies the ATTEMPT and is the same across every candidate this
+// attempt tries; see publish for why it cannot be per-candidate.
+func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, candidate, key, working string, attempt, seq int, token string, log *slog.Logger) (Outcome, bool) {
 	final := filepath.Join(root, candidate)
 	// Attempt-private: two attempts on one job must not stage over each other.
 	tmp := filepath.Join(root, tempPrefix+job.JobID+"."+nonce()+".tmp")
@@ -485,10 +502,11 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	}
 
 	// Claim the right to publish. Exclusive per ATTEMPT, not per process: the
-	// token below is what the ledger guards on, because every handler in one
-	// renamer shares the instance name and two of them holding "the exclusive
-	// claim" at once is not exclusivity.
-	token := nonce()
+	// token is what the ledger guards on, because every handler in one renamer
+	// shares the instance name and two of them holding "the exclusive claim"
+	// at once is not exclusivity. Re-claiming under the same token updates the
+	// reserved name and the staged identity, which is what an advance past an
+	// occupied destination needs.
 	claim, cerr := p.led.ClaimPublication(ctx, job.JobID, candidate,
 		int64(staged.Inode), int64(staged.Device), attempt, token, p.cfg.PublishTakeoverAfter)
 	switch {
