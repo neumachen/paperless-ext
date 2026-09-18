@@ -919,6 +919,37 @@ func (d *Dir) RemoveIfOurs(name string, expect Entry) error {
 	return err
 }
 
+// CopyInto streams an open file into a new entry in this directory.
+//
+// The destination is created relative to the verified descriptor and must not
+// already exist, and it is flushed before the function returns: a temporary
+// that is about to be linked into a watched directory has to be complete on
+// disk before anything can reach it.
+func (d *Dir) CopyInto(src *os.File, name string) error {
+	dst, err := d.CreateExclusive(name, 0o640)
+	if err != nil {
+		return err
+	}
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		_ = dst.Close()
+		return err
+	}
+	buf := make([]byte, copyBufferSize)
+	if _, err := io.CopyBuffer(dst, src, buf); err != nil {
+		_ = dst.Close()
+		return err
+	}
+	if err := dst.Sync(); err != nil {
+		_ = dst.Close()
+		return err
+	}
+	return dst.Close()
+}
+
+// OpenAnyRegular opens a regular file by path, without following a final
+// symlink, for callers that already hold a verified path in another root.
+func OpenAnyRegular(path string) (*os.File, Entry, error) { return openRegular(path) }
+
 // checkLeaf refuses anything but a single, contained path component.
 func checkLeaf(name string) error {
 	if name == "" || strings.ContainsRune(name, '/') {

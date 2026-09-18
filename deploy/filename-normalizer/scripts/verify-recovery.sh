@@ -937,8 +937,12 @@ TINY_BYTES7="$(in_storage "du -sb /srv/fn/staging-tiny 2>/dev/null | cut -f1 || 
 # never mounted, and a permission error would satisfy a category check that
 # accepts any storage failure.
 TINY_SIZE7="$(in_storage "df -k /srv/fn/staging-tiny 2>/dev/null | awk 'NR==2 {print \$2}' || echo unknown")"
+# The classified label, not the raw errno: the logger maps the error to a
+# closed-set error_kind and the raw message never reaches ordinary output, so
+# grepping for the strerror text found nothing and the assertion built on it
+# failed for a run that had exercised ENOSPC perfectly well.
 NOSPACE7="$(compose --profile fault logs renamer-tinyfs 2>/dev/null \
-    | grep -ciE 'no space left|enospc' || true)"
+    | grep -c 'storage_full' || true)"
 # Existence and size are not preservation: a file can keep its length and lose
 # its contents. The source is hashed and compared with what discovery recorded.
 SRCSUM7="$(in_storage "sha256sum '/srv/fn/incoming/$DOC7' 2>/dev/null | cut -c1-64")"
@@ -962,7 +966,7 @@ emit "       staged. Scenario 3's holder is removed exactly that way.)"
 emit "     source still present:       $SRC7 ($SRCSIZE7 bytes, unchanged and complete)"
 emit "   the failing filesystem itself, now that it can be read:"
 emit "     the failing filesystem was inspected:            $([ "${TINY_SIZE7:-unknown}" != "unknown" ] && echo yes || echo NO) (df reports ${TINY_SIZE7} KiB total)"
-emit "     the failure was out-of-space:                    $NOSPACE7 log line(s) naming ENOSPC"
+emit "     the failure was out-of-space:                    $NOSPACE7 log line(s) classified storage_full"
 emit "     partial .work files left in the 1 MB filesystem: $TINY_LEFT7"
 emit "     bytes still occupied there:                      $TINY_BYTES7"
 emit "   (This replaces the previous round's stated limitation. The filesystem"
@@ -998,7 +1002,7 @@ case "$CAT7" in
 esac
 [ "${TINY_SIZE7:-unknown}" != "unknown" ] || bad "the failing filesystem could not be inspected, so what it left behind is unobserved"
 [ "${TINY_SIZE7:-0}" -le 4096 ] 2>/dev/null || bad "the inspected filesystem is ${TINY_SIZE7} KiB, not the small one this scenario fills"
-[ "${NOSPACE7:-0}" -ge 1 ] || bad "no out-of-space failure was logged; this run did not exercise ENOSPC"
+[ "${NOSPACE7:-0}" -ge 1 ] || bad "no storage_full failure was logged; this run did not exercise ENOSPC"
 drop_fault renamer-tinyfs
 emit ""
 

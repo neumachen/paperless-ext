@@ -465,7 +465,7 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	}
 	defer func() { _ = dir.Close() }()
 
-	if err := p.stageBesideDestination(working, tmp); err != nil {
+	if err := p.stageBesideDestination(dir, working, filepath.Base(tmp)); err != nil {
 		cat := jobs.Category(storage.RejectionCategory(err))
 		log.Error("could not stage the document beside its destination",
 			slog.String("event", "staging_failed"), slog.String("category", string(cat)))
@@ -1292,14 +1292,32 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 // tmp is attempt-private and must not already exist; a hard link is instant
 // when staging and consume share a filesystem, and a copy is the fallback when
 // they genuinely do not.
-func (p *Pipeline) stageBesideDestination(working, tmp string) error {
-	if err := os.Link(working, tmp); err == nil {
-		return nil
-	} else if errors.Is(err, fs.ErrExist) {
+// stageBesideDestination places this attempt's bytes inside the destination
+// directory, through the directory's own descriptor.
+//
+// It used to create the temporary by PATHNAME, which left the one write in the
+// publication path that the root verification did not cover: a root repointed
+// between its verification and this call put the staged file somewhere else
+// entirely. Creating it relative to the verified descriptor means the file is
+// inside the accepted directory or it is nowhere.
+//
+// The working copy is opened once and both routes use that descriptor: a link
+// when the two roots share a filesystem, a copy when they do not.
+func (p *Pipeline) stageBesideDestination(dir *storage.Dir, working, tmpName string) error {
+	wf, _, err := storage.OpenAnyRegular(working)
+	if err != nil {
 		return err
 	}
-	_, err := storage.CopyVerified(working, tmp)
-	return err
+	defer func() { _ = wf.Close() }()
+
+	if lerr := dir.LinkFromDescriptor(wf, tmpName); lerr == nil {
+		return nil
+	} else if errors.Is(lerr, storage.ErrDestinationExists) {
+		return lerr
+	}
+	// Different filesystems: copy into a file created inside the destination
+	// directory, then flush it before anybody is told it exists.
+	return dir.CopyInto(wf, tmpName)
 }
 
 // recordGrace bounds a durable write that has outlived the attempt that
