@@ -213,11 +213,21 @@ emit ""
 #
 # Refusal is the easy path: nothing has happened yet. The hard one is a run
 # that has already started fault services, cut containers off the network and
-# revoked directory permissions when the operator presses ^C. Every exercise
-# installs `trap 'exit 130' INT` so that its EXIT trap -- the restoration --
-# still runs, and that arrangement had never been exercised.
+# revoked directory permissions when it is stopped. Every exercise installs
+# `trap 'exit 130' INT` and `trap 'exit 143' TERM` so that its EXIT trap -- the
+# restoration -- still runs, and that arrangement had never been exercised.
+#
+# SIGTERM, not SIGINT, and the difference is not cosmetic. A command started
+# asynchronously by a NON-INTERACTIVE shell has SIGINT set to ignore, and a
+# signal inherited as ignored cannot be trapped -- so `kill -INT` at a child
+# started with `&` from a script is silently a no-op. The first version of this
+# case did exactly that: it sent SIGINT, the recovery exercise carried on
+# through its next scenario, and `wait` simply blocked until the run finished
+# on its own. SIGTERM is delivered, the TERM trap fires, and the EXIT trap runs
+# the same restoration an operator's ^C would reach -- because an interactive
+# ^C goes to the foreground process GROUP, where SIGINT is not ignored.
 # ---------------------------------------------------------------------------
-log "3/3: an exercise interrupted mid-run must restore what it changed"
+log "3/3: an exercise stopped mid-run must restore what it changed"
 INT_LOG="$EVIDENCE_DIR/refusal-interrupted-recovery.log"
 PERM_BEFORE_INT="$(in_storage "stat -c '%a:%u:%g' /srv/fn/consume")"
 VOLS_BEFORE_INT="$(docker volume ls -q --filter "name=^${PROJECT}_" 2>/dev/null | sort | tr '\n' ',')"
@@ -225,8 +235,8 @@ VOLS_BEFORE_INT="$(docker volume ls -q --filter "name=^${PROJECT}_" 2>/dev/null 
 sh "$SCRIPT_DIR/verify-recovery.sh" > "$INT_LOG" 2>&1 &
 INT_PID=$!
 
-# Interrupt only once it has actually changed something. Interrupting before
-# the first mutation would demonstrate the refusal path again, not this one.
+# Stop it only once it has actually changed something. Stopping before the
+# first mutation would demonstrate the refusal path again, not this one.
 _i=0
 FAULT_SEEN=no
 while [ "$_i" -lt 240 ]; do
@@ -242,9 +252,9 @@ done
 if [ "$FAULT_SEEN" != "yes" ]; then
     kill -TERM "$INT_PID" 2>/dev/null || true
     wait "$INT_PID" 2>/dev/null || true
-    bad "the recovery exercise never started a fault service, so there was nothing to interrupt"
+    bad "the recovery exercise never started a fault service, so there was nothing to stop"
 else
-    kill -INT "$INT_PID" 2>/dev/null || true
+    kill -TERM "$INT_PID" 2>/dev/null || true
     INT_RC=0
     wait "$INT_PID" 2>/dev/null || INT_RC=$?
 
@@ -262,25 +272,25 @@ else
     LOCK_LEFT="$([ -d "$EVIDENCE_DIR/.exercise.lock" ] && echo yes || echo no)"
     TEMPS_LEFT="$(in_storage "ls -1a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-' || true")"
 
-    emit "3. the recovery exercise, interrupted after it started a fault service"
-    emit "   exit status:                  $INT_RC   (expected 130: the INT trap ran)"
+    emit "3. the recovery exercise, stopped after it started a fault service"
+    emit "   exit status:                  $INT_RC   (expected 143: the TERM trap ran)"
     emit "   fault services left behind:   $FAULTS_LEFT   (expected 0)"
     emit "   application services ready:   $RDY1 / $RDY2 / $RDYW   (expected yes/yes/yes)"
     emit "   still on the application net: $NET_ON of 3   (expected 3)"
     emit "   destination permissions:      $PERM_AFTER_INT   (expected $PERM_BEFORE_INT)"
     emit "   project volumes:              $([ "$VOLS_AFTER_INT" = "$VOLS_BEFORE_INT" ] && echo unchanged || echo CHANGED)"
     emit "   exercise lock left held:      $LOCK_LEFT   (expected no)"
-    emit "   staged temporaries present:   $TEMPS_LEFT   (reported: an interrupted publication"
+    emit "   staged temporaries present:   $TEMPS_LEFT   (reported: a publication stopped"
     emit "                                 cannot unlink what it staged, so this is a"
     emit "                                 consequence of the interruption, not a leak"
     emit "                                 of the ordinary path)"
-    [ "${INT_RC:-0}" != "0" ] || bad "the interrupted exercise exited 0, so the interruption was not honoured"
-    [ "${FAULTS_LEFT:-1}" = "0" ] || bad "$FAULTS_LEFT fault service(s) survived the interruption"
-    [ "$RDY1" = "yes" ] && [ "$RDY2" = "yes" ] && [ "$RDYW" = "yes" ] || bad "an application service is not ready after the interruption"
+    [ "${INT_RC:-0}" = "143" ] || bad "the stopped exercise exited $INT_RC, not 143: the TERM trap did not run"
+    [ "${FAULTS_LEFT:-1}" = "0" ] || bad "$FAULTS_LEFT fault service(s) survived the termination"
+    [ "$RDY1" = "yes" ] && [ "$RDY2" = "yes" ] && [ "$RDYW" = "yes" ] || bad "an application service is not ready after the termination"
     [ "${NET_ON:-0}" = "3" ] || bad "only $NET_ON of 3 application services are on the application network"
     [ "$PERM_AFTER_INT" = "$PERM_BEFORE_INT" ] || bad "destination permissions are $PERM_AFTER_INT, were $PERM_BEFORE_INT"
-    [ "$VOLS_AFTER_INT" = "$VOLS_BEFORE_INT" ] || bad "the set of project volumes changed across the interrupted run"
-    [ "$LOCK_LEFT" = "no" ] || bad "the interrupted exercise left the exercise lock held"
+    [ "$VOLS_AFTER_INT" = "$VOLS_BEFORE_INT" ] || bad "the set of project volumes changed across the stopped run"
+    [ "$LOCK_LEFT" = "no" ] || bad "the stopped exercise left the exercise lock held"
 fi
 emit ""
 
