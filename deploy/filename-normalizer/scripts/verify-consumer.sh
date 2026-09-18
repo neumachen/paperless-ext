@@ -469,9 +469,33 @@ fi
 emit ""
 
 # Nothing this exercise did not create may have been consumed or removed.
-LEFT_ALONE="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -vc '^consumer-' || true")"
-emit "documents from earlier runs still in the directory: ${LEFT_ALONE:-unknown} of ${IGNORED_COUNT:-unknown}"
-[ "${LEFT_ALONE:-0}" = "${IGNORED_COUNT:-0}" ] || bad "the consumer took ${IGNORED_COUNT} - ${LEFT_ALONE} documents this exercise did not create"
+#
+# The NAMES are compared, not two counts. Counting could not carry this claim
+# and quietly failed on it: the ignore list was built with os.listdir(), which
+# includes the `.fn-*` temporaries other exercises strand in the destination,
+# while the closing count was `ls -1 | grep -vc '^consumer-'`, which lists no
+# dotfiles and also drops entries an EARLIER run of this exercise left behind.
+# Both differences read as documents the consumer had eaten -- 311 before
+# against 301 after, with nothing actually missing.
+GONE_JSON="$(printf '%s' "$IGNORED_JSON" | docker run --rm -i \
+    -v "${PROJECT}_fn-consume:/consume:ro" "$UTIL_PY_IMAGE" python3 -c "
+import json, os, sys
+before = set(json.load(sys.stdin))
+now = set(os.listdir('/consume'))
+print(json.dumps(sorted(before - now)))" 2>/dev/null || echo unreadable)"
+if [ "$GONE_JSON" = "unreadable" ]; then
+    bad "the destination directory could not be read back, so nothing was established about what survived"
+    GONE_COUNT=unknown
+else
+    GONE_COUNT="$(printf '%s' "$GONE_JSON" | docker run --rm -i "$UTIL_PY_IMAGE" \
+        python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo unknown)"
+fi
+emit "entries present before this exercise:               ${IGNORED_COUNT:-unknown}"
+emit "of those, missing afterwards:                      ${GONE_COUNT:-unknown}   (expected 0, compared by name)"
+if [ "${GONE_COUNT:-1}" != "0" ]; then
+    emit "   missing: $GONE_JSON"
+    bad "${GONE_COUNT} entries this exercise did not create are gone from the destination"
+fi
 
 # The ignore list is a snapshot taken before the consumer started, so it cannot
 # protect a document some OTHER work delivers while this exercise is running:
