@@ -1355,7 +1355,11 @@ log "11/12: an old live attempt resumes after its claim expired"
 DOC11="a7-stale-$STAMP.pdf"
 NAME11="a7-stale-$LOWER.pdf"
 
-start_fault renamer-hold FN_FAULT_HOLD=90s FN_PUBLISH_TAKEOVER_AFTER=10s || exit 1
+# Prefetch 1 on the holder. With the default of 2 it holds the duplicate
+# delivery published below as well, the sibling never sees the job, and the
+# holder simply wakes up and finishes the work -- which is correct, and
+# measures nothing about a takeover.
+start_fault renamer-hold FN_FAULT_HOLD=90s FN_PUBLISH_TAKEOVER_AFTER=10s FN_RENAMER_PREFETCH=1 || exit 1
 sleep 6
 submit "$DOC11"
 sleep 12
@@ -1363,29 +1367,51 @@ JOB11="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC11';")"
 HOLDER11_A="$(psqlq "SELECT coalesce(publish_claimed_by,'-') FROM jobs WHERE job_id = '$JOB11';")"
 STATE11_A="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB11';")"
 
-# A sibling arrives once the window has expired for the holder.
+# A sibling arrives once the window has expired for the holder, and is given a
+# delivery of its own: the holder is sitting on the original one.
 start_fault renamer-taker FN_PUBLISH_TAKEOVER_AFTER=10s || exit 1
+sleep 4
+compose exec -T rabbitmq rabbitmqadmin \
+    --vhost "${FN_AMQP_VHOST:-filename-normalizer}" \
+    --username "${FN_AMQP_USER:-fn_app}" \
+    --password "$(cat "$DEPLOY_DIR/secrets/fn_amqp_password")" \
+    --non-interactive \
+    publish message \
+    --exchange "${FN_AMQP_EXCHANGE:-filename_normalizer.jobs}" \
+    --routing-key "${FN_AMQP_ROUTING_KEY:-normalize}" \
+    --properties '{"delivery_mode":2,"content_type":"application/json"}' \
+    --payload "{\"contract_version\":1,\"job_id\":\"$JOB11\",\"attempt\":2,\"enqueued_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" >/dev/null 2>&1 \
+    && SIBLING11=yes || SIBLING11=no
+emit "   a delivery was given to the sibling: ${SIBLING11:-no}"
 CLOSED11="$(await_state "$DOC11" "delivered held uncertain" 180)"
 RECEIPTS11_MID="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB11';")"
 COPIES11_MID="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^a7-stale-$LOWER' || true")"
 
 # Now the old attempt wakes up, 90s after its claim.
+# Wait for THIS job to reach a conclusion in the HOLDER's log.
+#
+# The previous form polled the holder's whole log for an unanchored alternation
+# and also broke as soon as `ps -q` looked empty, so it stopped seconds after
+# the sibling acted -- a minute before the holder's 90-second pause ended. It
+# then reported that the holder had never stood down, which was a statement
+# about when the measurement was taken and nothing else. The pause is 90s, so
+# this waits past it, filters by job, and uses an ERE that is the same on every
+# grep this might run under.
 _i=0
-while [ "$_i" -lt 150 ]; do
-    if compose --profile fault logs renamer-hold 2>/dev/null \
-        | grep -q 'publication_superseded\|publication_in_progress\|delivery_settled'; then
+while [ "$_i" -lt 210 ]; do
+    if compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB11" \
+        | grep -qE 'publication_superseded|publication_in_progress|document_published|delivery_settled'; then
         break
     fi
-    _alive="$(compose --profile fault ps -q renamer-hold 2>/dev/null | head -1)"
-    [ -z "$_alive" ] && break
-    sleep 3; _i=$((_i + 3))
+    sleep 5; _i=$((_i + 5))
 done
 sleep 8
+emit "   waited for the holder to resume: ${_i}s (its pause is 90s)"
 # Either stand-down is correct and which one depends on whether the sibling
 # recorded a receipt or merely took the claim; both are counted, and the events
 # themselves go into the report so the sequence is recorded rather than guessed.
 SUPERSEDED11="$(compose --profile fault logs renamer-hold 2>/dev/null \
-    | grep "$JOB11" | grep -c 'publication_superseded\|publication_in_progress' || true)"
+    | grep "$JOB11" | grep -cE 'publication_superseded|publication_in_progress' || true)"
 STOODDOWN11="$(compose --profile fault logs renamer-hold 2>/dev/null \
     | grep "$JOB11" \
     | grep -oE 'publication_superseded|publication_in_progress|document_published|delivery_settled' \
@@ -1427,6 +1453,9 @@ emit "   source preserved:             $SRC11   (expected yes)"
 # The invariant, whichever way the sibling went: the old attempt adds nothing.
 # It must not create a document, must not write a receipt, and must not change
 # the outcome somebody else recorded while it was paused.
+SIBLING_ACTED11="$(compose --profile fault logs renamer-taker 2>/dev/null | grep -c "$JOB11" || true)"
+emit "   the sibling handled the job:  $SIBLING_ACTED11 log line(s)   (expected >= 1)"
+[ "${SIBLING_ACTED11:-0}" -ge 1 ] || bad "the sibling never saw this job, so no takeover was exercised and nothing here is about one"
 [ "${SUPERSEDED11:-0}" -ge 1 ] || bad "the superseded attempt never reported standing down; it may have linked past a decided outcome"
 [ "${COPIES11:-0}" = "${COPIES11_MID:-0}" ] || bad "documents went from $COPIES11_MID to $COPIES11 when the old attempt resumed"
 [ "${RECEIPTS11:-0}" = "${RECEIPTS11_MID:-0}" ] || bad "receipts went from $RECEIPTS11_MID to $RECEIPTS11 when the old attempt resumed"

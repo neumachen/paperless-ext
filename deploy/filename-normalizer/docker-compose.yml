@@ -568,6 +568,12 @@ services:
       # and the exercise read "a receipt already exists" as a product fault.
       FN_FAULT_POINTS: ${FN_FAULT_POINTS:-hold_after_claim}
       FN_FAULT_HOLD: ${FN_FAULT_HOLD:-90s}
+      # Settable, because a paused holder with the default prefetch of 2 holds
+      # the duplicate delivery an exercise publishes for a SIBLING to pick up.
+      # The sibling then never sees the job, no takeover happens, and the
+      # holder eventually wakes and does the work itself -- correct behaviour,
+      # and a measurement of nothing.
+      FN_RENAMER_PREFETCH: ${FN_RENAMER_PREFETCH:-2}
     # Reset, like every other fault-profile instance. Inheriting the renamer
     # anchor's published port means inheriting renamer-1's: this service would
     # take 18081 and renamer-1 would fail to start with exit 128 -- which
