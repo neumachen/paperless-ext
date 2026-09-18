@@ -179,6 +179,32 @@ heal_network() {
 # at that line and leave everything after it undone.
 restore_perm() { :; }
 
+# The foreign file scenario 5 plants is a resource this invocation created, so
+# it belongs on the restore path like a fault container does. Removed inline
+# when the scenario completes; removed by restore when the scenario does not --
+# an interrupted run used to leave it in the real destination directory.
+#
+# Gated on identity in both places: if the name now leads to a different inode,
+# it is somebody else's file and this exercise does not touch it.
+PLANTED_PATH=""
+PLANTED_INODE=""
+cleanup_planted() {
+    if [ -z "$PLANTED_PATH" ]; then return 0; fi
+    _cp_now="$(in_storage "ls -i '$PLANTED_PATH' 2>/dev/null | awk '{print \$1}'")"
+    if [ -z "$_cp_now" ]; then
+        PLANTED_PATH=""; PLANTED_INODE=""
+        return 0
+    fi
+    if [ "$_cp_now" != "$PLANTED_INODE" ]; then
+        echo "note: $PLANTED_PATH is inode $_cp_now, not the planted $PLANTED_INODE; leaving it alone." >&2
+        PLANTED_PATH=""; PLANTED_INODE=""
+        return 1
+    fi
+    in_storage "rm -f '$PLANTED_PATH' 2>/dev/null; true" >/dev/null 2>&1 || true
+    PLANTED_PATH=""; PLANTED_INODE=""
+    return 0
+}
+
 RESTORED=0
 # Set the moment this invocation first changes the running stack. Before that
 # there is nothing to restore, and restoring anyway is a mutation of its own:
@@ -199,6 +225,7 @@ restore() {
     # left disconnected is the most damaging thing this script can leave behind.
     heal_network
     restore_perm || _r_perm_failed=1
+    cleanup_planted || true
     drop_fault renamer-fault renamer-hold renamer-altfs renamer-tinyfs renamer-permdenied renamer-tmpfsdest
 
     # Recreate rather than start: a service that was recreated with an
@@ -717,6 +744,8 @@ CLAIMINO5="$(psqlq "SELECT coalesce(publish_inode::text,'-') FROM jobs WHERE job
 # only thing that distinguishes it from this job's own work.
 in_storage "head -c 8192 /dev/zero | tr '\\0' 'q' > '/srv/fn/consume/$RESERVED5'" >/dev/null 2>&1
 FOREIGN_INO5="$(in_storage "ls -i '/srv/fn/consume/$RESERVED5' 2>/dev/null | awk '{print \$1}'")"
+PLANTED_PATH="/srv/fn/consume/$RESERVED5"
+PLANTED_INODE="$FOREIGN_INO5"
 SAMEBYTES5="$(in_storage "md5sum '/srv/fn/incoming/$DOC5' '/srv/fn/consume/$RESERVED5' 2>/dev/null | awk '{print \$1}' | sort -u | wc -l")"
 
 drop_fault renamer-fault
@@ -752,13 +781,15 @@ emit "   foreign file still intact:    $([ "$STILL_FOREIGN5" = "$FOREIGN_INO5" ]
 # is re-read here and the removal is gated on it.
 NOW5="$(in_storage "ls -i '/srv/fn/consume/$RESERVED5' 2>/dev/null | awk '{print \$1}'")"
 if [ -n "$NOW5" ] && [ "$NOW5" = "$FOREIGN_INO5" ]; then
-    in_storage "rm -f '/srv/fn/consume/$RESERVED5' 2>/dev/null; true" >/dev/null 2>&1 || true
+    cleanup_planted || true
     GONE5="$(in_storage "test -e '/srv/fn/consume/$RESERVED5' && echo present || echo removed")"
     emit "   the planted intruder was:     $GONE5 afterwards (inode $FOREIGN_INO5, the one this exercise planted)"
     [ "$GONE5" = "removed" ] || bad "the exercise left its planted file in the destination"
 elif [ -z "$NOW5" ]; then
+    PLANTED_PATH=""; PLANTED_INODE=""
     emit "   the planted intruder was:     already gone before cleanup"
 else
+    PLANTED_PATH=""; PLANTED_INODE=""
     emit "   the planted intruder was:     NOT removed: inode $NOW5 is not the planted $FOREIGN_INO5"
     bad "the file at the reserved name is not the one this exercise planted; leaving it alone"
 fi

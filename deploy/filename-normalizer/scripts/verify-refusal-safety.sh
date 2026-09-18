@@ -92,7 +92,7 @@ BEFORE="$(snapshot)"
 # ---------------------------------------------------------------------------
 # 1. Every exercise refuses while another holds the lock, and mutates nothing.
 # ---------------------------------------------------------------------------
-log "1/2: each exercise must refuse while the lock is held, without touching anything"
+log "1/3: each exercise must refuse while the lock is held, without touching anything"
 # `mkdir`, not `mkdir -p`. With -p this succeeds against a lock another
 # exercise is holding, and the cleanup at the end of this script would then
 # remove somebody else's lock -- an ownership failure in the exercise whose
@@ -138,7 +138,7 @@ emit ""
 # 2. The consumer exercise refuses a pre-existing instance AND leaves its state
 #    alone. This is the one that used to destroy a database on the way past.
 # ---------------------------------------------------------------------------
-log "2/2: a pre-existing consumer volume must survive the refusal"
+log "2/3: a pre-existing consumer volume must survive the refusal"
 if [ -n "$(docker volume ls -q --filter "name=^${DECOY_VOL}$" 2>/dev/null)" ]; then
     emit "2. SKIPPED: $DECOY_VOL already exists and is not this exercise's to use"
 else
@@ -208,18 +208,101 @@ else
 fi
 emit ""
 
+# ---------------------------------------------------------------------------
+# 3. An exercise INTERRUPTED mid-run restores what it changed.
+#
+# Refusal is the easy path: nothing has happened yet. The hard one is a run
+# that has already started fault services, cut containers off the network and
+# revoked directory permissions when the operator presses ^C. Every exercise
+# installs `trap 'exit 130' INT` so that its EXIT trap -- the restoration --
+# still runs, and that arrangement had never been exercised.
+# ---------------------------------------------------------------------------
+log "3/3: an exercise interrupted mid-run must restore what it changed"
+INT_LOG="$EVIDENCE_DIR/refusal-interrupted-recovery.log"
+PERM_BEFORE_INT="$(in_storage "stat -c '%a:%u:%g' /srv/fn/consume")"
+VOLS_BEFORE_INT="$(docker volume ls -q --filter "name=^${PROJECT}_" 2>/dev/null | sort | tr '\n' ',')"
+
+sh "$SCRIPT_DIR/verify-recovery.sh" > "$INT_LOG" 2>&1 &
+INT_PID=$!
+
+# Interrupt only once it has actually changed something. Interrupting before
+# the first mutation would demonstrate the refusal path again, not this one.
+_i=0
+FAULT_SEEN=no
+while [ "$_i" -lt 240 ]; do
+    if [ -n "$(compose --profile fault ps -aq renamer-fault 2>/dev/null)" ]; then
+        FAULT_SEEN=yes
+        break
+    fi
+    kill -0 "$INT_PID" 2>/dev/null || break
+    sleep 2
+    _i=$((_i + 2))
+done
+
+if [ "$FAULT_SEEN" != "yes" ]; then
+    kill -TERM "$INT_PID" 2>/dev/null || true
+    wait "$INT_PID" 2>/dev/null || true
+    bad "the recovery exercise never started a fault service, so there was nothing to interrupt"
+else
+    kill -INT "$INT_PID" 2>/dev/null || true
+    INT_RC=0
+    wait "$INT_PID" 2>/dev/null || INT_RC=$?
+
+    FAULTS_LEFT="$(compose --profile fault ps -aq renamer-fault renamer-hold renamer-altfs \
+        renamer-tinyfs renamer-permdenied renamer-tmpfsdest 2>/dev/null | wc -l | tr -d ' ')"
+    RDY1="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    RDY2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    RDYW="$(compose exec -T watcher /usr/local/bin/fn-watcher healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    NET_ON="$(for _c in watcher renamer-1 renamer-2; do
+        _cid="$(compose ps -q "$_c" 2>/dev/null | head -1)"
+        docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$_cid" 2>/dev/null
+    done | grep -c "${PROJECT}_fn" || true)"
+    PERM_AFTER_INT="$(in_storage "stat -c '%a:%u:%g' /srv/fn/consume")"
+    VOLS_AFTER_INT="$(docker volume ls -q --filter "name=^${PROJECT}_" 2>/dev/null | sort | tr '\n' ',')"
+    LOCK_LEFT="$([ -d "$EVIDENCE_DIR/.exercise.lock" ] && echo yes || echo no)"
+    TEMPS_LEFT="$(in_storage "ls -1a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-' || true")"
+
+    emit "3. the recovery exercise, interrupted after it started a fault service"
+    emit "   exit status:                  $INT_RC   (expected 130: the INT trap ran)"
+    emit "   fault services left behind:   $FAULTS_LEFT   (expected 0)"
+    emit "   application services ready:   $RDY1 / $RDY2 / $RDYW   (expected yes/yes/yes)"
+    emit "   still on the application net: $NET_ON of 3   (expected 3)"
+    emit "   destination permissions:      $PERM_AFTER_INT   (expected $PERM_BEFORE_INT)"
+    emit "   project volumes:              $([ "$VOLS_AFTER_INT" = "$VOLS_BEFORE_INT" ] && echo unchanged || echo CHANGED)"
+    emit "   exercise lock left held:      $LOCK_LEFT   (expected no)"
+    emit "   staged temporaries present:   $TEMPS_LEFT   (reported: an interrupted publication"
+    emit "                                 cannot unlink what it staged, so this is a"
+    emit "                                 consequence of the interruption, not a leak"
+    emit "                                 of the ordinary path)"
+    [ "${INT_RC:-0}" != "0" ] || bad "the interrupted exercise exited 0, so the interruption was not honoured"
+    [ "${FAULTS_LEFT:-1}" = "0" ] || bad "$FAULTS_LEFT fault service(s) survived the interruption"
+    [ "$RDY1" = "yes" ] && [ "$RDY2" = "yes" ] && [ "$RDYW" = "yes" ] || bad "an application service is not ready after the interruption"
+    [ "${NET_ON:-0}" = "3" ] || bad "only $NET_ON of 3 application services are on the application network"
+    [ "$PERM_AFTER_INT" = "$PERM_BEFORE_INT" ] || bad "destination permissions are $PERM_AFTER_INT, were $PERM_BEFORE_INT"
+    [ "$VOLS_AFTER_INT" = "$VOLS_BEFORE_INT" ] || bad "the set of project volumes changed across the interrupted run"
+    [ "$LOCK_LEFT" = "no" ] || bad "the interrupted exercise left the exercise lock held"
+fi
+emit ""
+
 AFTER="$(snapshot)"
-# Everything but the destination's entry count must be identical. The count is
-# compared as an inequality because unrelated work delivering a document while
-# this runs is not a change this exercise made, and failing on it would report
-# somebody else's successful delivery as a refusal that mutated the stack. A
-# count that FELL is still a failure: that is something being destroyed.
-BEFORE_FIXED="$(printf '%s\n' "$BEFORE" | grep -v '^consume_entries=')"
-AFTER_FIXED="$(printf '%s\n' "$AFTER" | grep -v '^consume_entries=')"
+# Two fields are compared differently here, and only here.
+#
+# Container ids: case 3 interrupts a run that had already changed the stack, and
+# restoring it RECREATES the three application services. New container ids are
+# what a working restoration looks like, so they are excluded from this
+# comparison -- case 1, where nothing may change at all, compares them strictly.
+#
+# The destination's entry count is compared as an inequality, because unrelated
+# work delivering a document while this runs is not a change this exercise
+# made; failing on it would report somebody else's successful delivery as a
+# mutation. A count that FELL is still a failure: that is something destroyed.
+BEFORE_FIXED="$(printf '%s\n' "$BEFORE" | grep -v '^consume_entries=' | grep -v '_id=')"
+AFTER_FIXED="$(printf '%s\n' "$AFTER" | grep -v '^consume_entries=' | grep -v '_id=')"
 BEFORE_N="$(printf '%s\n' "$BEFORE" | sed -n 's/^consume_entries=//p')"
 AFTER_N="$(printf '%s\n' "$AFTER" | sed -n 's/^consume_entries=//p')"
 if [ "$BEFORE_FIXED" = "$AFTER_FIXED" ] && [ "${AFTER_N:-0}" -ge "${BEFORE_N:-0}" ]; then
-    emit "The stack is exactly as it was found."
+    emit "The stack ends as it began: same configuration, same volumes, same"
+    emit "destination permissions, nothing removed."
     emit "  (destination entries ${BEFORE_N:-?} -> ${AFTER_N:-?}: nothing was removed)"
 else
     bad "the stack did not end as it began"
