@@ -127,6 +127,16 @@ const (
 	CategoryDispatchReclaimed Category = "dispatch_reclaimed"
 	// CategoryLedgerUnavailable records a durable-write failure.
 	CategoryLedgerUnavailable Category = "ledger_unavailable"
+	// CategoryPolicyTransliterates records a configured rule that would change
+	// a letter rather than the shape of a name -- turning "für" into "fur".
+	// The naming package emits it; it belongs here because a category the
+	// enumeration does not list is a category the gRPC reason counts cannot
+	// report, so an operator asking "why is work being held" gets an answer
+	// with a hole in it.
+	CategoryPolicyTransliterates Category = "policy_transliterates"
+	// CategoryPolicyExpansionTooLarge records rules whose projected output
+	// exceeds the configured bound, refused before anything is allocated.
+	CategoryPolicyExpansionTooLarge Category = "policy_expansion_too_large"
 )
 
 // String renders the category for logs and metric labels.
@@ -157,6 +167,8 @@ func Categories() []Category {
 		CategoryUnsupportedContract,
 		CategoryDispatchReclaimed,
 		CategoryLedgerUnavailable,
+		CategoryPolicyTransliterates,
+		CategoryPolicyExpansionTooLarge,
 	}
 }
 

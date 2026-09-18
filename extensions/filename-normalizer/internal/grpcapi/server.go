@@ -405,6 +405,16 @@ func (s *Server) PreviewName(_ context.Context, req *pb.PreviewNameRequest) (*pb
 			if err != nil {
 				break
 			}
+			// Publication verifies the FINAL name -- suffix included -- against
+			// the policy's own invariants immediately before reserving it, and
+			// holds the job at the first candidate that fails. A preview that
+			// advertised a name the publisher would refuse was telling an
+			// operator something the system would not do: with a rule matching
+			// `^foo_01$`, foo_01.pdf normalizes back to foo.pdf, so it is not a
+			// name this policy can publish. Stop where publication stops.
+			if err := policy.VerifyFinalName(c, previewJobID); err != nil {
+				break
+			}
 			r.CollisionCandidates = append(r.CollisionCandidates, c)
 		}
 		out.Results = append(out.Results, r)

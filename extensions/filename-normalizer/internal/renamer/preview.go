@@ -88,13 +88,33 @@ func (p *Previewer) report(ctx context.Context) {
 			switch {
 			case job.PolicyVersion != p.cfg.Policy.Identity:
 				byCategory[string(jobs.CategoryPolicyMismatch)]++
+			// Work accepted before the destination was recorded is held by
+			// real processing and must be counted as held here too. Counting
+			// it as publishable told an operator that ambiguous historical
+			// work would go out under the current configuration, which is the
+			// opposite of what the pipeline does with it.
+			case job.DestinationRootUnknown:
+				byCategory[string(jobs.CategoryDestinationMismatch)]++
 			case job.DestinationRoot != nil && *job.DestinationRoot != "" && *job.DestinationRoot != p.cfg.Storage.Consume:
 				byCategory[string(jobs.CategoryDestinationMismatch)]++
 			default:
-				if _, err := p.cfg.Policy.Normalize(job.SourceName, job.JobID); err != nil {
+				res, err := p.cfg.Policy.Normalize(job.SourceName, job.JobID)
+				switch {
+				case err != nil:
 					byCategory[naming.HoldCategory(err)]++
-				} else {
-					wouldPublish++
+				default:
+					// The name publication would actually reserve has to
+					// satisfy the policy's invariants, and publication holds
+					// the job when it does not. A preview that skipped that
+					// check counted work as publishable that the pipeline
+					// would refuse.
+					if c, cerr := p.cfg.Policy.Candidate(res, 0); cerr != nil {
+						byCategory[string(jobs.CategoryNameTooLong)]++
+					} else if verr := p.cfg.Policy.VerifyFinalName(c, job.JobID); verr != nil {
+						byCategory[naming.HoldCategory(verr)]++
+					} else {
+						wouldPublish++
+					}
 				}
 			}
 		}
