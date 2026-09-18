@@ -319,7 +319,7 @@ restore() {
 }
 
 exercise_lock recovery || exit 1
-trap 'report_keep; restore' EXIT
+trap 'restore; report_keep' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
