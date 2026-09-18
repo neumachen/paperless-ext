@@ -561,7 +561,12 @@ services:
       FN_INSTANCE: renamer-hold
       FN_DB_APPLY_MIGRATIONS: "false"
       FN_RENAMER_CONCURRENCY: "1"
-      FN_FAULT_POINTS: hold_after_claim
+      # Substitutable, defaulting to the point this service was added for.
+      # Hardcoding it meant an exercise asking for hold_after_link got
+      # hold_after_claim without being told, and then measured a sequence that
+      # had not happened: the holder paused before its link instead of after it,
+      # and the exercise read "a receipt already exists" as a product fault.
+      FN_FAULT_POINTS: ${FN_FAULT_POINTS:-hold_after_claim}
       FN_FAULT_HOLD: ${FN_FAULT_HOLD:-90s}
     # Reset, like every other fault-profile instance. Inheriting the renamer
     # anchor's published port means inheriting renamer-1's: this service would

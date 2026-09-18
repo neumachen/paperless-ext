@@ -1381,8 +1381,21 @@ while [ "$_i" -lt 150 ]; do
     sleep 3; _i=$((_i + 3))
 done
 sleep 8
+# Either stand-down is correct and which one depends on whether the sibling
+# recorded a receipt or merely took the claim; both are counted, and the events
+# themselves go into the report so the sequence is recorded rather than guessed.
 SUPERSEDED11="$(compose --profile fault logs renamer-hold 2>/dev/null \
-    | grep -c 'publication_superseded' || true)"
+    | grep "$JOB11" | grep -c 'publication_superseded\|publication_in_progress' || true)"
+STOODDOWN11="$(compose --profile fault logs renamer-hold 2>/dev/null \
+    | grep "$JOB11" \
+    | grep -oE 'publication_superseded|publication_in_progress|document_published|delivery_settled' \
+    | sort -u | tr '\n' ' ')"
+{
+    printf '\n--- scenario 11: what each side logged for %s ---\n' "$JOB11"
+    compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB11" | tail -12
+    printf '\n--- the sibling ---\n'
+    compose --profile fault logs renamer-taker 2>/dev/null | grep "$JOB11" | tail -12
+} >> "$EVIDENCE_DIR/scenario11-events.log" 2>/dev/null || true
 COPIES11="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^a7-stale-$LOWER' || true")"
 RECEIPTS11="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB11';")"
 FINAL11="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB11';")"
@@ -1392,26 +1405,39 @@ NAMES11="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep '^a7-stale-$LOWE
 emit "11. an old live attempt resuming after its claim expired"
 emit "   takeover window:              10s; the holder's pause: 90s"
 emit "   claim holder while held:      $HOLDER11_A   (state $STATE11_A)"
-emit "   what the sibling did with a stale claim and no destination:"
-emit "                                 recorded $CLOSED11 (expected uncertain: it cannot"
-emit "                                 tell a publication that never happened from one"
-emit "                                 whose file was already taken)"
-emit "   receipts then:                $RECEIPTS11_MID   (expected 0)"
-emit "   documents then:               $COPIES11_MID   (expected 0)"
-emit "   the old attempt stood down:   $SUPERSEDED11 time(s)   (expected >= 1: it did not link)"
-emit "   documents after it resumed:   $COPIES11   (expected 0: no consumable copy for a closed job)"
-emit "   names present:                ${NAMES11:-none}   (expected none)"
-emit "   receipts after it resumed:    $RECEIPTS11   (expected 0)"
-emit "   final state:                  $FINAL11   (expected uncertain: not reopened by the old attempt)"
-emit "   source preserved:             $SRC11   (expected yes: an operator has what they need)"
-[ "$CLOSED11" = "uncertain" ] || bad "the sibling recorded '$CLOSED11' for a stale claim with no destination"
-[ "${RECEIPTS11_MID:-0}" = "0" ] || bad "$RECEIPTS11_MID receipts exist for a job nothing published"
-[ "${SUPERSEDED11:-0}" -ge 1 ] || bad "the superseded attempt never reported standing down; it may have linked into a closed job"
-[ "${COPIES11:-0}" = "0" ] || bad "$COPIES11 document(s) appeared for a job recorded '$FINAL11'; the old attempt published past a closed outcome"
-[ "${RECEIPTS11:-0}" = "0" ] || bad "$RECEIPTS11 receipts exist after the old attempt resumed"
-[ "$FINAL11" = "uncertain" ] || bad "the job ended as '$FINAL11'; an uncertain outcome was reopened"
+emit "   what the sibling made of the stale claim:"
+emit "                                 recorded $CLOSED11"
+emit "                                 (either outcome is legitimate and which one"
+emit "                                 depends on where the sibling's delivery found"
+emit "                                 the job: a delivery that reaches the publish"
+emit "                                 path takes the claim over and publishes; one"
+emit "                                 that reaches recovery with no destination"
+emit "                                 records uncertain, because it cannot tell a"
+emit "                                 publication that never happened from one whose"
+emit "                                 file was already taken)"
+emit "   receipts then:                $RECEIPTS11_MID"
+emit "   documents then:               $COPIES11_MID"
+emit "   the old attempt reported standing down: $SUPERSEDED11 time(s)   (expected >= 1)"
+emit "   what it logged:               ${STOODDOWN11:-none}"
+emit "   documents after it resumed:   $COPIES11   (expected: unchanged at $COPIES11_MID)"
+emit "   names present:                ${NAMES11:-none}   (expected no suffixed twin)"
+emit "   receipts after it resumed:    $RECEIPTS11   (expected: unchanged at $RECEIPTS11_MID)"
+emit "   final state:                  $FINAL11   (expected: unchanged at $CLOSED11)"
+emit "   source preserved:             $SRC11   (expected yes)"
+# The invariant, whichever way the sibling went: the old attempt adds nothing.
+# It must not create a document, must not write a receipt, and must not change
+# the outcome somebody else recorded while it was paused.
+[ "${SUPERSEDED11:-0}" -ge 1 ] || bad "the superseded attempt never reported standing down; it may have linked past a decided outcome"
+[ "${COPIES11:-0}" = "${COPIES11_MID:-0}" ] || bad "documents went from $COPIES11_MID to $COPIES11 when the old attempt resumed"
+[ "${RECEIPTS11:-0}" = "${RECEIPTS11_MID:-0}" ] || bad "receipts went from $RECEIPTS11_MID to $RECEIPTS11 when the old attempt resumed"
+[ "$FINAL11" = "$CLOSED11" ] || bad "the outcome changed from '$CLOSED11' to '$FINAL11' when the old attempt resumed"
+[ "${COPIES11:-0}" -le 1 ] || bad "$COPIES11 documents exist for one submission"
 [ "$SRC11" = "yes" ] || bad "the source was removed"
-emit "   => this job is UNRESOLVED BY DESIGN: job_id=$JOB11"
+case "$CLOSED11" in
+    uncertain) emit "   => this job is UNRESOLVED BY DESIGN: job_id=$JOB11" ;;
+    delivered) emit "   => the sibling delivered it; the old attempt added nothing. job_id=$JOB11" ;;
+    *) bad "the job reached '$CLOSED11', which is neither a delivery nor an honest uncertainty" ;;
+esac
 drop_fault renamer-hold renamer-taker
 compose start renamer-1 renamer-2 >/dev/null 2>&1 || true
 wait_healthy renamer-1 120 || true

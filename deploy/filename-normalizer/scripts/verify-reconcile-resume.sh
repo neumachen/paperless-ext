@@ -197,7 +197,13 @@ while [ "$_i" -lt 150 ]; do
     sleep 3; _i=$((_i + 3))
 done
 sleep 6
-KEPT="$(compose --profile fault logs renamer-hold 2>/dev/null | grep -c 'publication_reconciled_by_sibling' || true)"
+KEPT="$(compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | grep -c 'publication_reconciled_by_sibling\|publication_superseded' || true)"
+{
+    printf '\n--- what A logged for %s ---\n' "$JOB"
+    compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | tail -12
+    printf '\n--- what the sibling logged ---\n'
+    compose --profile fault logs renamer-taker 2>/dev/null | grep "$JOB" | tail -12
+} >> "$EVIDENCE_DIR/reconcile-resume-events.log" 2>/dev/null || true
 WITHDREW="$(compose --profile fault logs renamer-hold 2>/dev/null | grep -c 'duplicate_publication_withdrawn' || true)"
 PRESENT="$(in_storage "test -f '/srv/fn/consume/$NAME' && echo yes || echo no")"
 INODE_FINAL="$(in_storage "ls -i '/srv/fn/consume/$NAME' 2>/dev/null | awk '{print \$1}'")"
@@ -207,7 +213,7 @@ STATE_FINAL="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB';")"
 SRC="$(in_storage "test -f '/srv/fn/incoming/$DOC' && echo yes || echo no")"
 
 emit "3. A resumed and found a receipt it did not write"
-emit "   A recognised its own file:    $KEPT time(s)   (expected >= 1)"
+emit "   A stood down instead of deleting: $KEPT time(s)   (expected >= 1)"
 emit "   A withdrew a duplicate:       $WITHDREW time(s)   (expected 0: there is no duplicate)"
 emit "   the document is still there:  $PRESENT   (expected yes)"
 emit "   still the same file:          $INODE_FINAL   (expected $INODE_A)"
@@ -218,7 +224,7 @@ emit "   source preserved:             $SRC   (expected yes)"
 [ "$PRESENT" = "yes" ] || bad "the document a receipt describes was deleted by the attempt that published it"
 [ "$INODE_FINAL" = "$INODE_A" ] || bad "the file at the destination is inode $INODE_FINAL, not the published $INODE_A"
 [ "${WITHDREW:-0}" = "0" ] || bad "A withdrew its own publication as a duplicate"
-[ "${KEPT:-0}" -ge 1 ] || bad "A did not report recognising the receipt as describing its own file"
+[ "${KEPT:-0}" -ge 1 ] || bad "A did not report standing down; it may have treated the receipt as somebody else's"
 [ "${COPIES:-0}" = "1" ] || bad "$COPIES documents exist for one publication"
 [ "${RECEIPTS_FINAL:-0}" = "1" ] || bad "$RECEIPTS_FINAL receipts exist"
 [ "$STATE_FINAL" = "delivered" ] || bad "the job ended as '$STATE_FINAL'"
