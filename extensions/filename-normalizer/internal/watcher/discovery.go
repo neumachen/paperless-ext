@@ -270,7 +270,31 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 
 	// Fingerprint before registering: the renamer verifies its working copy
 	// against this value, which is how a source that changes later is caught.
-	sum, size, err := storage.Fingerprint(entry.Path)
+	//
+	// Read through a descriptor opened from the root a component at a time,
+	// and hashed as the descriptor -- not by handing the pathname back to the
+	// kernel a second time. The old code inspected the path, closed it, and
+	// then re-opened it to hash: a parent directory replaced by a symlink
+	// pointing outside the incoming root in between made those bytes come from
+	// outside the accepted roots. The identity re-check afterwards caught it,
+	// but catching it afterwards is not containment -- the read had happened.
+	f, opened, err := storage.Open(root, name, d.cfg.Discovery.Recursive)
+	if err != nil {
+		d.base.Metrics.Discovered.WithLabelValues(storage.RejectionCategory(err)).Inc()
+		d.log.Warn("could not open a submission for fingerprinting",
+			slog.String("event", "entry_rejected"),
+			slog.String("category", storage.RejectionCategory(err)))
+		return false
+	}
+	defer f.Close()
+	if !storage.SameFile(entry, opened) {
+		d.base.Metrics.Discovered.WithLabelValues("unstable").Inc()
+		d.log.Info("submission changed between inspection and reading; leaving it for the next scan",
+			slog.String("event", "entry_unstable"))
+		return false
+	}
+
+	sum, size, err := storage.FingerprintFile(f)
 	if err != nil {
 		d.base.Metrics.Discovered.WithLabelValues(storage.RejectionCategory(err)).Inc()
 		d.log.Warn("could not fingerprint a submission",
@@ -279,12 +303,11 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 		return false
 	}
 
-	// The file must not have changed while it was being read.
-	after, err := storage.InspectRel(root, name)
-	if !d.cfg.Discovery.Recursive {
-		after, err = storage.Inspect(root, name)
-	}
-	if err != nil || !storage.SameFile(entry, after) {
+	// The file must not have changed while it was being read. Asked of the
+	// same descriptor, so this is about the bytes that were actually hashed
+	// rather than about whatever the name leads to now.
+	st, serr := f.Stat()
+	if serr != nil || st.Size() != opened.Size || !st.ModTime().Equal(opened.ModTime) {
 		d.base.Metrics.Discovered.WithLabelValues("unstable").Inc()
 		d.log.Info("submission changed while it was being fingerprinted; leaving it for the next scan",
 			slog.String("event", "entry_unstable"))

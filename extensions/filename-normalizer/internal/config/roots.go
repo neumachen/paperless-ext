@@ -118,6 +118,13 @@ func (rs RootSet) Verify() error {
 		if err := r.Verify(); err != nil {
 			return err
 		}
+		// Hand the identity to the storage layer, which checks it again at the
+		// moment it opens the root for an actual read or write. Verifying here
+		// alone leaves a window between this check and every use of the root:
+		// repointing it afterwards would redirect the operations this call was
+		// supposed to protect, and no interval between checks is short enough
+		// to close that.
+		storage.ExpectRoot(r)
 	}
 	// Re-checking aliasing every time is cheap and catches a root that was
 	// repointed at another role's directory rather than at a new one, which
