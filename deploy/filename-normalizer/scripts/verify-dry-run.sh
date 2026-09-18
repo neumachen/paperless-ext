@@ -156,6 +156,21 @@ emit "before:  jobs=$BEFORE_JOBS reservations=$BEFORE_RES receipts=$BEFORE_RECEI
 emit "         history_rows=$BEFORE_EVENTS queued_messages=$BEFORE_QUEUED"
 
 # ---------------------------------------------------------------------------
+# The dry run's own baseline, taken BEFORE the document is submitted.
+#
+# It used to be read afterwards, once the job row had appeared -- and the dry
+# run reports every 10 seconds, so a report including the new job had often
+# already been emitted by then. The "before" reading then already counted the
+# job, the "after" reading equalled it, and the exercise reported that the dry
+# run had never examined the document it had in fact just examined. The
+# previous round passed this check by winning the race, not by being right.
+count_in_last_report() {
+    compose logs renamer-dry-run 2>/dev/null | grep dry_run_report | tail -1 \
+        | sed -n 's/.*"count":\([0-9][0-9]*\).*/\1/p'
+}
+REPORTS_BEFORE="$(compose logs renamer-dry-run 2>/dev/null | grep -c dry_run_report || true)"
+COUNT_BEFORE="$(count_in_last_report)"
+
 log "4/6: submitting a document through the real watcher and broker"
 compose run --rm --no-deps -T --entrypoint sh storage-init -c \
     "printf '%%PDF-1.4 dry run probe\\n' > /srv/fn/incoming/.wip-dryrun && \
@@ -186,23 +201,23 @@ done
 # not by itself show that THIS job was in it -- the report is aggregate counts
 # and names nothing, deliberately, because a name is document-derived text. So
 # the count is read as well: the number of jobs the policy would publish has to
-# rise by at least one across this submission, which is the observable trace
-# this particular job leaves in an aggregate report.
-count_in_last_report() {
-    compose logs renamer-dry-run 2>/dev/null | grep dry_run_report | tail -1 \
-        | sed -n 's/.*"count":\([0-9][0-9]*\).*/\1/p'
-}
-REPORTS_BEFORE="$(compose logs renamer-dry-run 2>/dev/null | grep -c dry_run_report || true)"
-COUNT_BEFORE="$(count_in_last_report)"
+# rise by at least one against the baseline taken before the submission, which
+# is the observable trace this particular job leaves in an aggregate report.
+#
+# Polled until it rises rather than sampled once: the first report after the
+# row appears may have been computed moments before the row committed, and
+# reading only that one turns a 10-second tick into a coin toss.
 _i=0
 REPORT_SEEN=0
 COUNT_AFTER=""
 while [ "$_i" -lt 120 ]; do
     _now="$(compose logs renamer-dry-run 2>/dev/null | grep -c dry_run_report || true)"
     if [ "${_now:-0}" -gt "${REPORTS_BEFORE:-0}" ]; then
-        COUNT_AFTER="$(count_in_last_report)"
         REPORT_SEEN=1
-        break
+        COUNT_AFTER="$(count_in_last_report)"
+        if [ -n "$COUNT_AFTER" ] && [ -n "$COUNT_BEFORE" ] && [ "$COUNT_AFTER" -gt "$COUNT_BEFORE" ]; then
+            break
+        fi
     fi
     sleep 1
     _i=$((_i + 1))
