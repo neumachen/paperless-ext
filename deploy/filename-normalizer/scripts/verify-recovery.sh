@@ -125,7 +125,17 @@ drop_fault() {
             *" $_df "*)
                 compose --profile fault stop "$_df" >/dev/null 2>&1 || true
                 compose --profile fault rm -f "$_df" >/dev/null 2>&1 || true
-                CREATED="$(printf '%s' "$CREATED" | tr ' ' '\n' | grep -vx "$_df" | tr '\n' ' ')"
+                # Untracked only once the container is actually gone. CREATED
+                # is the leak oracle -- restoration fails if anything is still
+                # in it -- so dropping a name whose removal failed scrubbed the
+                # evidence from the very variable that was supposed to report
+                # it, and restoration then announced "fault services left:
+                # none" over a container that was still running.
+                if [ -z "$(compose --profile fault ps -aq "$_df" 2>/dev/null)" ]; then
+                    CREATED="$(printf '%s' "$CREATED" | tr ' ' '\n' | grep -vx "$_df" | tr '\n' ' ')"
+                else
+                    echo "error: '$_df' could not be removed; it stays on the list." >&2
+                fi
                 ;;
         esac
     done
@@ -144,10 +154,22 @@ cut_network() {
 }
 
 heal_network() {
+    _hn_left=""
     for _hn_cid in $DISCONNECTED; do
         docker network connect "$NET" "$_hn_cid" >/dev/null 2>&1 || true
+        # Verified, then untracked. Emptying the list unconditionally meant a
+        # container this exercise had disconnected and failed to reconnect was
+        # forgotten, and the restoration check only inspects the three
+        # application services -- so anything else stayed off the network with
+        # nothing recording it.
+        if docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$_hn_cid" 2>/dev/null \
+            | grep -q "$NET"; then
+            continue
+        fi
+        echo "error: could not reconnect $_hn_cid to $NET." >&2
+        _hn_left="$_hn_left $_hn_cid"
     done
-    DISCONNECTED=""
+    DISCONNECTED="$_hn_left"
 }
 
 # Placeholder so the restore trap can call this before scenario 8 defines the
@@ -175,6 +197,13 @@ restore() {
 
     _r_ok=1
     if [ "${_r_perm_failed:-0}" = "1" ]; then _r_ok=0; fi
+    # Anything this run disconnected and could not reconnect. The per-service
+    # loop below only inspects the three application services, so a container
+    # outside that set would otherwise be left off the network silently.
+    if [ -n "$(printf '%s' "$DISCONNECTED" | tr -d ' ')" ]; then
+        _r_ok=0
+        printf '  containers left disconnected: %s\n' "$DISCONNECTED" >> "$OUT"
+    fi
     for _r_svc in watcher renamer-1 renamer-2; do
         _r_cid="$(compose ps -q "$_r_svc" 2>/dev/null | head -1)"
         if [ -z "$_r_cid" ]; then _r_ok=0; _r_nets="absent"; else
@@ -645,15 +674,25 @@ emit "   foreign file still intact:    $([ "$STILL_FOREIGN5" = "$FOREIGN_INO5" ]
 [ "$STILL_FOREIGN5" = "$FOREIGN_INO5" ] || bad "the foreign file was replaced or removed"
 
 # The intruder was planted by this exercise, so this exercise takes it away
-# again. Leaving it behind means a file in the destination that no receipt and
-# no job explains -- which is exactly what the suite's isolation assertion is
-# for, and it caught these: four of them had accumulated, one per run. The
-# assertion was right; the exercise was littering. Removed only after the
-# checks above have read it.
-in_storage "rm -f '/srv/fn/consume/$RESERVED5' 2>/dev/null; true" >/dev/null 2>&1 || true
-GONE5="$(in_storage "test -e '/srv/fn/consume/$RESERVED5' && echo present || echo removed")"
-emit "   the planted intruder was:     $GONE5 afterwards (this exercise created it, so it removes it)"
-[ "$GONE5" = "removed" ] || bad "the exercise left its planted file in the destination"
+# again -- but ONLY while it is still demonstrably the file that was planted.
+#
+# `bad` records a mismatch and carries on, so the branch that fires when the
+# inode at that name is no longer the planted one fell straight through to an
+# unconditional rm. The one case where the path may hold somebody else's file
+# -- a real delivery, say -- was exactly the case that deleted it. The identity
+# is re-read here and the removal is gated on it.
+NOW5="$(in_storage "ls -i '/srv/fn/consume/$RESERVED5' 2>/dev/null | awk '{print \$1}'")"
+if [ -n "$NOW5" ] && [ "$NOW5" = "$FOREIGN_INO5" ]; then
+    in_storage "rm -f '/srv/fn/consume/$RESERVED5' 2>/dev/null; true" >/dev/null 2>&1 || true
+    GONE5="$(in_storage "test -e '/srv/fn/consume/$RESERVED5' && echo present || echo removed")"
+    emit "   the planted intruder was:     $GONE5 afterwards (inode $FOREIGN_INO5, the one this exercise planted)"
+    [ "$GONE5" = "removed" ] || bad "the exercise left its planted file in the destination"
+elif [ -z "$NOW5" ]; then
+    emit "   the planted intruder was:     already gone before cleanup"
+else
+    emit "   the planted intruder was:     NOT removed: inode $NOW5 is not the planted $FOREIGN_INO5"
+    bad "the file at the reserved name is not the one this exercise planted; leaving it alone"
+fi
 emit ""
 
 # ---------------------------------------------------------------------------
@@ -829,29 +868,40 @@ DOC8="perm-denied-$STAMP.pdf"
 NAME8="perm-denied-$LOWER.pdf"
 PERM_ROOT="/srv/fn/consume"
 PERM_TOUCHED=0
+# Captured BEFORE anything is revoked, and restored to exactly this. Restoring
+# to a hardcoded 0770 65532:65532 quietly rewrote whatever the destination's
+# owner and mode had actually been, and called that success -- a deployment
+# using a shared group, or any mode but 0770, would have been changed by a test
+# that claims to leave the stack as it found it.
+PERM_BEFORE=""
 
-# Whatever happens, the destination's mode goes back. It is restored in the
-# trap as well, so an interruption between the revoke and the restore cannot
-# leave a directory nobody can write to.
 restore_perm() {
     if [ "$PERM_TOUCHED" = "1" ]; then
+        if [ -z "$PERM_BEFORE" ]; then
+            echo "error: the consume root's original mode was never captured;" >&2
+            echo "       refusing to guess. Inspect $PERM_ROOT by hand." >&2
+            printf '\nPERMISSION RESTORATION FAILED: no captured original\n' >> "$OUT"
+            return 1
+        fi
+        _rp_mode_want="${PERM_BEFORE%%:*}"
+        _rp_own_want="${PERM_BEFORE#*:}"
         compose run --rm --no-deps -T --user 0 --entrypoint sh storage-init \
-            -c "chown 65532:65532 $PERM_ROOT && chmod 0770 $PERM_ROOT" >/dev/null 2>&1 || true
+            -c "chown $_rp_own_want $PERM_ROOT; chmod $_rp_mode_want $PERM_ROOT" >/dev/null 2>&1 || true
         # in_storage strips whitespace, so a two-field stat comes back run
         # together and could never equal a spaced expectation -- the check
         # reported a restoration failure for a directory it had just restored
         # correctly. A separator that survives the strip fixes it.
-        _rp_mode="$(in_storage "stat -c '%a:%u' $PERM_ROOT 2>/dev/null || echo unknown")"
-        if [ "$_rp_mode" != "770:65532" ]; then
-            echo "error: the consume root was NOT restored (now: $_rp_mode)." >&2
+        _rp_now="$(in_storage "stat -c '%a:%u:%g' $PERM_ROOT 2>/dev/null || echo unknown")"
+        if [ "$_rp_now" != "$PERM_BEFORE" ]; then
+            echo "error: the consume root was NOT restored (now: $_rp_now, was: $PERM_BEFORE)." >&2
             echo "       Fix it before running anything else:" >&2
             echo "       docker compose run --rm --user 0 --entrypoint sh storage-init \\" >&2
-            echo "         -c 'chown 65532:65532 $PERM_ROOT && chmod 0770 $PERM_ROOT'" >&2
-            printf '\nPERMISSION RESTORATION FAILED: consume root is %s\n' "$_rp_mode" >> "$OUT"
+            echo "         -c 'chown $_rp_own_want $PERM_ROOT && chmod $_rp_mode_want $PERM_ROOT'" >&2
+            printf '\nPERMISSION RESTORATION FAILED: consume root is %s, was %s\n' "$_rp_now" "$PERM_BEFORE" >> "$OUT"
             return 1
         fi
         PERM_TOUCHED=0
-        note "consume root restored to 0770 owned by the runtime account"
+        note "consume root restored to what it was before this run ($PERM_BEFORE)"
     fi
     return 0
 }
@@ -860,6 +910,11 @@ start_fault renamer-permdenied FN_PERM_HOLD=60s || exit 1
 wait_healthy renamer-permdenied 180 || true
 WHO8="$(docker inspect -f '{{.Config.User}}' "$(compose --profile fault ps -q renamer-permdenied | head -1)" 2>/dev/null || echo unknown)"
 MODE_BEFORE8="$(in_storage "stat -c %a $PERM_ROOT 2>/dev/null || echo unknown")"
+PERM_BEFORE="$(in_storage "stat -c '%a:%u:%g' $PERM_ROOT 2>/dev/null || echo unknown")"
+if [ "$PERM_BEFORE" = "unknown" ]; then
+    bad "the consume root's mode and owner could not be read; not revoking anything"
+    PERM_BEFORE=""
+fi
 
 submit "$DOC8" 4096
 await_registered "$DOC8" 90 || bad "the permission probe was never registered"
@@ -924,12 +979,18 @@ restore_perm
 # A write refused mid-publication cannot clean up after itself: removing the
 # staged temporary needs the same directory permission the kernel just took
 # away. What it leaves is reported, and removed here, rather than passed over.
-LEFT8="$(in_storage "ls -1a $PERM_ROOT 2>/dev/null | grep -c '^\.fn-' || true")"
-emit "   staged temporaries stranded by the denial: $LEFT8"
+LEFT8="$(in_storage "ls -1a $PERM_ROOT 2>/dev/null | grep -c \"^\\.fn-$JOB8\\.\" || true")"
+OTHER8="$(in_storage "ls -1a $PERM_ROOT 2>/dev/null | grep -c '^\.fn-' || true")"
+emit "   staged temporaries stranded by the denial (this job): $LEFT8"
+emit "   temporaries in the destination from other work:      $OTHER8   (reported, not touched)"
 emit "   (cleanup needs the same permission the denial removed, so this is a"
-emit "    real consequence of the fault, not a leak in the ordinary path. The"
-emit "    exercise removes them because it caused them.)"
-in_storage "rm -f $PERM_ROOT/.fn-* 2>/dev/null; true" >/dev/null 2>&1 || true
+emit "    real consequence of the fault, not a leak in the ordinary path. Only"
+emit "    this job's are removed: the earlier glob took every .fn-* in the real"
+emit "    consume root, including artifacts this invocation never created.)"
+# Scoped to this job's temporaries. The glob removed every .fn-* in the real
+# consume root, including ones this invocation never created -- the very
+# artifacts the scenario above reports as belonging to other actors.
+in_storage "rm -f $PERM_ROOT/.fn-$JOB8.* 2>/dev/null; true" >/dev/null 2>&1 || true
 drop_fault renamer-permdenied
 emit ""
 
