@@ -50,9 +50,17 @@ count_consume() {
 # without ever looking at whether its own restoration worked.
 CREATED=""
 RESTORED=0
+# Set the moment the stack is first changed. A refusal before that point must
+# leave the stack alone rather than restarting services it never stopped.
+MUTATED=0
 restore() {
     if [ "$RESTORED" = "1" ]; then return 0; fi
     RESTORED=1
+    if [ "$MUTATED" = "0" ]; then
+        log "nothing was changed; leaving the stack alone"
+        exercise_unlock
+        return 0
+    fi
     log "restarting the ordinary renamers"
     _r_ok=1
 
@@ -105,19 +113,24 @@ emit "A9 — dry run preserves sources and the operational ledger"
 emit ""
 
 # ---------------------------------------------------------------------------
-log "1/6: stopping the ordinary renamers so the dry-run instance is the only consumer"
-compose stop renamer-1 renamer-2 >/dev/null 2>&1
-emit "ordinary renamers stopped"
-
-log "2/6: starting a renamer with dry_run enabled"
-# Refused rather than adopted: this exercise removes the service afterwards, so
-# taking over one it did not create means destroying something another run or
-# an operator is using.
+# Ownership is decided BEFORE anything is stopped. This check used to come
+# after the two renamers had already been stopped, so the refusal printed
+# "Refusing before anything is changed" having just stopped two services that
+# belonged to whoever else was using this stack -- and the restore trap then
+# restarted them, which is a mutation and a restoration nobody asked for.
+log "1/6: confirming the dry-run service is this invocation's to create"
 if [ -n "$(compose --profile fault ps -aq renamer-dry-run 2>/dev/null)" ]; then
     echo "error: 'renamer-dry-run' already exists; this invocation did not create it" >&2
     echo "       and will not remove it. Refusing before anything is changed." >&2
     exit 1
 fi
+
+log "2/6: stopping the ordinary renamers so the dry-run instance is the only consumer"
+MUTATED=1
+compose stop renamer-1 renamer-2 >/dev/null 2>&1
+emit "ordinary renamers stopped"
+
+log "starting a renamer with dry_run enabled"
 CREATED="renamer-dry-run"
 compose --profile fault up -d --wait --wait-timeout 180 renamer-dry-run >/dev/null 2>&1 || {
     echo "the dry-run renamer did not become healthy" >&2

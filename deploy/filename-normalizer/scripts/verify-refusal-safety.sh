@@ -69,6 +69,15 @@ cleanup() {
         docker volume rm "$DECOY_VOL" >/dev/null 2>&1 || true
         DECOY_CREATED=0
     fi
+    # Interrupted between creating the decoy container and removing it.
+    if [ "${REDIS_CREATED:-0}" = "1" ]; then
+        compose --profile consumer rm -f -v paperless-redis >/dev/null 2>&1 || true
+        REDIS_CREATED=0
+    fi
+    if [ "${REDIS_VOL_CREATED:-0}" = "1" ]; then
+        docker volume rm "${PROJECT}_paperless-redis" >/dev/null 2>&1 || true
+        REDIS_VOL_CREATED=0
+    fi
 }
 trap 'cleanup' EXIT
 trap 'exit 130' INT
@@ -144,11 +153,19 @@ else
     # the exact hazard this exercise exists to demonstrate, and an exercise
     # that commits it while proving others do not is worthless.
     REDIS_CREATED=0
+    REDIS_VOL_CREATED=0
     if [ -n "$(compose --profile consumer ps -aq paperless-redis 2>/dev/null)" ]; then
         emit "2. SKIPPED: a paperless-redis container already exists and is not this"
         emit "   exercise's to create, use or remove."
         SKIP_CASE2=1
     else
+        # Creating the container also creates its named volume. That volume is
+        # this invocation's too, and it has to go back -- the first run of this
+        # exercise left ${PROJECT}_paperless-redis behind and its own
+        # end-as-it-began check caught it.
+        if [ -z "$(docker volume ls -q --filter "name=^${PROJECT}_paperless-redis$" 2>/dev/null)" ]; then
+            REDIS_VOL_CREATED=1
+        fi
         compose --profile consumer create paperless-redis >/dev/null 2>&1 && REDIS_CREATED=1
     fi
 
@@ -173,9 +190,15 @@ else
     fi
     # Removed only if this invocation created it.
     if [ "${REDIS_CREATED:-0}" = "1" ]; then
-        compose --profile consumer rm -f paperless-redis >/dev/null 2>&1 || true
+        compose --profile consumer rm -f -v paperless-redis >/dev/null 2>&1 || true
         if [ -n "$(compose --profile consumer ps -aq paperless-redis 2>/dev/null)" ]; then
             bad "the decoy paperless-redis container this exercise created could not be removed"
+        fi
+    fi
+    if [ "${REDIS_VOL_CREATED:-0}" = "1" ]; then
+        docker volume rm "${PROJECT}_paperless-redis" >/dev/null 2>&1 || true
+        if [ -n "$(docker volume ls -q --filter "name=^${PROJECT}_paperless-redis$" 2>/dev/null)" ]; then
+            bad "the decoy paperless-redis volume this exercise created could not be removed"
         fi
     fi
     docker volume rm "$DECOY_VOL" >/dev/null 2>&1 && DECOY_CREATED=0
