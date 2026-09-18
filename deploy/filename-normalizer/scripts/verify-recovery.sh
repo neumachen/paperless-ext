@@ -1317,17 +1317,26 @@ drop_fault renamer-same-instance
 emit ""
 
 # ---------------------------------------------------------------------------
-# 11. An old attempt that is still ALIVE, resuming after the takeover expired.
+# 11. An old attempt that is still ALIVE, resuming after its claim expired.
 #
 # The previous demonstration held a claim for 45 seconds inside a 600-second
-# takeover window, so the sibling deferred and the holder was never actually
-# superseded: nothing resumed after losing its claim. Here the window is 10
-# seconds and the hold is 90, so the holder is genuinely taken over, the taker
-# publishes and records the delivery, and only then does the old attempt wake
-# up -- holding a staged file, filesystem access, and a claim that is no longer
-# its own. It must not put a second consumable copy into the directory.
+# window, so the sibling deferred and the holder was never superseded: nothing
+# ever resumed after losing its claim. Here the window is 10 seconds and the
+# hold is 90, so the holder is genuinely overtaken.
+#
+# What a sibling does with a stale claim is worth stating exactly, because the
+# handoff's sequence assumed it publishes. It does not, and it should not: it
+# finds a stale claim and NO destination, which is indistinguishable from a
+# publication whose file a consumer already took, so it records `uncertain` and
+# stops. That is the A6 before-link contract.
+#
+# The dangerous half is unchanged and is what this scenario is about: the old
+# attempt wakes up holding a staged file, filesystem access, and a job somebody
+# else has closed. It must not link. A document appearing in the consumer's
+# directory for a job recorded `uncertain` is a file no receipt describes and
+# nothing will ever reconcile -- and the consumer would ingest it.
 # ---------------------------------------------------------------------------
-log "11/12: an old live attempt resumes after its claim was taken over"
+log "11/12: an old live attempt resumes after its claim expired"
 DOC11="a7-stale-$STAMP.pdf"
 NAME11="a7-stale-$LOWER.pdf"
 
@@ -1337,49 +1346,57 @@ submit "$DOC11"
 sleep 12
 JOB11="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC11';")"
 HOLDER11_A="$(psqlq "SELECT coalesce(publish_claimed_by,'-') FROM jobs WHERE job_id = '$JOB11';")"
+STATE11_A="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB11';")"
 
-# The taker arrives after the window has already expired for the holder.
+# A sibling arrives once the window has expired for the holder.
 start_fault renamer-taker FN_PUBLISH_TAKEOVER_AFTER=10s || exit 1
-TAKEN11="$(await_state "$DOC11" "delivered held uncertain" 180)"
-HOLDER11_B="$(psqlq "SELECT coalesce(publish_claimed_by,'-') FROM jobs WHERE job_id = '$JOB11';")"
+CLOSED11="$(await_state "$DOC11" "delivered held uncertain" 180)"
 RECEIPTS11_MID="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB11';")"
 COPIES11_MID="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^a7-stale-$LOWER' || true")"
 
-# Now the old attempt wakes up. Its hold is 90s from its claim.
+# Now the old attempt wakes up, 90s after its claim.
 _i=0
 while [ "$_i" -lt 150 ]; do
-    _alive="$(compose --profile fault ps -q renamer-hold 2>/dev/null | head -1)"
-    [ -z "$_alive" ] && break
-    if compose --profile fault logs renamer-hold 2>/dev/null | grep -q 'publication_superseded\|delivery_settled\|publication_in_progress'; then
+    if compose --profile fault logs renamer-hold 2>/dev/null \
+        | grep -q 'publication_superseded\|publication_in_progress\|delivery_settled'; then
         break
     fi
+    _alive="$(compose --profile fault ps -q renamer-hold 2>/dev/null | head -1)"
+    [ -z "$_alive" ] && break
     sleep 3; _i=$((_i + 3))
 done
+sleep 8
 SUPERSEDED11="$(compose --profile fault logs renamer-hold 2>/dev/null \
-    | grep -c 'publication_superseded\|publication_in_progress' || true)"
+    | grep -c 'publication_superseded' || true)"
 COPIES11="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^a7-stale-$LOWER' || true")"
 RECEIPTS11="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB11';")"
 FINAL11="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB11';")"
+SRC11="$(in_storage "test -f '/srv/fn/incoming/$DOC11' && echo yes || echo no")"
 NAMES11="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep '^a7-stale-$LOWER' | tr '\n' ' '")"
 
-emit "11. an old live attempt resuming after its claim was taken over"
+emit "11. an old live attempt resuming after its claim expired"
 emit "   takeover window:              10s; the holder's pause: 90s"
-emit "   claim holder while held:      $HOLDER11_A"
-emit "   claim holder after takeover:  $HOLDER11_B   (expected a different attempt, or cleared by delivery)"
-emit "   state once the taker finished:$TAKEN11   (expected delivered)"
-emit "   receipts then:                $RECEIPTS11_MID   (expected 1)"
-emit "   documents then:               $COPIES11_MID   (expected 1)"
+emit "   claim holder while held:      $HOLDER11_A   (state $STATE11_A)"
+emit "   what the sibling did with a stale claim and no destination:"
+emit "                                 recorded $CLOSED11 (expected uncertain: it cannot"
+emit "                                 tell a publication that never happened from one"
+emit "                                 whose file was already taken)"
+emit "   receipts then:                $RECEIPTS11_MID   (expected 0)"
+emit "   documents then:               $COPIES11_MID   (expected 0)"
 emit "   the old attempt stood down:   $SUPERSEDED11 time(s)   (expected >= 1: it did not link)"
-emit "   documents after it resumed:   $COPIES11   (expected 1: no second consumable copy)"
-emit "   names present:                ${NAMES11:-none}   (expected exactly one, no suffixed twin)"
-emit "   receipts after it resumed:    $RECEIPTS11   (expected 1)"
-emit "   final state:                  $FINAL11   (expected delivered)"
-[ "$TAKEN11" = "delivered" ] || bad "the taker did not deliver the job (state '$TAKEN11'), so nothing was taken over"
-[ "${RECEIPTS11_MID:-0}" = "1" ] || bad "$RECEIPTS11_MID receipts after the takeover"
-[ "${SUPERSEDED11:-0}" -ge 1 ] || bad "the superseded attempt never reported standing down; it may have linked a second copy"
-[ "${COPIES11:-0}" = "1" ] || bad "$COPIES11 documents exist after the old attempt resumed; it exposed another copy"
-[ "${RECEIPTS11:-0}" = "1" ] || bad "$RECEIPTS11 receipts exist for one submission"
-[ "$FINAL11" = "delivered" ] || bad "the job ended as '$FINAL11'"
+emit "   documents after it resumed:   $COPIES11   (expected 0: no consumable copy for a closed job)"
+emit "   names present:                ${NAMES11:-none}   (expected none)"
+emit "   receipts after it resumed:    $RECEIPTS11   (expected 0)"
+emit "   final state:                  $FINAL11   (expected uncertain: not reopened by the old attempt)"
+emit "   source preserved:             $SRC11   (expected yes: an operator has what they need)"
+[ "$CLOSED11" = "uncertain" ] || bad "the sibling recorded '$CLOSED11' for a stale claim with no destination"
+[ "${RECEIPTS11_MID:-0}" = "0" ] || bad "$RECEIPTS11_MID receipts exist for a job nothing published"
+[ "${SUPERSEDED11:-0}" -ge 1 ] || bad "the superseded attempt never reported standing down; it may have linked into a closed job"
+[ "${COPIES11:-0}" = "0" ] || bad "$COPIES11 document(s) appeared for a job recorded '$FINAL11'; the old attempt published past a closed outcome"
+[ "${RECEIPTS11:-0}" = "0" ] || bad "$RECEIPTS11 receipts exist after the old attempt resumed"
+[ "$FINAL11" = "uncertain" ] || bad "the job ended as '$FINAL11'; an uncertain outcome was reopened"
+[ "$SRC11" = "yes" ] || bad "the source was removed"
+emit "   => this job is UNRESOLVED BY DESIGN: job_id=$JOB11"
 drop_fault renamer-hold renamer-taker
 compose start renamer-1 renamer-2 >/dev/null 2>&1 || true
 wait_healthy renamer-1 120 || true

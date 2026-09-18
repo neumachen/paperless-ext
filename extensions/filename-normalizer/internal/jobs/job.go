@@ -41,6 +41,21 @@ const (
 
 // States lists every valid state, in lifecycle order. Metrics iterate this so
 // that a gauge exists (at zero) even for states nothing has reached yet.
+// IsTerminal reports whether a state is a durable outcome that nothing should
+// publish past.
+//
+// `held`, `delivered` and `uncertain` are all decisions somebody has already
+// recorded. An attempt that finds one of them after its own claim -- because a
+// takeover let a sibling close the job while it was paused -- must not add a
+// document the durable record does not describe.
+func IsTerminal(s State) bool {
+	switch s {
+	case StateHeld, StateDelivered, StateUncertain:
+		return true
+	}
+	return false
+}
+
 func States() []State {
 	return []State{
 		StatePendingDispatch,
