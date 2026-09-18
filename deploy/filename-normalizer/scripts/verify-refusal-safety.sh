@@ -98,7 +98,7 @@ cleanup() {
         REDIS_VOL_CREATED=0
     fi
 }
-trap 'report_keep; cleanup' EXIT
+trap 'cleanup; report_keep' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 

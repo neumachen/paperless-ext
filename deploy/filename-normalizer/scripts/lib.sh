@@ -583,20 +583,29 @@ report_begin() {
     } > "$REPORT_OUT"
 }
 
-# report_keep copies the current report into this run's own file. Safe to call
-# more than once; the last call wins for this run only.
+# report_keep copies the current report into this run's own file, and into the
+# success slot when the run has passed.
+#
+# Called last, from the restoration path, because the restoration block is part
+# of the report: an exercise logs PASSED before its EXIT trap runs, so a copy
+# taken at the pass point stops one section short of the evidence that the stack
+# was put back. Safe to call more than once; the last call wins.
+REPORT_PASSED=0
 report_keep() {
     [ -n "$REPORT_RUN" ] || return 0
     [ -f "$REPORT_OUT" ] || return 0
     cp "$REPORT_OUT" "$REPORT_RUN" 2>/dev/null || true
+    if [ "${REPORT_PASSED:-0}" = "1" ] && [ -n "$REPORT_NAME" ]; then
+        cp "$REPORT_OUT" "$EVIDENCE_DIR/successful/${REPORT_NAME}.txt" 2>/dev/null || true
+    fi
 }
 
-# report_success additionally promotes it to the success slot. Only a run that
-# actually passed may call this.
+# report_success marks this run as one that may be promoted. Only a run that
+# actually passed may call it; the copy itself happens in report_keep, after
+# restoration has had its say.
 report_success() {
+    REPORT_PASSED=1
     report_keep
-    [ -n "$REPORT_NAME" ] || return 0
-    cp "$REPORT_OUT" "$EVIDENCE_DIR/successful/${REPORT_NAME}.txt" 2>/dev/null || true
 }
 
 # cksum_sha256 hashes a file in a container, like everything else here.

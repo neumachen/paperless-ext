@@ -58,10 +58,10 @@ start_fault() {
 restore() {
     if [ "$RESTORED" = "1" ]; then return 0; fi
     RESTORED=1
-    report_keep
     if [ "$MUTATED" = "0" ]; then
         log "nothing was changed; leaving the stack alone"
         exercise_unlock
+        report_keep
         return 0
     fi
     log "restoring the stack"
@@ -90,8 +90,10 @@ restore() {
     if [ "$_ok" != "1" ]; then
         echo "FAILED: the stack was NOT restored. See $OUT." >&2
         printf '\nRESTORATION FAILED\n' >> "$OUT"
+        report_keep
         exit 1
     fi
+    report_keep
     note "restored: ordinary renamers ready, fault services removed"
 }
 
