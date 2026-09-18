@@ -509,6 +509,49 @@ services:
   # observe both halves -- the sibling standing down while the claim is fresh,
   # and the takeover once it is not -- inside one hold.
   # -------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  # Two handlers inside ONE process, contending for one job.
+  #
+  # The overlap that was demonstrated before was between two CONTAINERS, which
+  # is the easy direction: their claim holders have different names, so any
+  # guard that compares names catches it. Two handlers of one renamer share the
+  # instance name, and the recovery path exempted a claim whose holder name
+  # matched its own -- so the boundary that held across processes was the one
+  # that did not hold inside one. Concurrency 2 with a prefetch of 2 puts both
+  # deliveries of a job in the hands of a single process.
+  # -------------------------------------------------------------------------
+  renamer-same-instance:
+    <<: *renamer
+    profiles: [fault]
+    restart: "no"
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-same-instance
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "2"
+      FN_RENAMER_PREFETCH: "2"
+      FN_FAULT_POINTS: hold_after_claim
+      FN_FAULT_HOLD: ${FN_FAULT_HOLD:-45s}
+      FN_PUBLISH_TAKEOVER_AFTER: ${FN_PUBLISH_TAKEOVER_AFTER:-600s}
+    ports: []
+
+  # -------------------------------------------------------------------------
+  # An ordinary worker with whatever takeover window the exercise gives it, so
+  # a STALE holder can actually be taken over inside a run: the accepted stack
+  # uses a window far longer than any hold a test can sit through.
+  # -------------------------------------------------------------------------
+  renamer-taker:
+    <<: *renamer
+    profiles: [fault]
+    restart: "no"
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-taker
+      FN_DB_APPLY_MIGRATIONS: "false"
+      FN_RENAMER_CONCURRENCY: "1"
+      FN_PUBLISH_TAKEOVER_AFTER: ${FN_PUBLISH_TAKEOVER_AFTER:-600s}
+    ports: []
+
   renamer-hold:
     <<: *renamer
     profiles: [fault]

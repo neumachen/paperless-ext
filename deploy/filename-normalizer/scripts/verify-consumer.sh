@@ -94,6 +94,27 @@ start_consumer() {
             return 1
         fi
     done
+    # A Paperless library that already exists is not this exercise's to use.
+    #
+    # Excluding a pre-existing volume from the removal list stopped the
+    # exercise DELETING somebody's library, and no more than that: it still
+    # started Paperless against it, so the instance ingested documents into an
+    # existing media store, wrote to an existing database, and left both
+    # changed. Not-deleting is not not-touching. A library this invocation did
+    # not create means this invocation does not run.
+    _sc_existing=""
+    for _v in paperless-data paperless-media; do
+        if [ -n "$(docker volume ls -q --filter "name=^${PROJECT}_${_v}$" 2>/dev/null)" ]; then
+            _sc_existing="$_sc_existing ${PROJECT}_${_v}"
+        fi
+    done
+    if [ -n "$_sc_existing" ]; then
+        echo "error: Paperless state already exists:$_sc_existing" >&2
+        echo "       This invocation did not create it, will not ingest into it," >&2
+        echo "       and will not remove it. Refusing before anything is changed." >&2
+        return 1
+    fi
+
     # Past this point the stack is being changed, so restoration has something
     # to restore. Before it, restoration must do nothing: see MUTATED.
     MUTATED=1
@@ -234,11 +255,11 @@ restore() {
 }
 
 exercise_lock consumer || exit 1
-trap 'restore' EXIT
+trap 'report_keep; restore' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-: > "$OUT"
+report_begin "consumer" "$OUT" "$0"
 emit "A real consumer takes the published document, and the handoff survives it"
 emit ""
 
@@ -408,6 +429,23 @@ emit "   delivery_received events:            $DELIV_BEFORE -> $DELIV_AFTER"
 emit "   state after that delivery:           $STATE_REDELIV   (expected delivered)"
 emit "   receipts after it:                   $RECEIPTS_REDELIV   (expected 1)"
 emit "   files republished by it:             $REPUB2   (expected 0)"
+# After the redelivery, the same two durable questions as before it: how many
+# publication attempts the ledger recorded, and whether the consumer's library
+# still holds exactly this exercise's fixture. A directory that is empty because
+# the consumer emptied it cannot answer either.
+ATTEMPTS_AFTER_REDELIVERY="$(psqlq "SELECT count(*) FROM job_events WHERE job_id = '$JOB' AND event_type = 'publish_attempted';")"
+INGESTED_AFTER="$(compose --profile consumer exec -T paperless sh -c \
+    "python3 -c \"
+import sqlite3
+db = sqlite3.connect('/usr/src/paperless/data/db.sqlite3')
+print(db.execute(
+    'select count(*) from documents_document where original_filename = ?',
+    ('$NAME',)).fetchone()[0])
+\"" 2>/dev/null | tr -d ' \r\n' || echo unknown)"
+emit "   publication attempts recorded:       $ATTEMPTS_AFTER_REDELIVERY   (expected 1: still one)"
+emit "   this fixture in the library:         $INGESTED_AFTER   (expected 1: still exactly one)"
+[ "${ATTEMPTS_AFTER_REDELIVERY:-0}" = "1" ] || bad "$ATTEMPTS_AFTER_REDELIVERY publication attempts after the redelivery"
+[ "${INGESTED_AFTER:-0}" = "1" ] || bad "the consumer's library holds $INGESTED_AFTER copies of this fixture after the redelivery"
 [ "$REPUB_MSG" = "yes" ] || bad "the redelivery could not be published"
 [ "${DELIV_AFTER:-0}" -gt "${DELIV_BEFORE:-0}" ] || bad "no further delivery arrived, so nothing was proven about redelivery after consumption"
 [ "$STATE_REDELIV" = "delivered" ] || bad "a redelivery after consumption moved the job to '$STATE_REDELIV'"
@@ -466,6 +504,19 @@ else
     [ "${REPUB4:-0}" -le 1 ] || bad "$REPUB4 copies exist for one publication"
 fi
 [ "$SRC4" = "yes" ] || bad "the source was removed"
+ATTEMPTS4="$(psqlq "SELECT count(*) FROM job_events WHERE job_id = '$JOB4' AND event_type = 'publish_attempted';")"
+INGESTED4="$(compose --profile consumer exec -T paperless sh -c \
+    "python3 -c \"
+import sqlite3
+db = sqlite3.connect('/usr/src/paperless/data/db.sqlite3')
+print(db.execute(
+    'select count(*) from documents_document where original_filename = ?',
+    ('$NAME4',)).fetchone()[0])
+\"" 2>/dev/null | tr -d ' \r\n' || echo unknown)"
+emit "   publication attempts recorded:$ATTEMPTS4   (expected 1: the race produced one publication)"
+emit "   this fixture in the library:  $INGESTED4   (expected 1: the consumer took it once)"
+[ "${ATTEMPTS4:-0}" = "1" ] || bad "$ATTEMPTS4 publication attempts recorded for the raced job"
+[ "${INGESTED4:-0}" = "1" ] || bad "the consumer's library holds $INGESTED4 copies of the raced fixture"
 emit ""
 
 # Nothing this exercise did not create may have been consumed or removed.
@@ -516,6 +567,15 @@ if [ "${ARRIVED:-0}" -gt 0 ]; then
 fi
 emit "documents other work delivered while this ran:     ${ARRIVED:-0}, of which ${ARRIVED_GONE} were consumed"
 [ "${ARRIVED_GONE:-0}" = "0" ] || bad "$ARRIVED_GONE document(s) belonging to other work were ingested by this exercise's consumer"
+# The ignore list is a snapshot and cannot name a document that had not arrived
+# when it was taken. That is a real hole and it is reported as one rather than
+# left to the reader: if other work delivered while this ran, those documents
+# were eligible for ingestion into a media store this exercise destroys.
+if [ "${ARRIVED:-0}" -gt 0 ]; then
+    emit "   NOTE: those ${ARRIVED} arrived after the ignore list was taken, so the"
+    emit "   list could not protect them. None was consumed in this run; the"
+    emit "   protection is the check above, not the list."
+fi
 emit ""
 
 emit "The handoff is a filesystem handoff and it ends at the link. A real"
@@ -531,5 +591,6 @@ if [ "$FAILURES" -ne 0 ]; then
     exit 1
 fi
 
+report_success
 log "PASSED: the handoff to a real consumer holds"
 note "evidence: $OUT"
