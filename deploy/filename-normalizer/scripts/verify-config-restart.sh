@@ -138,11 +138,27 @@ restore() {
     _r_consume="$(effective_value renamer-1 "d['storage']['consume']")"
     _r_id="$(effective_value renamer-1 "d['policy']['identity']")"
     _r_wcfg="$(watcher_effective_value "d['config_file']")"
+    # renamer-2 is recreated by apply_env exactly like the other two, and it
+    # was never read back. A worker left on the exercise's configuration would
+    # have kept normalizing documents under it while this script reported the
+    # stack restored.
+    _r_cfg2="$(effective_value renamer-2 "d['config_file']")"
+    _r_consume2="$(effective_value renamer-2 "d['storage']['consume']")"
     _r_ok=1
     if [ "$_r_cfg" != "$DEFAULT_CONFIG" ]; then _r_ok=0; fi
     if [ "$_r_wcfg" != "$DEFAULT_CONFIG" ]; then _r_ok=0; fi
+    if [ "$_r_cfg2" != "$DEFAULT_CONFIG" ]; then _r_ok=0; fi
     if [ "$_r_consume" != "$DEFAULT_CONSUME" ]; then _r_ok=0; fi
+    if [ "$_r_consume2" != "$DEFAULT_CONSUME" ]; then _r_ok=0; fi
     if [ -n "$BASELINE_ID" ] && [ "$_r_id" != "$BASELINE_ID" ]; then _r_ok=0; fi
+
+    # Configuration alone is not a restored stack: a service can hold the right
+    # configuration and be unable to reach its database. /readyz is asked for,
+    # not /healthz, which answers 200 for a process with every dependency down.
+    _r_rdy1="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    _r_rdy2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    _r_rdyw="$(compose exec -T watcher /usr/local/bin/fn-watcher healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    if [ "$_r_rdy1" != "yes" ] || [ "$_r_rdy2" != "yes" ] || [ "$_r_rdyw" != "yes" ]; then _r_ok=0; fi
 
     cleanup_exercise_file
 
@@ -151,7 +167,11 @@ restore() {
         printf '  renamer-1 config_file:   %s   (expected %s)\n' "$_r_cfg" "$DEFAULT_CONFIG"
         printf '  watcher   config_file:   %s   (expected %s)\n' "$_r_wcfg" "$DEFAULT_CONFIG"
         printf '  renamer-1 consume root:  %s   (expected %s)\n' "$_r_consume" "$DEFAULT_CONSUME"
+        printf '  renamer-2 config_file:   %s   (expected %s)\n' "$_r_cfg2" "$DEFAULT_CONFIG"
+        printf '  renamer-2 consume root:  %s   (expected %s)\n' "$_r_consume2" "$DEFAULT_CONSUME"
         printf '  renamer-1 policy:        %s   (expected %s)\n' "$_r_id" "${BASELINE_ID:-unknown}"
+        printf '  renamer-1/2, watcher ready: %s / %s / %s   (expected yes/yes/yes)\n' \
+            "$_r_rdy1" "$_r_rdy2" "$_r_rdyw"
         if [ -f "$EX_HOST" ]; then
             printf '  exercise config removed: no\n'
         else
@@ -164,7 +184,8 @@ restore() {
     if [ "$_r_ok" != "1" ]; then
         echo >&2
         echo "FAILED: the stack was NOT restored to its prior effective configuration." >&2
-        echo "        config_file=$_r_cfg watcher=$_r_wcfg consume=$_r_consume policy=$_r_id" >&2
+        echo "        config_file=$_r_cfg watcher=$_r_wcfg renamer-2=$_r_cfg2 consume=$_r_consume policy=$_r_id" >&2
+        echo "        ready: renamer-1=$_r_rdy1 renamer-2=$_r_rdy2 watcher=$_r_rdyw" >&2
         echo "        See $OUT. Restore by hand before running anything else." >&2
         printf '\nRESTORATION FAILED — see the values above.\n' >> "$OUT"
         exit 1

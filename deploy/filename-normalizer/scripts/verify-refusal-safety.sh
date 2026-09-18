@@ -84,7 +84,15 @@ BEFORE="$(snapshot)"
 # 1. Every exercise refuses while another holds the lock, and mutates nothing.
 # ---------------------------------------------------------------------------
 log "1/2: each exercise must refuse while the lock is held, without touching anything"
-mkdir -p "$EVIDENCE_DIR/.exercise.lock" 2>/dev/null
+# `mkdir`, not `mkdir -p`. With -p this succeeds against a lock another
+# exercise is holding, and the cleanup at the end of this script would then
+# remove somebody else's lock -- an ownership failure in the exercise whose
+# whole subject is ownership.
+if ! mkdir "$EVIDENCE_DIR/.exercise.lock" 2>/dev/null; then
+    echo "error: another exercise ($(cat "$EVIDENCE_DIR/.exercise.lock/owner" 2>/dev/null || echo unknown))" >&2
+    echo "       already holds the lock. Nothing has been changed." >&2
+    exit 1
+fi
 printf 'refusal-safety pid=%s at=%s\n' "$$" "$STAMP" > "$EVIDENCE_DIR/.exercise.lock/owner"
 LOCK_HELD=1
 emit "1. the lock is held by this exercise; each of the four is invoked"
@@ -132,34 +140,64 @@ else
         sh -c 'cat /v/precious.txt 2>/dev/null' 2>/dev/null | tr -d '\r\n')"
 
     # A service container that exists is what the consumer exercise refuses on.
-    compose --profile consumer create paperless-redis >/dev/null 2>&1 || true
+    # Created only if there is none: adopting one and removing it afterwards is
+    # the exact hazard this exercise exists to demonstrate, and an exercise
+    # that commits it while proving others do not is worthless.
+    REDIS_CREATED=0
+    if [ -n "$(compose --profile consumer ps -aq paperless-redis 2>/dev/null)" ]; then
+        emit "2. SKIPPED: a paperless-redis container already exists and is not this"
+        emit "   exercise's to create, use or remove."
+        SKIP_CASE2=1
+    else
+        compose --profile consumer create paperless-redis >/dev/null 2>&1 && REDIS_CREATED=1
+    fi
 
-    _log="$EVIDENCE_DIR/refusal-consumer-preexisting.log"
-    if sh "$SCRIPT_DIR/verify-consumer.sh" > "$_log" 2>&1; then _rc=0; else _rc=$?; fi
-    _refused="$(grep -c 'did not create it' "$_log" 2>/dev/null || true)"
+    if [ "${SKIP_CASE2:-0}" != "1" ]; then
+        _log="$EVIDENCE_DIR/refusal-consumer-preexisting.log"
+        if sh "$SCRIPT_DIR/verify-consumer.sh" > "$_log" 2>&1; then _rc=0; else _rc=$?; fi
+        _refused="$(grep -c 'did not create it' "$_log" 2>/dev/null || true)"
 
-    MARKER_AFTER="$(docker run --rm -v "$DECOY_VOL:/v" "$UTIL_IMAGE" \
-        sh -c 'cat /v/precious.txt 2>/dev/null' 2>/dev/null | tr -d '\r\n')"
-    VOL_AFTER="$(docker volume ls -q --filter "name=^${DECOY_VOL}$" 2>/dev/null)"
+        MARKER_AFTER="$(docker run --rm -v "$DECOY_VOL:/v" "$UTIL_IMAGE" \
+            sh -c 'cat /v/precious.txt 2>/dev/null' 2>/dev/null | tr -d '\r\n')"
+        VOL_AFTER="$(docker volume ls -q --filter "name=^${DECOY_VOL}$" 2>/dev/null)"
 
-    emit "2. a pre-existing consumer service and volume"
-    emit "   verify-consumer exit:         $_rc   (expected non-zero: refused)"
-    emit "   refusal messages:             ${_refused:-0}   (expected >= 1)"
-    emit "   the volume still exists:      $([ -n "$VOL_AFTER" ] && echo yes || echo NO)"
-    emit "   its contents survived:        $([ "$MARKER_AFTER" = "$MARKER_BEFORE" ] && [ -n "$MARKER_BEFORE" ] && echo yes || echo NO)"
-    [ "$_rc" != "0" ] || bad "the consumer exercise adopted a service it did not create"
-    [ "${_refused:-0}" -ge 1 ] || bad "the consumer exercise did not report a refusal"
-    [ -n "$VOL_AFTER" ] || bad "the pre-existing volume was deleted by an exercise that refused to run"
-    [ -n "$MARKER_BEFORE" ] && [ "$MARKER_AFTER" = "$MARKER_BEFORE" ] || bad "the pre-existing volume's contents were destroyed"
-
-    compose --profile consumer rm -f paperless-redis >/dev/null 2>&1 || true
+        emit "2. a pre-existing consumer service and volume"
+        emit "   verify-consumer exit:         $_rc   (expected non-zero: refused)"
+        emit "   refusal messages:             ${_refused:-0}   (expected >= 1)"
+        emit "   the volume still exists:      $([ -n "$VOL_AFTER" ] && echo yes || echo NO)"
+        emit "   its contents survived:        $([ "$MARKER_AFTER" = "$MARKER_BEFORE" ] && [ -n "$MARKER_BEFORE" ] && echo yes || echo NO)"
+        [ "$_rc" != "0" ] || bad "the consumer exercise adopted a service it did not create"
+        [ "${_refused:-0}" -ge 1 ] || bad "the consumer exercise did not report a refusal"
+        [ -n "$VOL_AFTER" ] || bad "the pre-existing volume was deleted by an exercise that refused to run"
+        [ -n "$MARKER_BEFORE" ] && [ "$MARKER_AFTER" = "$MARKER_BEFORE" ] || bad "the pre-existing volume's contents were destroyed"
+    fi
+    # Removed only if this invocation created it.
+    if [ "${REDIS_CREATED:-0}" = "1" ]; then
+        compose --profile consumer rm -f paperless-redis >/dev/null 2>&1 || true
+        if [ -n "$(compose --profile consumer ps -aq paperless-redis 2>/dev/null)" ]; then
+            bad "the decoy paperless-redis container this exercise created could not be removed"
+        fi
+    fi
     docker volume rm "$DECOY_VOL" >/dev/null 2>&1 && DECOY_CREATED=0
+    if [ -n "$(docker volume ls -q --filter "name=^${DECOY_VOL}$" 2>/dev/null)" ]; then
+        bad "the decoy volume this exercise created could not be removed"
+    fi
 fi
 emit ""
 
 AFTER="$(snapshot)"
-if [ "$BEFORE" = "$AFTER" ]; then
+# Everything but the destination's entry count must be identical. The count is
+# compared as an inequality because unrelated work delivering a document while
+# this runs is not a change this exercise made, and failing on it would report
+# somebody else's successful delivery as a refusal that mutated the stack. A
+# count that FELL is still a failure: that is something being destroyed.
+BEFORE_FIXED="$(printf '%s\n' "$BEFORE" | grep -v '^consume_entries=')"
+AFTER_FIXED="$(printf '%s\n' "$AFTER" | grep -v '^consume_entries=')"
+BEFORE_N="$(printf '%s\n' "$BEFORE" | sed -n 's/^consume_entries=//p')"
+AFTER_N="$(printf '%s\n' "$AFTER" | sed -n 's/^consume_entries=//p')"
+if [ "$BEFORE_FIXED" = "$AFTER_FIXED" ] && [ "${AFTER_N:-0}" -ge "${BEFORE_N:-0}" ]; then
     emit "The stack is exactly as it was found."
+    emit "  (destination entries ${BEFORE_N:-?} -> ${AFTER_N:-?}: nothing was removed)"
 else
     bad "the stack did not end as it began"
     emit "   BEFORE:"; printf '%s\n' "$BEFORE" | sed 's/^/     /' >> "$OUT"

@@ -191,14 +191,21 @@ restore() {
     if [ "${_r_left:-0}" != "0" ]; then _r_ok=0; fi
 
     compose up -d --force-recreate --wait --wait-timeout 180 renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
-    _r_ready="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck >/dev/null 2>&1 && echo yes || echo no)"
-    _r_readyw="$(compose exec -T watcher /usr/local/bin/fn-watcher healthcheck >/dev/null 2>&1 && echo yes || echo no)"
-    if [ "$_r_ready" != "yes" ] || [ "$_r_readyw" != "yes" ]; then _r_ok=0; fi
+    # Every service this invocation recreated, and READINESS for each.
+    # renamer-2 was recreated here and never checked, so a worker left unable
+    # to reach its dependencies would have been reported as a restored stack;
+    # and plain `healthcheck` reads /healthz, which a process answers while
+    # every dependency it needs is unreachable.
+    _r_ready="$(compose exec -T renamer-1 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    _r_ready2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    _r_readyw="$(compose exec -T watcher /usr/local/bin/fn-watcher healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
+    if [ "$_r_ready" != "yes" ] || [ "$_r_ready2" != "yes" ] || [ "$_r_readyw" != "yes" ]; then _r_ok=0; fi
     {
         printf '\nrestoration (read back from the running stack):\n'
         printf '  consumer containers left: %s\n' "${_r_left:-unknown}"
-        printf '  renamer-1 healthcheck:    %s\n' "$_r_ready"
-        printf '  watcher   healthcheck:    %s\n' "$_r_readyw"
+        printf '  renamer-1 ready:          %s\n' "$_r_ready"
+        printf '  renamer-2 ready:          %s\n' "$_r_ready2"
+        printf '  watcher   ready:          %s\n' "$_r_readyw"
     } >> "$OUT"
     exercise_unlock
     if [ "$_r_ok" != "1" ]; then
@@ -207,7 +214,7 @@ restore() {
         printf '\nRESTORATION FAILED — see the values above.\n' >> "$OUT"
         exit 1
     fi
-    note "restored: consumer removed, application services answering their own healthcheck"
+    note "restored: consumer removed, every recreated service reports itself READY"
 }
 
 exercise_lock consumer || exit 1

@@ -488,38 +488,44 @@ recreate_service() {
     compose up -d --force-recreate --wait --wait-timeout 180 "$@" >/dev/null 2>&1
 }
 
-# effective_value reads one field from a running application's own effective
-# configuration, so restoration is verified against what the process is
-# actually using rather than against a file on disk. A file can be correct
-# while the process that read it minutes ago is still running with the old
-# one -- which is exactly the failure this whole helper exists to catch.
+# effective_value reads one field from the configuration a RUNNING application
+# is actually holding, over the read-only gRPC inspection API.
 #
-# check-config prints JSON followed by a human line, so the JSON is decoded
-# with raw_decode rather than json.load: json.load would raise on the trailing
-# text and every reading would silently come back "unknown", which reads as a
-# difference and would make restoration checks pass or fail for the wrong
-# reason.
+# It used to run `check-config` inside the container, and that answers a
+# different question. `check-config` starts a NEW process, which reads the
+# environment and the configuration file as they are at that moment: a file
+# edited in place after startup, or an environment the running process never
+# saw, would be reported as the live configuration. The restoration checks
+# built on it therefore proved that the container could load the right
+# configuration, not that the process serving traffic had loaded it -- which is
+# the failure this helper exists to catch, so the helper was answering past it.
+#
+# GetEffectiveConfig returns the process's in-memory configuration, so the
+# reading is of the running application. It is read-only, which is the whole of
+# the accepted gRPC scope, and it is the client that already ships with the
+# stack rather than a new dependency.
+#
+# `unreadable` on any failure. A silent empty string would compare equal to
+# another silent empty string and make a restoration check pass because both
+# readings failed.
 effective_value() {
     _ev_svc="$1"; _ev_expr="$2"
-    compose exec -T "$_ev_svc" /usr/local/bin/fn-renamer check-config 2>/dev/null \
+    compose --profile tools run --rm -T \
+        -e FN_GRPC_TARGET="$_ev_svc:${FN_GRPC_PORT:-9090}" fnctl config 2>/dev/null \
         | run_py "import json,sys
 try:
-    d, _ = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())
+    outer = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())[0]
+    d = json.loads(outer['effectiveJson'])
     print($_ev_expr)
 except Exception:
     print('unreadable')"
 }
 
-# watcher_effective_value is the same for the watcher, which ships its own
-# binary name.
+# watcher_effective_value is the same reading for the watcher. It is kept as a
+# separate name because the callers read like sentences, but there is no longer
+# anything service-specific about it: the API is the same on every service.
 watcher_effective_value() {
-    compose exec -T watcher /usr/local/bin/fn-watcher check-config 2>/dev/null \
-        | run_py "import json,sys
-try:
-    d, _ = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())
-    print($1)
-except Exception:
-    print('unreadable')"
+    effective_value watcher "$1"
 }
 
 # run_py runs Python inside a container. Development tooling does not run on
