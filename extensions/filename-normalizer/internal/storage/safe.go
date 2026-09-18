@@ -489,23 +489,35 @@ func CopyVerified(src, dst string) (CopyResult, error) {
 // src and dst must be on the same filesystem, which is why the caller stages
 // the temporary inside the destination directory. The publication step
 // therefore never crosses a filesystem boundary, whatever the topology.
-func PublishExclusive(src, dst string) error {
+// It reports `published` separately from `err` because the three operations it
+// performs are not equivalent. The link either created the directory entry or
+// it did not; everything after that happens to a document the consumer can
+// already see. Returning all three through one error value meant the caller
+// could only ask "did this fail", and it answered by inspecting the errno --
+// so an EACCES from the post-link unlink was read as a refusal that proved
+// nothing had been published, the publication claim was withdrawn, and a
+// retry could publish the document a second time after a consumer had taken
+// the first. `published` is the only thing that can answer that question, and
+// only this function knows it.
+func PublishExclusive(src, dst string) (published bool, err error) {
 	if err := os.Link(src, dst); err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			return fmt.Errorf("%w: %s", ErrDestinationExists, filepath.Base(dst))
+			return false, fmt.Errorf("%w: %s", ErrDestinationExists, filepath.Base(dst))
 		}
-		return fmt.Errorf("link into place: %w", err)
+		return false, fmt.Errorf("link into place: %w", err)
 	}
+	// From here the document IS published: it is visible at dst under a name
+	// nothing else may take. Failures below are reported, never reclassified.
 	if err := SyncDir(filepath.Dir(dst)); err != nil {
 		// The link exists; report the failure without unlinking, because
 		// removing a published document to tidy up an fsync error would be
 		// worse than the error.
-		return fmt.Errorf("sync destination directory: %w", err)
+		return true, fmt.Errorf("sync destination directory: %w", err)
 	}
 	if err := os.Remove(src); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove the staged link: %w", err)
+		return true, fmt.Errorf("remove the staged link: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // LinkExclusive links src to dst and reports whether dst already existed.

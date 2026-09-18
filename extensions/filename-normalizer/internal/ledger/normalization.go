@@ -199,14 +199,20 @@ func ClaimHolder(err error) string {
 //
 // A claim held by a process that has since died is taken over only when it is
 // older than takeoverAfter, which the caller sets from its own handler budget.
-func (l *Ledger) ClaimPublication(ctx context.Context, jobID, reserved string, inode, device int64, attempt int, takeoverAfter time.Duration) (PublishClaim, error) {
+func (l *Ledger) ClaimPublication(ctx context.Context, jobID, reserved string, inode, device int64, attempt int, token string, takeoverAfter time.Duration) (PublishClaim, error) {
 	var claim PublishClaim
 	err := l.tx(ctx, func(tx pgx.Tx) error {
+		// The guard is the TOKEN, not the instance name. Matching on the
+		// instance let two handlers in one renamer both hold the claim -- they
+		// share the name -- so "exclusive per job" was really "exclusive per
+		// job per process", and the second handler simply overwrote the
+		// first's recorded inode.
 		row := tx.QueryRow(ctx, `
 			UPDATE jobs
 			   SET state = 'publishing',
 			       reserved_name = $2,
 			       publish_claimed_by = $3,
+			       publish_claim_token = $7,
 			       publish_inode = $4,
 			       publish_device = $5,
 			       publish_attempted_at = now(),
@@ -214,31 +220,50 @@ func (l *Ledger) ClaimPublication(ctx context.Context, jobID, reserved string, i
 			 WHERE job_id = $1
 			   AND state IN ('processing', 'publishing')
 			   AND NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = $1)
-			   AND (publish_claimed_by IS NULL
-			        OR publish_claimed_by = $3
+			   AND (publish_claim_token IS NULL
+			        OR publish_claim_token = $7
 			        OR publish_attempted_at < now() - $6::interval)
 			RETURNING reserved_name, publish_claimed_by, publish_inode, publish_device`,
-			jobID, reserved, l.actor, inode, device, takeoverAfter.String())
+			jobID, reserved, l.actor, inode, device, takeoverAfter.String(), token)
 		if err := row.Scan(&claim.Name, &claim.ClaimedBy, &claim.Inode, &claim.Device); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				// Either the job is not publishable, it already has a receipt,
 				// or a live sibling holds the claim. Tell those apart so the
 				// caller can settle rather than spin.
 				var state string
-				var holder *string
+				var holder, heldToken *string
 				qerr := tx.QueryRow(ctx,
-					`SELECT state, publish_claimed_by FROM jobs WHERE job_id = $1`, jobID).Scan(&state, &holder)
+					`SELECT state, publish_claimed_by, publish_claim_token FROM jobs WHERE job_id = $1`,
+					jobID).Scan(&state, &holder, &heldToken)
 				if errors.Is(qerr, pgx.ErrNoRows) {
 					return ErrNotFound
 				}
 				if qerr != nil {
 					return qerr
 				}
-				if holder != nil && *holder != l.actor {
-					return fmt.Errorf("%w: held by %s", ErrPublicationInProgress, *holder)
+				// Compared by token: another handler of THIS instance is still
+				// another attempt, and telling it to carry on because the
+				// process name matched is the whole defect.
+				if heldToken != nil && *heldToken != token {
+					held := "unknown"
+					if holder != nil {
+						held = *holder
+					}
+					return fmt.Errorf("%w: held by %s", ErrPublicationInProgress, held)
 				}
 				return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
 			}
+			return err
+		}
+		// Remember the inode for the JOB, not just for the current claim. An
+		// attempt that resumes after the claim has moved on must still be able
+		// to recognise a sibling attempt's document as this job's own, instead
+		// of calling it foreign and publishing a suffixed second copy.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO job_publication_inodes (job_id, device, inode, attempt, claimed_by)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (job_id, device, inode) DO NOTHING`,
+			jobID, device, inode, attempt, l.actor); err != nil {
 			return err
 		}
 		return l.appendEvent(ctx, tx, eventInput{
@@ -252,6 +277,82 @@ func (l *Ledger) ClaimPublication(ctx context.Context, jobID, reserved string, i
 		return PublishClaim{}, err
 	}
 	return claim, nil
+}
+
+// OwnsDestination reports whether a file identity belongs to this job.
+//
+// It asks about the JOB, across every attempt that ever staged a file for it,
+// which is the question that matters at an occupied destination. Asking only
+// about the current claim's inode made an attempt that resumed after the claim
+// moved on classify a SIBLING ATTEMPT'S document -- this job's own document,
+// under this job's own reserved name -- as foreign, and advance to a suffix.
+// With separate staging and consume filesystems that is the ordinary case, not
+// an exotic one, because competing attempts stage different inodes by
+// construction.
+func (l *Ledger) OwnsDestination(ctx context.Context, jobID string, device, inode int64) (bool, error) {
+	var owns bool
+	err := l.primary.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM job_publication_inodes
+			 WHERE job_id = $1 AND device = $2 AND inode = $3)`,
+		jobID, device, inode).Scan(&owns)
+	if err != nil {
+		return false, fmt.Errorf("check destination ownership: %w", err)
+	}
+	return owns, nil
+}
+
+// PublicationStanding is what the durable record says about a job's
+// publication at one moment.
+type PublicationStanding struct {
+	State      string
+	HeldBySelf bool
+	Holder     string
+	HasReceipt bool
+	// DeliveredName is set when a receipt exists.
+	DeliveredName string
+}
+
+// Standing reports whether this attempt's claim still stands and whether some
+// other attempt has already recorded a delivery.
+//
+// It exists for the moment AFTER a successful link. A claim can be taken over
+// on a timeout, and a timeout cannot tell a dead worker from a slow one: the
+// earlier worker keeps its filesystem access and can still link. So an attempt
+// that has just published asks whether it is still the publisher of record. If
+// it is not, it has created a second copy of a document that is already
+// delivered, and it is the only party that can say so -- and the only one that
+// knows which inode is its own.
+func (l *Ledger) Standing(ctx context.Context, jobID, token string) (PublicationStanding, error) {
+	var (
+		st        PublicationStanding
+		holder    *string
+		held      *string
+		delivered *string
+	)
+	err := l.primary.QueryRow(ctx, `
+		SELECT j.state,
+		       j.publish_claimed_by,
+		       j.publish_claim_token,
+		       r.delivered_name
+		  FROM jobs j
+		  LEFT JOIN delivery_receipts r ON r.job_id = j.job_id
+		 WHERE j.job_id = $1`, jobID).Scan(&st.State, &holder, &held, &delivered)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return PublicationStanding{}, ErrNotFound
+		}
+		return PublicationStanding{}, fmt.Errorf("read publication standing: %w", err)
+	}
+	st.HeldBySelf = held != nil && *held == token
+	if holder != nil {
+		st.Holder = *holder
+	}
+	if delivered != nil {
+		st.HasReceipt = true
+		st.DeliveredName = *delivered
+	}
+	return st, nil
 }
 
 // AbandonPublication withdraws a claim for a publication that DID NOT HAPPEN.
@@ -274,20 +375,30 @@ func (l *Ledger) ClaimPublication(ctx context.Context, jobID, reserved string, i
 //
 // Withdrawing the claim returns the job to `processing`, so the next delivery
 // is an ordinary attempt.
-func (l *Ledger) AbandonPublication(ctx context.Context, jobID string, attempt int, reason string) error {
+func (l *Ledger) AbandonPublication(ctx context.Context, jobID, token string, attempt int, reason string) error {
 	return l.tx(ctx, func(tx pgx.Tx) error {
+		// Guarded by the token: only the attempt that took this claim may
+		// withdraw it. Matching on the instance name let one handler withdraw
+		// a claim a sibling handler in the same process was still using.
+		//
+		// The remembered inode in job_publication_inodes is deliberately NOT
+		// deleted. The claim is being withdrawn because this attempt did not
+		// publish, but a file it staged may still exist somewhere, and
+		// forgetting that identity is how a later attempt comes to call this
+		// job's own file foreign.
 		tag, err := tx.Exec(ctx, `
 			UPDATE jobs
 			   SET state = 'processing',
 			       publish_claimed_by = NULL,
+			       publish_claim_token = NULL,
 			       publish_inode = NULL,
 			       publish_device = NULL,
 			       updated_at = now()
 			 WHERE job_id = $1
 			   AND state = 'publishing'
-			   AND publish_claimed_by = $2
+			   AND publish_claim_token = $2
 			   AND NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = $1)`,
-			jobID, l.actor)
+			jobID, token)
 		if err != nil {
 			return err
 		}

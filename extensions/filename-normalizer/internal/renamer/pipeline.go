@@ -17,6 +17,7 @@ import (
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/config"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/jobs"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/ledger"
+	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/logging"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/naming"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/storage"
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/telemetry"
@@ -455,10 +456,13 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		return out, true
 	}
 
-	// Claim the right to publish. Exclusive per job: a sibling mid-publication
-	// makes this attempt stand down rather than race it to a suffixed name.
+	// Claim the right to publish. Exclusive per ATTEMPT, not per process: the
+	// token below is what the ledger guards on, because every handler in one
+	// renamer shares the instance name and two of them holding "the exclusive
+	// claim" at once is not exclusivity.
+	token := nonce()
 	claim, cerr := p.led.ClaimPublication(ctx, job.JobID, candidate,
-		int64(staged.Inode), int64(staged.Device), attempt, p.cfg.PublishTakeoverAfter)
+		int64(staged.Inode), int64(staged.Device), attempt, token, p.cfg.PublishTakeoverAfter)
 	switch {
 	case errors.Is(cerr, ledger.ErrPublicationInProgress):
 		log.Info("another attempt is publishing this job; standing down",
@@ -466,9 +470,12 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			slog.String("held_by", ledger.ClaimHolder(cerr)))
 		return deferred(ledger.ClaimHolder(cerr), cerr), true
 	case errors.Is(cerr, ledger.ErrOutcomeAlreadyRecorded):
-		log.Info("a durable outcome was recorded while this attempt was preparing",
-			slog.String("event", "outcome_preserved"))
-		return settled("delivered", jobs.StateDelivered, ""), true
+		// Read what stands. Reporting `delivered` here was a guess, and a
+		// wrong one whenever the preserved outcome was a hold.
+		if out, ok := p.settleAgainstPreserved(ctx, job.JobID, log); ok {
+			return out, true
+		}
+		return unsettled(cerr), true
 	case cerr != nil:
 		return unsettled(cerr), true
 	}
@@ -493,8 +500,8 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	// property.
 	p.faults.Pause(config.FaultHoldAfterClaim, log)
 
-	err := storage.PublishExclusive(tmp, final)
-	if err == nil {
+	published, err := storage.PublishExclusive(tmp, final)
+	if published {
 		// Fired only when the link actually succeeded, so `after_link` means
 		// what its name says. An EEXIST interruption is a different scenario
 		// and would need its own point.
@@ -505,8 +512,33 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		p.faults.Pause(config.FaultHoldAfterLink, log)
 	}
 
+	// A successful link is not yet a sole publication. The claim can have been
+	// taken over while this attempt was between its claim and its link -- a
+	// takeout is a timeout, and a timeout cannot tell a dead worker from a
+	// slow one, while the slow one keeps its filesystem access. If another
+	// attempt's delivery is already recorded, this attempt has just created a
+	// SECOND copy of a document that is already delivered, and it is the only
+	// party that knows which inode is its own.
+	if published {
+		if out, done := p.withdrawDuplicate(ctx, job, final, staged, token, attempt, log); done {
+			return out, true
+		}
+	}
+
 	switch {
-	case err == nil:
+	case published:
+		// `published`, not `err == nil`. The link created the directory entry;
+		// the sync and the removal of the staged temporary happen to a
+		// document the consumer can already see. Judging those by their errno
+		// -- which is what happened before -- let a post-link EACCES be read
+		// as "nothing was published", withdraw the claim, and leave a retry
+		// free to publish the document a second time after a consumer had
+		// taken the first.
+		if err != nil {
+			log.Error("the document was published, but the step after it failed",
+				slog.String("event", "publication_completed_with_error"),
+				slog.String("category", string(jobs.Category(storage.RejectionCategory(err)))))
+		}
 		// The link returned success, so publication HAPPENED. What is at the
 		// destination now is a separate question: a consumer may already have
 		// taken it. Reading the destination is therefore best-effort evidence,
@@ -516,7 +548,13 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			size = *job.SizeBytes
 		}
 		absent := false
-		switch sum, n, ferr := storage.Fingerprint(final); {
+		// Read back through a descriptor whose identity is checked against the
+		// inode that was linked, not by reopening the pathname and trusting it
+		// still leads to the same file. Between the link and the read a
+		// consumer can take the document and anything at all can take the
+		// name; a plain reopen would hash a stranger's bytes and compare them
+		// to this job's fingerprint.
+		switch sum, n, ferr := fingerprintPublished(root, candidate, staged); {
 		case ferr == nil:
 			if job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint) {
 				log.Error("the published file is not this job's content",
@@ -534,6 +572,18 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			absent = true
 			log.Info("the destination was removed immediately after publication; recording the delivery",
 				slog.String("event", "destination_consumed_immediately"))
+		case errors.Is(ferr, storage.ErrMutated):
+			// The name now leads to a different file: this job's document was
+			// taken and something else was put there, or it was replaced
+			// outright. The publication still happened -- the link returned
+			// success and the inode it created was this attempt's -- so the
+			// delivery stands and its file is absent. What occupies the name
+			// now belongs to whoever put it there; republishing over it, or
+			// calling this job's completed delivery a conflict, would both be
+			// wrong.
+			absent = true
+			log.Warn("the destination was replaced immediately after publication; the delivery stands",
+				slog.String("event", "destination_replaced_after_publication"))
 		default:
 			cat := jobs.Category(storage.RejectionCategory(ferr))
 			out, _ := p.holdOr(ctx, job, cat, attempt, ferr)
@@ -581,19 +631,21 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			slog.String("event", "publication_failed"),
 			slog.String("category", string(cat)))
 
-		// link(2) is atomic: a refusal means no directory entry was created,
-		// so nothing was published and the claim should not stand. Leaving it
-		// standing left the job in `publishing`, which is the recovery path's
-		// input -- so the next delivery did not retry the write, it "recovered"
-		// it, found no destination, and recorded `uncertain`. A destination the
-		// kernel had plainly refused became an unresolvable outcome instead of
-		// a retry that would have recorded the real reason.
+		// Reached only when the link itself failed, which `published` now
+		// decides rather than the errno. link(2) is atomic: a refusal means no
+		// directory entry was created, so nothing was published and the claim
+		// should not stand. Leaving it standing left the job in `publishing`,
+		// which is the recovery path's input -- so the next delivery did not
+		// retry the write, it "recovered" it, found no destination, and
+		// recorded `uncertain`. A destination the kernel had plainly refused
+		// became an unresolvable outcome instead of a retry that would have
+		// recorded the real reason.
 		//
-		// Only definite refusals qualify. An ambiguous failure must keep the
-		// claim, because then a publication may in fact have happened.
+		// Only definite refusals qualify even here. An ambiguous failure must
+		// keep the claim, because then a publication may in fact have happened.
 		if definitelyNotPublished(err) {
 			actx, acancel := durably(ctx)
-			aerr := p.led.AbandonPublication(actx, job.JobID, attempt, string(cat))
+			aerr := p.led.AbandonPublication(actx, job.JobID, token, attempt, string(cat))
 			acancel()
 			if aerr != nil {
 				log.Warn("could not withdraw the publication claim after a refused link",
@@ -607,8 +659,159 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	}
 }
 
+// settleAgainstPreserved settles against the outcome that actually stands.
+//
+// The ledger refuses a write that would replace a durable outcome, and returns
+// ErrOutcomeAlreadyRecorded. The callers used to answer that refusal by
+// asserting an outcome of their own -- the claim path reported `delivered`, the
+// hold path reported `held` -- without reading what was preserved. A job that
+// is `held` was therefore reported and counted as a delivery, and a job that is
+// `delivered` as a hold. The refusal says only "somebody got there first"; what
+// they wrote has to be read.
+//
+// `ok` is false when the preserved outcome could not be read, in which case the
+// delivery goes back rather than being labelled from a guess.
+func (p *Pipeline) settleAgainstPreserved(ctx context.Context, jobID string, log *slog.Logger) (Outcome, bool) {
+	fresh, err := p.led.ReadJob(ctx, jobID)
+	if err != nil {
+		log.Warn("a durable outcome is recorded but could not be read; returning the delivery",
+			slog.String("event", "preserved_outcome_unreadable"),
+			slog.String("error_kind", logging.ErrorKind(err)))
+		return Outcome{}, false
+	}
+	cat := jobs.Category(categoryOfJob(fresh))
+	log.Info("a durable outcome is already recorded for this job; settling against it",
+		slog.String("event", "outcome_preserved"),
+		slog.String("state", string(fresh.State)),
+		slog.String("category", string(cat)))
+	return settled(string(fresh.State), fresh.State, cat), true
+}
+
+// categoryOfJob reports a job's failure category, or "" when it has none.
+func categoryOfJob(j ledger.Job) string {
+	if j.FailureCategory == nil {
+		return ""
+	}
+	return *j.FailureCategory
+}
+
+// recordAbsentDelivery records a delivery whose file has already gone.
+//
+// Reconciliation identifies the destination and then reads it, and a consumer
+// can take the document between those two operations -- Paperless polls every
+// second. The old code ran that ENOENT through the generic storage classifier
+// and held the job as `source_absent`: a missing SOURCE reported for a
+// publication that had happened, with the source sitting untouched in the
+// incoming directory. The delivery is recorded from what the job already knows
+// about its own content, and the absence is recorded with it.
+func (p *Pipeline) recordAbsentDelivery(ctx context.Context, job ledger.Job, root, name string, attempt int, log *slog.Logger) Outcome {
+	if job.Fingerprint == nil {
+		// Nothing to record a receipt from. Uncertain is the honest answer
+		// rather than a receipt with invented content.
+		log.Error("the document went before it could be read and this job has no recorded fingerprint",
+			slog.String("event", "publication_uncertain"),
+			slog.String("category", string(jobs.CategoryPublicationUncertain)))
+		return p.uncertain(ctx, job, attempt)
+	}
+	size := int64(0)
+	if job.SizeBytes != nil {
+		size = *job.SizeBytes
+	}
+	rctx, rcancel := durably(ctx)
+	defer rcancel()
+	receipt := ledger.Receipt{
+		JobID: job.JobID, DestinationRoot: root, DeliveredName: name,
+		SizeBytes: size, Fingerprint: job.Fingerprint, Attempt: attempt,
+	}
+	if err := p.led.RecordDelivered(rctx, receipt, true); err != nil {
+		return unsettled(err)
+	}
+	if nerr := p.led.NoteDeliveredFileAbsent(rctx, job.JobID); nerr != nil {
+		log.Warn("could not record that the delivered file was already absent",
+			slog.String("event", "absence_note_failed"))
+	}
+	log.Info("recovered a publication whose file had already been taken",
+		slog.String("event", "delivery_reconciled"),
+		slog.Bool("destination_already_absent", true))
+	return settled("reconciled", jobs.StateDelivered, "")
+}
+
+// withdrawDuplicate removes a second copy this attempt has just created,
+// when the durable record says another attempt's delivery already stands.
+//
+// This is the one place that removes a published file, and it is safe for one
+// reason: the file removed is identified by the inode THIS attempt linked a
+// moment ago, and it is removed only when the ledger already holds a receipt
+// written by somebody else. The alternative is worse than it sounds -- one
+// submission visible twice in the consumer's inbox, with one receipt, so the
+// second copy belongs to no job and nothing will ever reconcile it.
+//
+// It reports `done` when the caller must stop: the outcome has been settled
+// against the delivery that stands.
+func (p *Pipeline) withdrawDuplicate(ctx context.Context, job ledger.Job, final string, staged storage.Entry, token string, attempt int, log *slog.Logger) (Outcome, bool) {
+	sctx, scancel := durably(ctx)
+	defer scancel()
+	standing, serr := p.led.Standing(sctx, job.JobID, token)
+	if serr != nil {
+		// Unknown standing is not evidence of a duplicate. Leave the document
+		// in place and let the ordinary path record it; a receipt that cannot
+		// be written is handled there.
+		log.Warn("could not read the publication standing after linking",
+			slog.String("event", "standing_unreadable"),
+			slog.String("error_kind", logging.ErrorKind(serr)))
+		return Outcome{}, false
+	}
+	if !standing.HasReceipt {
+		// No competing delivery is recorded. Losing the claim without a
+		// receipt is not a reason to remove anything: this attempt's link may
+		// well be the publication that gets recorded.
+		return Outcome{}, false
+	}
+
+	// Remove only this attempt's own inode, and only if that is still what the
+	// name resolves to.
+	removed := false
+	if got, ierr := storage.Identify(final); ierr == nil && got.Inode == staged.Inode && got.Device == staged.Device {
+		if rerr := os.Remove(final); rerr == nil {
+			removed = true
+		} else if !errors.Is(rerr, fs.ErrNotExist) {
+			log.Error("could not remove the duplicate this attempt published",
+				slog.String("event", "duplicate_not_withdrawn"),
+				slog.String("error_kind", storage.RejectionCategory(rerr)))
+		}
+	}
+	log.Warn("another attempt's delivery already stands; withdrawing this attempt's copy",
+		slog.String("event", "duplicate_publication_withdrawn"),
+		slog.Bool("removed", removed),
+		slog.String("delivered_as", standing.DeliveredName))
+	return settled("delivered", jobs.StateDelivered, ""), true
+}
+
+// fingerprintPublished reads back a document this attempt published, through a
+// descriptor it has proved is the file it linked.
+//
+// `expect` is the identity of the staged temporary, which after a successful
+// link is also the identity of the destination. Opening the pathname again and
+// hashing whatever answers is the check/use gap: a consumer can take the
+// document and something else can take the name in between, and the hash would
+// then be compared against this job's fingerprint as though it meant something.
+// A changed identity comes back as ErrMutated and is handled as what it is.
+func fingerprintPublished(root, candidate string, expect storage.Entry) ([]byte, int64, error) {
+	f, _, err := storage.OpenExpected(root, candidate, expect, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+	return storage.FingerprintFile(f)
+}
+
 // definitelyNotPublished reports whether a link failure proves no directory
 // entry was created.
+//
+// It is consulted only when the link itself failed. Whether the link succeeded
+// is now reported separately by PublishExclusive, because an errno cannot
+// answer it: EACCES from the post-link unlink and EACCES from the link are the
+// same value and opposite facts.
 //
 // The listed errors are refusals the kernel makes BEFORE creating anything:
 // permission, a read-only filesystem, no space, a name the filesystem will not
@@ -662,11 +865,30 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 		return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt), true
 	}
 
-	ours := fresh.PublishInode != nil && fresh.PublishDevice != nil &&
-		*fresh.PublishInode == int64(got.Inode) && *fresh.PublishDevice == int64(got.Device)
+	// Ownership is a question about the JOB, not about the attempt asking.
+	// Comparing against the current claim's inode made an attempt that resumed
+	// after the claim moved on treat a SIBLING ATTEMPT'S document -- this job's
+	// own document, under this job's own reserved name -- as foreign, and
+	// advance to a suffixed second copy. Separate staging and consume
+	// filesystems make that the ordinary case, because competing attempts then
+	// stage different inodes by construction.
+	ours, oerr := p.led.OwnsDestination(ctx, job.JobID, int64(got.Device), int64(got.Inode))
+	if oerr != nil {
+		return unsettled(oerr), true
+	}
 
 	if ours {
-		sum, size, serr := storage.Fingerprint(final)
+		sum, size, serr := fingerprintPublished(root, candidate, got)
+		if errors.Is(serr, fs.ErrNotExist) || errors.Is(serr, storage.ErrMutated) {
+			// Taken, or replaced, between identifying it and reading it. This
+			// job's document was at that name and is this job's own, so the
+			// delivery stands and its file is absent -- reporting a missing
+			// SOURCE here was the same misdiagnosis the publication path used
+			// to make, one step further along.
+			log.Info("this job's document went while it was being reconciled; recording the delivery",
+				slog.String("event", "destination_consumed_during_recovery"))
+			return p.recordAbsentDelivery(ctx, job, root, candidate, attempt, log), true
+		}
 		if serr != nil {
 			out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)
 			return out, true
@@ -762,15 +984,29 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 		// Identity first. A foreign file whose bytes matched this job's was
 		// previously adopted here, which both took someone else's file and
 		// deduplicated two submissions that must stay distinct.
-		ours := job.PublishInode != nil && job.PublishDevice != nil &&
-			*job.PublishInode == int64(got.Inode) && *job.PublishDevice == int64(got.Device)
+		// Any inode this job ever staged, not just the current claim's: an
+		// attempt of this job that published before the claim moved on left a
+		// file that is still this job's own.
+		ours, oerr := p.led.OwnsDestination(ctx, job.JobID, int64(got.Device), int64(got.Inode))
+		if oerr != nil {
+			return unsettled(oerr)
+		}
 		if !ours {
 			log.Error("the reserved destination holds a file this job did not link",
 				slog.String("event", "destination_conflict"),
 				slog.String("category", string(jobs.CategoryDestinationConflict)))
 			return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt)
 		}
-		sum, size, serr := storage.Fingerprint(final)
+		sum, size, serr := fingerprintPublished(root, name, got)
+		if errors.Is(serr, fs.ErrNotExist) || errors.Is(serr, storage.ErrMutated) {
+			// Identified as this job's, then gone before it could be read --
+			// a consumer taking it is the ordinary reason. The publication
+			// happened and the delivery stands; calling this a missing source
+			// would lose a completed delivery from the accounting.
+			log.Info("this job's document went while it was being reconciled; recording the delivery",
+				slog.String("event", "destination_consumed_during_recovery"))
+			return p.recordAbsentDelivery(ctx, job, root, name, attempt, log)
+		}
 		if serr != nil {
 			out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)
 			return out
@@ -859,12 +1095,14 @@ func (p *Pipeline) hold(ctx context.Context, job ledger.Job, cat jobs.Category, 
 		return settled("held", jobs.StateHeld, cat)
 	case errors.Is(err, ledger.ErrOutcomeAlreadyRecorded):
 		// Another attempt reached a durable outcome first and it stands. This
-		// attempt settles against it rather than demoting it or retrying.
-		p.log.Info("a newer outcome is already recorded for this job; not overwriting it",
-			slog.String("event", "outcome_preserved"),
-			slog.String("job_id", job.JobID),
-			slog.String("category", string(cat)))
-		return settled("held", jobs.StateHeld, cat)
+		// attempt settles against WHAT STANDS -- previously it reported `held`
+		// with its own category, so a delivery that had beaten it was recorded
+		// in the metrics and the log as a hold.
+		log := p.log.With(slog.String("job_id", job.JobID))
+		if out, ok := p.settleAgainstPreserved(ctx, job.JobID, log); ok {
+			return out
+		}
+		return unsettled(err)
 	default:
 		return unsettled(err)
 	}
@@ -901,6 +1139,17 @@ func (p *Pipeline) uncertain(ctx context.Context, job ledger.Job, attempt int) O
 	ctx, cancel := durably(ctx)
 	defer cancel()
 	if err := p.led.RecordUncertain(ctx, job.JobID, jobs.CategoryPublicationUncertain, attempt); err != nil {
+		// A refusal is not an outage. RecordUncertain is guarded so it cannot
+		// demote a delivery that already stands, and that guard firing was
+		// being returned as a bare error -- which the processor reported as a
+		// PostgreSQL failure and answered by detaching the consumer. The
+		// database did exactly what it was asked to do.
+		if errors.Is(err, ledger.ErrOutcomeAlreadyRecorded) {
+			log := p.log.With(slog.String("job_id", job.JobID))
+			if out, ok := p.settleAgainstPreserved(ctx, job.JobID, log); ok {
+				return out
+			}
+		}
 		return unsettled(err)
 	}
 	return settled("uncertain", jobs.StateUncertain, jobs.CategoryPublicationUncertain)

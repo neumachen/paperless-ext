@@ -199,15 +199,20 @@ func (p *Processor) handle(ctx context.Context, d broker.Delivery) broker.Decisi
 	if !out.Settled {
 		// Nothing was committed, so the delivery must go back to the broker.
 		p.base.Metrics.Deliveries.WithLabelValues("requeued").Inc()
-		if out.Err != nil {
-			p.base.Metrics.LedgerErrors.WithLabelValues(logging.ErrorKind(out.Err)).Inc()
-		}
+
 		// Say which dependency actually failed. A refused destination and a
 		// full disk used to be reported as a PostgreSQL problem, which sent an
 		// operator to look at a database that was working perfectly.
 		dep, cat := out.Dependency, out.Cause
 		if dep == "" {
 			dep, cat = "postgres_primary", jobs.CategoryLedgerUnavailable
+		}
+		// Count a ledger error only when the ledger is what failed. Every
+		// storage retry used to land on this counter, so a disk with no space
+		// read on the dashboard as a database outage -- and the alert built on
+		// it would have pointed at the wrong dependency during an incident.
+		if out.Err != nil && dep == "postgres_primary" {
+			p.base.Metrics.LedgerErrors.WithLabelValues(logging.ErrorKind(out.Err)).Inc()
 		}
 		log.Error("could not reach a durable outcome; returning the delivery",
 			slog.String("event", "delivery_requeued"),
