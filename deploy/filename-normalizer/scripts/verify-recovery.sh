@@ -201,6 +201,17 @@ cleanup_planted() {
         return 1
     fi
     in_storage "rm -f '$PLANTED_PATH' 2>/dev/null; true" >/dev/null 2>&1 || true
+    # Verified, then forgotten. Clearing the record unconditionally discarded
+    # the only note of a file this exercise had written into the real consume
+    # directory: `rm -f` reports nothing, so a removal that failed left the
+    # planted file in place and the variable that would have reported it empty,
+    # and the run went on to announce a clean restoration.
+    _cp_after="$(in_storage "ls -i '$PLANTED_PATH' 2>/dev/null | awk '{print \$1}'")"
+    if [ -n "$_cp_after" ]; then
+        echo "error: the planted file $PLANTED_PATH (inode $PLANTED_INODE) could not be removed." >&2
+        printf '\nPLANTED FILE NOT REMOVED: %s inode %s\n' "$PLANTED_PATH" "$PLANTED_INODE" >> "$OUT"
+        return 1
+    fi
     PLANTED_PATH=""; PLANTED_INODE=""
     return 0
 }
@@ -220,13 +231,14 @@ restore() {
         return 0
     fi
     log "restoring the stack and verifying the running state"
+    _r_planted_failed=0
 
     # Reconnect first. Everything below needs the network back, and a container
     # left disconnected is the most damaging thing this script can leave behind.
     heal_network
     restore_perm || _r_perm_failed=1
-    cleanup_planted || true
-    drop_fault renamer-fault renamer-hold renamer-altfs renamer-tinyfs renamer-permdenied renamer-tmpfsdest
+    cleanup_planted || _r_planted_failed=1
+    drop_fault renamer-fault renamer-hold renamer-altfs renamer-tinyfs renamer-permdenied renamer-tmpfsdest renamer-same-instance renamer-taker
 
     # Recreate rather than start: a service that was recreated with an
     # environment override keeps that environment across a plain restart. The
@@ -279,6 +291,8 @@ restore() {
     _r_ready2="$(compose exec -T renamer-2 /usr/local/bin/fn-renamer healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
     _r_readyw="$(compose exec -T watcher /usr/local/bin/fn-watcher healthcheck --require-ready >/dev/null 2>&1 && echo yes || echo no)"
     if [ "$_r_ready" != "yes" ] || [ "$_r_ready2" != "yes" ] || [ "$_r_readyw" != "yes" ]; then _r_ok=0; fi
+    if [ "${_r_planted_failed:-0}" = "1" ]; then _r_ok=0; fi
+    if [ "${_r_perm_failed:-0}" = "1" ]; then _r_ok=0; fi
 
     # No fault service this run created may be left behind.
     _r_left="$(printf '%s' "$CREATED" | tr -s ' ')"
@@ -305,7 +319,7 @@ restore() {
 }
 
 exercise_lock recovery || exit 1
-trap 'restore' EXIT
+trap 'report_keep; restore' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -316,7 +330,7 @@ trap 'exit 143' TERM
 # restore trap then restarted them. Refusing here means refusing before the
 # first change.
 for _pf in renamer-fault renamer-hold renamer-altfs renamer-tinyfs \
-           renamer-permdenied renamer-tmpfsdest; do
+           renamer-permdenied renamer-tmpfsdest renamer-same-instance renamer-taker; do
     if [ -n "$(compose --profile fault ps -aq "$_pf" 2>/dev/null)" ]; then
         echo "error: service '$_pf' already exists; this invocation did not create it" >&2
         echo "       and will not remove it. Refusing before anything is changed." >&2
@@ -324,7 +338,7 @@ for _pf in renamer-fault renamer-hold renamer-altfs renamer-tinyfs \
     fi
 done
 
-: > "$OUT"
+report_begin "recovery" "$OUT" "$0"
 emit "FN-N010 — interruption, stale worker, filesystem boundaries, write failures"
 emit ""
 
@@ -450,7 +464,12 @@ sleep 5
 STATE2B="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB2';")"
 EVENTS_AFTER2="$(psqlq "SELECT count(*) FROM job_events e WHERE e.job_id = '$JOB2';")"
 NEWEVENTS2="$(psqlq "SELECT string_agg(event_type, ',' ORDER BY event_id) FROM (SELECT event_type, event_id FROM job_events WHERE job_id = '$JOB2' ORDER BY event_id DESC LIMIT ($EVENTS_AFTER2 - $EVENTS_BEFORE2)) t;")"
-SETTLED2="$(compose logs --since 3m renamer-1 renamer-2 2>/dev/null | grep -c "delivery_settled.*$JOB2" || true)"
+# The job id precedes the event in the JSON -- `log.With(job_id...)` attaches
+# it first -- so a pattern requiring the event BEFORE the id matched nothing
+# and reported "0 settlement lines" for deliveries that had settled perfectly
+# well. Both must be present; neither order is promised.
+SETTLED2="$(compose logs --since 5m renamer-1 renamer-2 2>/dev/null \
+    | grep "$JOB2" | grep -c 'delivery_settled' || true)"
 PUBLISHED2B="$(in_storage "test -f '/srv/fn/consume/$NAME2' && echo yes || echo no")"
 
 emit "   a later delivery was published to the real queue: $REPUB2"
@@ -471,8 +490,23 @@ sleep 12
 DELIV_SETTLE_B="$(psqlq "SELECT count(*) FROM job_events WHERE job_id = '$JOB2' AND event_type = 'delivery_received';")"
 UNACKED2="$(queue_field "${FN_AMQP_QUEUE:-filename_normalizer.jobs.v1}" messages_unacknowledged)"
 READY2="$(queue_field "${FN_AMQP_QUEUE:-filename_normalizer.jobs.v1}" messages_ready)"
-emit "   its disposition:              $SETTLED2 log line(s), and the delivery did"
-emit "                                 not come back: $DELIV_SETTLE_A -> $DELIV_SETTLE_B"
+# Three distinguishable states, not two.
+#
+# "no further event arrived within twelve seconds" is not acknowledgement: it
+# is equally consistent with a delivery still sitting unacknowledged in the
+# consumer's hands, and reporting it as proof was the previous round's error.
+# The settlement the handler logs FOR THIS JOB is the observation; the absence
+# of a redelivery is corroboration, not evidence.
+if [ "${SETTLED2:-0}" -ge 1 ]; then
+    DISPOSITION2="settled (the handler logged $SETTLED2 settlement(s) for this job)"
+elif [ "${DELIV_SETTLE_B:-0}" -gt "${DELIV_SETTLE_A:-0}" ]; then
+    DISPOSITION2="requeued (the delivery came back)"
+else
+    DISPOSITION2="NOT OBSERVED (no settlement logged and no redelivery seen; this run"
+    DISPOSITION2="$DISPOSITION2 cannot say whether the delivery is acknowledged or still outstanding)"
+fi
+emit "   its disposition:              $DISPOSITION2"
+emit "                                 corroboration: deliveries $DELIV_SETTLE_A -> $DELIV_SETTLE_B"
 emit "                                 over 12s (a requeued delivery returns)"
 emit "   broker queue at that moment:  ${UNACKED2:-unknown} unacknowledged, ${READY2:-unknown} ready"
 emit "                                 (context only: the queue is shared, so these"
@@ -484,6 +518,7 @@ emit "   destination after it:         $PUBLISHED2B   (expected no: nothing was 
 [ "$STATE2B" = "uncertain" ] || bad "an uncertain job was reopened to '$STATE2B' by a later delivery"
 [ "$PUBLISHED2B" = "no" ] || bad "a later delivery of an uncertain job published a document"
 [ "${DELIV_SETTLE_B:-0}" = "${DELIV_SETTLE_A:-0}" ] || bad "the delivery came back ($DELIV_SETTLE_A -> $DELIV_SETTLE_B): it was requeued, not settled"
+[ "${SETTLED2:-0}" -ge 1 ] || bad "no settlement was observed for this job; acknowledgement is not established by the absence of a redelivery"
 case "${NEWEVENTS2:-}" in
     *reserved*|*publish_attempted*|*delivered*) bad "a later delivery of an uncertain job did real work: $NEWEVENTS2" ;;
 esac
@@ -896,6 +931,14 @@ OTHER_TMP7="$(in_storage "ls -1a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-' 
 
 TINY_LEFT7="$(in_storage "ls -1a /srv/fn/staging-tiny 2>/dev/null | grep -c '\.work$' || true")"
 TINY_BYTES7="$(in_storage "du -sb /srv/fn/staging-tiny 2>/dev/null | cut -f1 || echo unknown")"
+# The inspection has to be shown to have worked, and the failure has to be the
+# one this scenario is about. A printed number proves neither: "0 partial files"
+# reads identically whether the filesystem was inspected and found clean or
+# never mounted, and a permission error would satisfy a category check that
+# accepts any storage failure.
+TINY_SIZE7="$(in_storage "df -k /srv/fn/staging-tiny 2>/dev/null | awk 'NR==2 {print \$2}' || echo unknown")"
+NOSPACE7="$(compose --profile fault logs renamer-tinyfs 2>/dev/null \
+    | grep -ciE 'no space left|enospc' || true)"
 # Existence and size are not preservation: a file can keep its length and lose
 # its contents. The source is hashed and compared with what discovery recorded.
 SRCSUM7="$(in_storage "sha256sum '/srv/fn/incoming/$DOC7' 2>/dev/null | cut -c1-64")"
@@ -918,6 +961,8 @@ emit "       process stopped between staging and linking cannot unlink what it"
 emit "       staged. Scenario 3's holder is removed exactly that way.)"
 emit "     source still present:       $SRC7 ($SRCSIZE7 bytes, unchanged and complete)"
 emit "   the failing filesystem itself, now that it can be read:"
+emit "     the failing filesystem was inspected:            $([ "${TINY_SIZE7:-unknown}" != "unknown" ] && echo yes || echo NO) (df reports ${TINY_SIZE7} KiB total)"
+emit "     the failure was out-of-space:                    $NOSPACE7 log line(s) naming ENOSPC"
 emit "     partial .work files left in the 1 MB filesystem: $TINY_LEFT7"
 emit "     bytes still occupied there:                      $TINY_BYTES7"
 emit "   (This replaces the previous round's stated limitation. The filesystem"
@@ -945,10 +990,15 @@ emit "     recorded at registration:   ${REGSUM7:-none}   (must be equal)"
 # delivery was requeued and the next one was stopped by the budget check
 # before it ever reached storage.
 case "$CAT7" in
-    storage_error|permission_denied|storage_unavailable) ;;
+    storage_error) ;;
+    permission_denied|storage_unavailable)
+        bad "category '$CAT7' is a different storage failure; this scenario is about running out of space" ;;
     retry_exhausted) bad "the real reason was lost: a full disk was recorded as retry_exhausted" ;;
     *) bad "category '$CAT7' does not describe a storage failure" ;;
 esac
+[ "${TINY_SIZE7:-unknown}" != "unknown" ] || bad "the failing filesystem could not be inspected, so what it left behind is unobserved"
+[ "${TINY_SIZE7:-0}" -le 4096 ] 2>/dev/null || bad "the inspected filesystem is ${TINY_SIZE7} KiB, not the small one this scenario fills"
+[ "${NOSPACE7:-0}" -ge 1 ] || bad "no out-of-space failure was logged; this run did not exercise ENOSPC"
 drop_fault renamer-tinyfs
 emit ""
 
@@ -1024,6 +1074,16 @@ wait_healthy renamer-permdenied 180 || true
 WHO8="$(docker inspect -f '{{.Config.User}}' "$(compose --profile fault ps -q renamer-permdenied | head -1)" 2>/dev/null || echo unknown)"
 MODE_BEFORE8="$(in_storage "stat -c %a $PERM_ROOT 2>/dev/null || echo unknown")"
 PERM_BEFORE="$(in_storage "stat -c '%a:%u:%g' $PERM_ROOT 2>/dev/null || echo unknown")"
+# Armed BEFORE the change, not after it succeeds.
+#
+# The revocation is `chown && chmod`: a chown that succeeds and a chmod that
+# fails leaves the directory owned by root with the flag still 0, so
+# restoration skipped a directory this run had already taken away from the
+# runtime account. The flag says "this run may have touched the permissions",
+# which is the question restoration needs answered, and the capture above is
+# what it restores to.
+PERM_TOUCHED=1
+PERM_TOUCHED_OK=0
 if [ "$PERM_BEFORE" = "unknown" ]; then
     bad "the consume root's mode and owner could not be read; not revoking anything"
     PERM_BEFORE=""
@@ -1048,7 +1108,7 @@ PAUSED8="$(compose --profile fault logs renamer-permdenied 2>/dev/null | grep -c
 
 # Revoke write, as root, on a directory the renamer does not own.
 compose run --rm --no-deps -T --user 0 --entrypoint sh storage-init \
-    -c "chown 0:0 $PERM_ROOT && chmod 0555 $PERM_ROOT" >/dev/null 2>&1 && PERM_TOUCHED=1
+    -c "chown 0:0 $PERM_ROOT && chmod 0555 $PERM_ROOT" >/dev/null 2>&1 && PERM_TOUCHED_OK=1
 MODE_AFTER8="$(in_storage "stat -c '%a-uid%u' $PERM_ROOT 2>/dev/null || echo unknown")"
 
 STATE8="$(await_state "$DOC8" "delivered held uncertain" 240)"
@@ -1060,6 +1120,7 @@ SRCSIZE8="$(in_storage "wc -c < '/srv/fn/incoming/$DOC8' 2>/dev/null || echo 0")
 DENIED8="$(compose --profile fault logs renamer-permdenied 2>/dev/null | grep -c 'permission_denied' || true)"
 
 emit "8. permission denied at the publication"
+emit "   the revocation itself succeeded:  $([ "$PERM_TOUCHED_OK" = "1" ] && echo yes || echo NO)   (expected yes)"
 emit "   NOTE: the hold (60s) deliberately outlives the handler budget (the 20s"
 emit "   shutdown timeout), so the refusal is established after the attempt's"
 emit "   own deadline has passed. That is the case that used to lose the"
@@ -1071,6 +1132,7 @@ emit "   deadline that governed the attempt."
 emit "   the renamer runs as:          ${WHO8:-unknown}   (not root: a root writer would not be denied)"
 emit "   destination mode before:      $MODE_BEFORE8 (owned by the runtime account)"
 emit "   destination mode during:      $MODE_AFTER8   (0555, root-owned, revoked mid-publication)"
+[ "$PERM_TOUCHED_OK" = "1" ] || bad "the permission revocation did not complete, so what follows is not the case it claims to be"
 emit "   the attempt was paused:       $PAUSED8 log line(s), claim held by ${HOLDER8:-none}"
 emit "   final state:                  $STATE8   (expected held)"
 emit "   category:                     $CAT8   (expected permission_denied)"
@@ -1172,6 +1234,224 @@ emit "   staged temporaries left:      $TMP_LEFT9   (expected 0: nothing partial
 drop_fault renamer-tmpfsdest
 emit ""
 
+# ---------------------------------------------------------------------------
+# 10. Two handlers of ONE process, contending for one job.
+#
+# The overlap established before was between two containers. That is the easy
+# direction: their claim holders have different names, so a guard comparing
+# names catches it. Recovery exempted a claim whose holder name matched its
+# own -- and every handler of one renamer shares that name -- so the boundary
+# that held between processes was exactly the one that did not hold inside
+# one. Concurrency 2, prefetch 2, and two deliveries of a single job.
+# ---------------------------------------------------------------------------
+log "10/12: same-instance overlap -- two handlers of one process on one job"
+stop_ordinary
+DOC10="a7-same-instance-$STAMP.pdf"
+NAME10="a7-same-instance-$LOWER.pdf"
+
+start_fault renamer-same-instance FN_FAULT_HOLD=45s || exit 1
+sleep 6
+submit "$DOC10"
+
+# Wait for the job row, then put a SECOND delivery of it on the queue. With
+# prefetch 2 and concurrency 2 the same process takes both.
+_i=0
+JOB10=""
+while [ "$_i" -lt 120 ]; do
+    JOB10="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC10';")"
+    [ -n "$JOB10" ] && break
+    sleep 1; _i=$((_i + 1))
+done
+[ -n "$JOB10" ] || bad "the submission was never registered, so nothing could contend for it"
+
+if [ -n "$JOB10" ]; then
+    compose exec -T rabbitmq rabbitmqadmin \
+        --vhost "${FN_AMQP_VHOST:-filename-normalizer}" \
+        --username "${FN_AMQP_USER:-fn_app}" \
+        --password "$(cat "$DEPLOY_DIR/secrets/fn_amqp_password")" \
+        --non-interactive \
+        publish message \
+        --exchange "${FN_AMQP_EXCHANGE:-filename_normalizer.jobs}" \
+        --routing-key "${FN_AMQP_ROUTING_KEY:-normalize}" \
+        --properties '{"delivery_mode":2,"content_type":"application/json"}' \
+        --payload "{\"contract_version\":1,\"job_id\":\"$JOB10\",\"attempt\":2,\"enqueued_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" >/dev/null 2>&1 \
+        && SECOND10=yes || SECOND10=no
+fi
+
+# Both deliveries are in one process; the holder is paused mid-claim.
+sleep 20
+HOLDER10="$(psqlq "SELECT coalesce(publish_claimed_by,'-') FROM jobs WHERE job_id = '$JOB10';")"
+STATE10_MID="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB10';")"
+# The second handler must have stood down INSIDE the same process, and said so.
+DEFER10="$(compose --profile fault logs renamer-same-instance 2>/dev/null \
+    | grep "$JOB10" | grep -c 'publication_in_progress' || true)"
+INFLIGHT10="$(compose --profile fault logs renamer-same-instance 2>/dev/null \
+    | grep "$JOB10" | grep -c 'delivery_received' || true)"
+
+# Let the hold expire and the job finish.
+FINAL10="$(await_state "$DOC10" "delivered held uncertain" 240)"
+COPIES10="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^a7-same-instance-$LOWER' || true")"
+RECEIPTS10="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB10';")"
+ATTEMPTS10="$(psqlq "SELECT count(*) FROM job_events WHERE job_id = '$JOB10' AND event_type = 'publish_attempted';")"
+
+emit "10. same-instance overlap -- two handlers of ONE renamer on one job"
+emit "   second delivery published:    ${SECOND10:-no}"
+emit "   deliveries this process took: $INFLIGHT10   (expected >= 2: both in one process)"
+emit "   claim holder while held:      $HOLDER10   (one name, shared by both handlers)"
+emit "   state while held:             $STATE10_MID   (expected publishing)"
+emit "   the second handler stood down:$DEFER10 time(s)   (expected >= 1)"
+emit "   final state:                  $FINAL10   (expected delivered)"
+emit "   documents published:          $COPIES10   (expected 1: not one per handler)"
+emit "   delivery receipts:            $RECEIPTS10   (expected 1)"
+emit "   publish attempts recorded:    $ATTEMPTS10"
+[ "${INFLIGHT10:-0}" -ge 2 ] || bad "only $INFLIGHT10 delivery reached the single process; the same-instance case was not exercised"
+[ "${DEFER10:-0}" -ge 1 ] || bad "no handler of this process stood down; the same-instance ownership boundary was not exercised"
+[ "$FINAL10" = "delivered" ] || bad "the contended job reached '$FINAL10'"
+[ "${COPIES10:-0}" = "1" ] || bad "$COPIES10 documents exist for one submission handled twice in one process"
+[ "${RECEIPTS10:-0}" = "1" ] || bad "$RECEIPTS10 receipts exist for one submission"
+drop_fault renamer-same-instance
+emit ""
+
+# ---------------------------------------------------------------------------
+# 11. An old attempt that is still ALIVE, resuming after the takeover expired.
+#
+# The previous demonstration held a claim for 45 seconds inside a 600-second
+# takeover window, so the sibling deferred and the holder was never actually
+# superseded: nothing resumed after losing its claim. Here the window is 10
+# seconds and the hold is 90, so the holder is genuinely taken over, the taker
+# publishes and records the delivery, and only then does the old attempt wake
+# up -- holding a staged file, filesystem access, and a claim that is no longer
+# its own. It must not put a second consumable copy into the directory.
+# ---------------------------------------------------------------------------
+log "11/12: an old live attempt resumes after its claim was taken over"
+DOC11="a7-stale-$STAMP.pdf"
+NAME11="a7-stale-$LOWER.pdf"
+
+start_fault renamer-hold FN_FAULT_HOLD=90s FN_PUBLISH_TAKEOVER_AFTER=10s || exit 1
+sleep 6
+submit "$DOC11"
+sleep 12
+JOB11="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC11';")"
+HOLDER11_A="$(psqlq "SELECT coalesce(publish_claimed_by,'-') FROM jobs WHERE job_id = '$JOB11';")"
+
+# The taker arrives after the window has already expired for the holder.
+start_fault renamer-taker FN_PUBLISH_TAKEOVER_AFTER=10s || exit 1
+TAKEN11="$(await_state "$DOC11" "delivered held uncertain" 180)"
+HOLDER11_B="$(psqlq "SELECT coalesce(publish_claimed_by,'-') FROM jobs WHERE job_id = '$JOB11';")"
+RECEIPTS11_MID="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB11';")"
+COPIES11_MID="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^a7-stale-$LOWER' || true")"
+
+# Now the old attempt wakes up. Its hold is 90s from its claim.
+_i=0
+while [ "$_i" -lt 150 ]; do
+    _alive="$(compose --profile fault ps -q renamer-hold 2>/dev/null | head -1)"
+    [ -z "$_alive" ] && break
+    if compose --profile fault logs renamer-hold 2>/dev/null | grep -q 'publication_superseded\|delivery_settled\|publication_in_progress'; then
+        break
+    fi
+    sleep 3; _i=$((_i + 3))
+done
+SUPERSEDED11="$(compose --profile fault logs renamer-hold 2>/dev/null \
+    | grep -c 'publication_superseded\|publication_in_progress' || true)"
+COPIES11="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^a7-stale-$LOWER' || true")"
+RECEIPTS11="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB11';")"
+FINAL11="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB11';")"
+NAMES11="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep '^a7-stale-$LOWER' | tr '\n' ' '")"
+
+emit "11. an old live attempt resuming after its claim was taken over"
+emit "   takeover window:              10s; the holder's pause: 90s"
+emit "   claim holder while held:      $HOLDER11_A"
+emit "   claim holder after takeover:  $HOLDER11_B   (expected a different attempt, or cleared by delivery)"
+emit "   state once the taker finished:$TAKEN11   (expected delivered)"
+emit "   receipts then:                $RECEIPTS11_MID   (expected 1)"
+emit "   documents then:               $COPIES11_MID   (expected 1)"
+emit "   the old attempt stood down:   $SUPERSEDED11 time(s)   (expected >= 1: it did not link)"
+emit "   documents after it resumed:   $COPIES11   (expected 1: no second consumable copy)"
+emit "   names present:                ${NAMES11:-none}   (expected exactly one, no suffixed twin)"
+emit "   receipts after it resumed:    $RECEIPTS11   (expected 1)"
+emit "   final state:                  $FINAL11   (expected delivered)"
+[ "$TAKEN11" = "delivered" ] || bad "the taker did not deliver the job (state '$TAKEN11'), so nothing was taken over"
+[ "${RECEIPTS11_MID:-0}" = "1" ] || bad "$RECEIPTS11_MID receipts after the takeover"
+[ "${SUPERSEDED11:-0}" -ge 1 ] || bad "the superseded attempt never reported standing down; it may have linked a second copy"
+[ "${COPIES11:-0}" = "1" ] || bad "$COPIES11 documents exist after the old attempt resumed; it exposed another copy"
+[ "${RECEIPTS11:-0}" = "1" ] || bad "$RECEIPTS11 receipts exist for one submission"
+[ "$FINAL11" = "delivered" ] || bad "the job ended as '$FINAL11'"
+drop_fault renamer-hold renamer-taker
+compose start renamer-1 renamer-2 >/dev/null 2>&1 || true
+wait_healthy renamer-1 120 || true
+emit ""
+
+# ---------------------------------------------------------------------------
+# 12. A successful publication followed by a GENUINE post-link failure.
+#
+# The boundary the evidence had was a crash after the link and a permission
+# denial before it. Neither is this one: a crash leaves the recovery path to
+# decide, and a denial before the link means nothing was published. Here the
+# link succeeds -- the document is really in the consumer's directory -- and
+# then an operation AFTER it fails for real, because the directory's write
+# permission is taken away while the attempt is paused between the link and
+# its cleanup. The publication must stand: a receipt, one document, and a
+# stranded temporary reported rather than reclassified as a failed delivery.
+# ---------------------------------------------------------------------------
+log "12/12: a real post-link failure must not unpublish anything"
+stop_ordinary
+DOC12="a6-post-link-$STAMP.pdf"
+NAME12="a6-post-link-$LOWER.pdf"
+
+start_fault renamer-fault FN_FAULT_POINTS=hold_after_link FN_FAULT_HOLD=45s || exit 1
+sleep 6
+submit "$DOC12"
+
+# Wait until the link has actually happened, then revoke write on the directory
+# the attempt still has to clean up in.
+_i=0
+LINKED12=no
+while [ "$_i" -lt 90 ]; do
+    if [ "$(in_storage "test -f '/srv/fn/consume/$NAME12' && echo yes || echo no")" = "yes" ]; then
+        LINKED12=yes
+        break
+    fi
+    sleep 2; _i=$((_i + 2))
+done
+REVOKED12=no
+if [ "$LINKED12" = "yes" ]; then
+    compose run --rm --no-deps -T --user 0 --entrypoint sh storage-init \
+        -c "chown 0:0 $PERM_ROOT && chmod 0555 $PERM_ROOT" >/dev/null 2>&1 && REVOKED12=yes
+fi
+
+FINAL12="$(await_state "$DOC12" "delivered held uncertain" 240)"
+RECEIPTS12="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = (SELECT job_id FROM jobs WHERE source_name = '$DOC12');")"
+CAT12="$(psqlq "SELECT coalesce(failure_category,'-') FROM jobs WHERE source_name = '$DOC12';")"
+PRESENT12="$(in_storage "test -f '/srv/fn/consume/$NAME12' && echo yes || echo no")"
+STRANDED12="$(compose --profile fault logs renamer-fault 2>/dev/null | grep -c 'staged_link_left_behind' || true)"
+
+# Give the permissions back before anything else runs.
+compose run --rm --no-deps -T --user 0 --entrypoint sh storage-init \
+    -c "chown ${PERM_BEFORE#*:} $PERM_ROOT; chmod ${PERM_BEFORE%%:*} $PERM_ROOT" >/dev/null 2>&1 || true
+PERM_NOW12="$(in_storage "stat -c '%a:%u:%g' $PERM_ROOT 2>/dev/null || echo unknown")"
+
+emit "12. a real failure AFTER a successful link"
+emit "   the link happened:            $LINKED12   (expected yes: the document was really published)"
+emit "   write revoked while paused:   $REVOKED12   (expected yes: the post-link step must really fail)"
+emit "   cleanup reported its failure: $STRANDED12 line(s)   (expected >= 1)"
+emit "   final state:                  $FINAL12   (expected delivered: a post-link error does not unpublish)"
+emit "   category:                     $CAT12   (expected '-')"
+emit "   delivery receipts:            $RECEIPTS12   (expected 1)"
+emit "   document still present:       $PRESENT12   (expected yes)"
+emit "   destination permissions back: $PERM_NOW12   (expected $PERM_BEFORE)"
+[ "$LINKED12" = "yes" ] || bad "the document was never linked, so this is not the post-link case"
+[ "$REVOKED12" = "yes" ] || bad "the post-link operation was never made to fail; this run proves nothing about that boundary"
+[ "$FINAL12" = "delivered" ] || bad "a post-link failure turned a completed publication into '$FINAL12'"
+[ "$CAT12" = "-" ] || bad "a completed delivery acquired the failure category '$CAT12'"
+[ "${RECEIPTS12:-0}" = "1" ] || bad "$RECEIPTS12 receipts for a publication that succeeded"
+[ "$PRESENT12" = "yes" ] || bad "the published document is gone after a post-link failure"
+[ "${STRANDED12:-0}" -ge 1 ] || bad "the failed cleanup was not reported"
+[ "$PERM_NOW12" = "$PERM_BEFORE" ] || bad "the destination permissions were not restored ($PERM_NOW12, was $PERM_BEFORE)"
+drop_fault renamer-fault
+compose start renamer-1 renamer-2 >/dev/null 2>&1 || true
+wait_healthy renamer-1 120 || true
+emit ""
+
 emit "mismatches: $FAILURES"
 
 if [ "$FAILURES" -ne 0 ]; then
@@ -1180,5 +1460,6 @@ if [ "$FAILURES" -ne 0 ]; then
     exit 1
 fi
 
+report_success
 log "PASSED: interruption, competing publication, stale worker, filesystem boundary, write failures"
 note "evidence: $OUT"

@@ -60,6 +60,19 @@ snapshot() {
 }
 
 cleanup() {
+    # A child exercise outlives its driver otherwise.
+    #
+    # Case 3 starts verify-recovery in the background and stops it deliberately.
+    # If THIS script is interrupted while that child is running, the child keeps
+    # going: it holds the exercise lock, it is mid-way through creating fault
+    # services and revoking permissions, and nothing is left watching it. It is
+    # sent the same signal its own trap handles, so its restoration runs.
+    if [ -n "${INT_PID:-}" ] && kill -0 "$INT_PID" 2>/dev/null; then
+        echo "stopping the child exercise ($INT_PID) so it restores what it changed" >&2
+        kill -TERM "$INT_PID" 2>/dev/null || true
+        wait "$INT_PID" 2>/dev/null || true
+        INT_PID=""
+    fi
     if [ "$LOCK_HELD" = "1" ]; then
         rm -f "$EVIDENCE_DIR/.exercise.lock/owner" 2>/dev/null || true
         rmdir "$EVIDENCE_DIR/.exercise.lock" 2>/dev/null || true
@@ -79,11 +92,11 @@ cleanup() {
         REDIS_VOL_CREATED=0
     fi
 }
-trap 'cleanup' EXIT
+trap 'report_keep; cleanup' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-: > "$OUT"
+report_begin "refusal-safety" "$OUT" "$0"
 emit "A refusal changes nothing"
 emit ""
 
@@ -328,5 +341,6 @@ if [ "$FAILURES" -ne 0 ]; then
     exit 1
 fi
 
+report_success
 log "PASSED: refusals are non-mutating and cleanup respects ownership"
 note "evidence: $OUT"

@@ -132,7 +132,19 @@ restore() {
     fi
     log "restoring the original configuration and verifying the running state"
 
-    apply_env "$DEFAULT_CONFIG" "$DEFAULT_CONSUME"
+    # What was captured, not what the script assumes the default to be.
+    #
+    # The preflight accepts a stack whose consume root is not the compose
+    # default -- it checks the configuration FILE -- and restoration then put
+    # all three services onto the hardcoded default anyway, quietly moving the
+    # destination of an installation that had deliberately been pointed
+    # somewhere else. The baseline read from the running processes is the only
+    # thing that describes the state this run is obliged to give back.
+    _r_want_cfg="${BASELINE_CFG:-$DEFAULT_CONFIG}"
+    _r_want_consume="${BASELINE_CONSUME:-$DEFAULT_CONSUME}"
+    case "$_r_want_cfg" in unreadable|"") _r_want_cfg="$DEFAULT_CONFIG" ;; esac
+    case "$_r_want_consume" in unreadable|"") _r_want_consume="$DEFAULT_CONSUME" ;; esac
+    apply_env "$_r_want_cfg" "$_r_want_consume"
 
     _r_cfg="$(effective_value renamer-1 "d['config_file']")"
     _r_consume="$(effective_value renamer-1 "d['storage']['consume']")"
@@ -145,11 +157,11 @@ restore() {
     _r_cfg2="$(effective_value renamer-2 "d['config_file']")"
     _r_consume2="$(effective_value renamer-2 "d['storage']['consume']")"
     _r_ok=1
-    if [ "$_r_cfg" != "$DEFAULT_CONFIG" ]; then _r_ok=0; fi
-    if [ "$_r_wcfg" != "$DEFAULT_CONFIG" ]; then _r_ok=0; fi
-    if [ "$_r_cfg2" != "$DEFAULT_CONFIG" ]; then _r_ok=0; fi
-    if [ "$_r_consume" != "$DEFAULT_CONSUME" ]; then _r_ok=0; fi
-    if [ "$_r_consume2" != "$DEFAULT_CONSUME" ]; then _r_ok=0; fi
+    if [ "$_r_cfg" != "$_r_want_cfg" ]; then _r_ok=0; fi
+    if [ "$_r_wcfg" != "$_r_want_cfg" ]; then _r_ok=0; fi
+    if [ "$_r_cfg2" != "$_r_want_cfg" ]; then _r_ok=0; fi
+    if [ "$_r_consume" != "$_r_want_consume" ]; then _r_ok=0; fi
+    if [ "$_r_consume2" != "$_r_want_consume" ]; then _r_ok=0; fi
     if [ -n "$BASELINE_ID" ] && [ "$_r_id" != "$BASELINE_ID" ]; then _r_ok=0; fi
 
     # Configuration alone is not a restored stack: a service can hold the right
@@ -164,11 +176,12 @@ restore() {
 
     {
         printf '\nrestoration (read back from the running processes, not from disk):\n'
-        printf '  renamer-1 config_file:   %s   (expected %s)\n' "$_r_cfg" "$DEFAULT_CONFIG"
-        printf '  watcher   config_file:   %s   (expected %s)\n' "$_r_wcfg" "$DEFAULT_CONFIG"
-        printf '  renamer-1 consume root:  %s   (expected %s)\n' "$_r_consume" "$DEFAULT_CONSUME"
-        printf '  renamer-2 config_file:   %s   (expected %s)\n' "$_r_cfg2" "$DEFAULT_CONFIG"
-        printf '  renamer-2 consume root:  %s   (expected %s)\n' "$_r_consume2" "$DEFAULT_CONSUME"
+        printf '  restoring to the CAPTURED baseline, not a default\n'
+        printf '  renamer-1 config_file:   %s   (expected %s)\n' "$_r_cfg" "$_r_want_cfg"
+        printf '  watcher   config_file:   %s   (expected %s)\n' "$_r_wcfg" "$_r_want_cfg"
+        printf '  renamer-1 consume root:  %s   (expected %s)\n' "$_r_consume" "$_r_want_consume"
+        printf '  renamer-2 config_file:   %s   (expected %s)\n' "$_r_cfg2" "$_r_want_cfg"
+        printf '  renamer-2 consume root:  %s   (expected %s)\n' "$_r_consume2" "$_r_want_consume"
         printf '  renamer-1 policy:        %s   (expected %s)\n' "$_r_id" "${BASELINE_ID:-unknown}"
         printf '  renamer-1/2, watcher ready: %s / %s / %s   (expected yes/yes/yes)\n' \
             "$_r_rdy1" "$_r_rdy2" "$_r_rdyw"
@@ -198,7 +211,7 @@ restore() {
 # would restore over the winner's change mid-assertion.
 exercise_lock config-restart || exit 1
 BASELINE_ID=""
-trap 'restore' EXIT
+trap 'report_keep; restore' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -207,7 +220,7 @@ if [ -e "$EX_HOST" ]; then
     exit 1
 fi
 
-: > "$OUT"
+report_begin "config-restart" "$OUT" "$0"
 emit "FN-N006 — accepted configuration meaning across a real restart"
 emit ""
 
@@ -235,6 +248,7 @@ case "$BASELINE_ID" in unreadable|"") echo "error: cannot read the running confi
 log "1/2: a naming-policy change across a restart"
 
 # Stop the renamers so a job can be accepted and left queued across the change.
+MUTATED=1
 compose stop renamer-1 renamer-2 >/dev/null 2>&1
 DOC1="cfg-policy-$STAMP.pdf"
 submit "$DOC1"
@@ -309,6 +323,7 @@ emit "   between scenarios, policy back to: $MID_ID"
 #    redirected to a new one.
 # ---------------------------------------------------------------------------
 log "2/2: a destination-root change across a restart"
+MUTATED=1
 compose stop renamer-1 renamer-2 >/dev/null 2>&1
 DOC2="cfg-dest-$STAMP.pdf"
 submit "$DOC2"
@@ -362,5 +377,6 @@ if [ "$FAILURES" -ne 0 ]; then
     exit 1
 fi
 
+report_success
 log "PASSED: accepted configuration meaning survives a real restart"
 note "evidence: $OUT"

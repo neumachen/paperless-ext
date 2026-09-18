@@ -528,6 +528,98 @@ watcher_effective_value() {
     effective_value watcher "$1"
 }
 
+# ---------------------------------------------------------------------------
+# Reports that survive the next run
+# ---------------------------------------------------------------------------
+#
+# Every exercise wrote its report to one fixed path and truncated it on entry.
+# That is fine until the next thing to run is a REFUSAL or an INTERRUPTION: a
+# run that stops after two lines truncates the complete report of the run that
+# succeeded, and the evidence for a passing qualification is gone. It happened
+# to both of the reports this pass was asked about -- one left holding 480
+# bytes, the other 75 -- and the retained snapshots taken before those runs did
+# not contain them either.
+#
+# So a report now goes to three places with three different meanings:
+#
+#   .evidence/<name>.txt                      the LAST run, whatever happened
+#   .evidence/runs/<name>-<stamp>-<pid>.txt   this run, kept
+#   .evidence/successful/<name>.txt           the last run that PASSED
+#
+# and every one of them carries a header naming the application revision, the
+# source digest the running process reports, and the sha256 of the exercise
+# script that produced it. A directory name says when a copy was made; it does
+# not say what made it or what it was made from.
+
+REPORT_NAME=""
+REPORT_OUT=""
+REPORT_RUN=""
+
+# report_begin <exercise-name> <report-path> [script-path]
+report_begin() {
+    REPORT_NAME="$1"
+    REPORT_OUT="$2"
+    _rb_script="${3:-$0}"
+    mkdir -p "$EVIDENCE_DIR/runs" "$EVIDENCE_DIR/successful"
+    REPORT_RUN="$EVIDENCE_DIR/runs/${REPORT_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$.txt"
+
+    _rb_digest="$(cksum_sha256 "$_rb_script")"
+    _rb_app="$(running_application_identity)"
+    {
+        printf 'exercise:        %s
+' "$REPORT_NAME"
+        printf 'script:          %s
+' "$(basename "$_rb_script")"
+        printf 'script sha256:   %s
+' "$_rb_digest"
+        printf 'application:     %s
+' "$_rb_app"
+        printf 'started:         %s
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'run report:      %s
+' "$REPORT_RUN"
+        printf -- '--------------------------------------------------------------
+'
+    } > "$REPORT_OUT"
+}
+
+# report_keep copies the current report into this run's own file. Safe to call
+# more than once; the last call wins for this run only.
+report_keep() {
+    [ -n "$REPORT_RUN" ] || return 0
+    [ -f "$REPORT_OUT" ] || return 0
+    cp "$REPORT_OUT" "$REPORT_RUN" 2>/dev/null || true
+}
+
+# report_success additionally promotes it to the success slot. Only a run that
+# actually passed may call this.
+report_success() {
+    report_keep
+    [ -n "$REPORT_NAME" ] || return 0
+    cp "$REPORT_OUT" "$EVIDENCE_DIR/successful/${REPORT_NAME}.txt" 2>/dev/null || true
+}
+
+# cksum_sha256 hashes a file in a container, like everything else here.
+cksum_sha256() {
+    [ -f "$1" ] || { echo "absent"; return 0; }
+    docker run --rm -i "$UTIL_IMAGE" sha256sum 2>/dev/null < "$1" | awk '{print $1}'
+}
+
+# running_application_identity asks the RUNNING renamer what it is, over the
+# read-only inspection API, so a report names the source it was produced
+# against rather than whatever HEAD happens to be later.
+running_application_identity() {
+    compose --profile tools run --rm -T -e FN_GRPC_TARGET="renamer-1:${FN_GRPC_PORT:-9090}" \
+        fnctl status 2>/dev/null \
+        | run_py "import json,sys
+try:
+    d = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())[0]
+    print('revision=%s source_digest=%s policy=%s' % (
+        d.get('revision'), d.get('sourceDigest'), d.get('policyIdentity')))
+except Exception:
+    print('unreadable')"
+}
+
 # run_py runs Python inside a container. Development tooling does not run on
 # the host; an exercise that shells out to a host interpreter has quietly
 # stepped outside the container-only rule the rest of the project follows.

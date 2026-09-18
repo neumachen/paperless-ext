@@ -104,11 +104,11 @@ restore() {
 }
 
 exercise_lock dry-run || exit 1
-trap 'restore' EXIT
+trap 'report_keep; restore' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-: > "$OUT"
+report_begin "dry-run" "$OUT" "$0"
 emit "A9 — dry run preserves sources and the operational ledger"
 emit ""
 
@@ -320,5 +320,6 @@ if [ "$FAILURES" -ne 0 ]; then
     exit 1
 fi
 
+report_success
 log "PASSED: a dry run preserves sources and the operational ledger"
 note "evidence: $OUT"
