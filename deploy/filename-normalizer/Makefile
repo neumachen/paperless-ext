@@ -228,6 +228,11 @@ test-restore-replay: ## Prove the documented restore quarantine prevents the rep
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-restore-replay.sh
 
+.PHONY: test-consumer-isolation
+test-consumer-isolation: ## Prove the consumer guard refuses to destroy media holding another job's document
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-consumer-isolation.sh
+
 .PHONY: test-refusal-safety
 test-refusal-safety: ## Prove a refusal changes nothing and cleanup respects ownership
 	@mkdir -p $(EVIDENCE)
