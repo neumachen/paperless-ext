@@ -244,7 +244,15 @@ while [ "$_i" -lt 150 ]; do
     sleep 3; _i=$((_i + 3))
 done
 sleep 6
-KEPT="$(compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | grep -c 'publication_reconciled_by_sibling\|publication_superseded\|publication_completed_elsewhere' || true)"
+# What "standing down" looks like now.
+#
+# A publishes from its own descriptor, so its staged NAME being gone does not
+# stop it: the link succeeds or returns EEXIST against the destination the
+# sibling already published. It then recognises that occupant as its own file
+# -- same inode, the one its receipt records -- and reconciles. That is the
+# property this exercise is about, and `delivery_reconciled` is how it is
+# reported; the older event names are kept for runs against earlier builds.
+KEPT="$(compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | grep -c 'publication_reconciled_by_sibling\|publication_superseded\|publication_completed_elsewhere\|delivery_reconciled' || true)"
 {
     printf '\n--- what A logged for %s ---\n' "$JOB"
     compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | tail -12

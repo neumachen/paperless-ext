@@ -1300,11 +1300,35 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 		return settled("reconciled", jobs.StateDelivered, ""), true
 	}
 
-	// No receipt naming this destination for this job, so the occupant is not
-	// this job's document however much it resembles one. Whether the bytes
-	// match is recorded but decides nothing: equal content is exactly the case
-	// the identity check exists for, and treating it as ownership would be
-	// implicit deduplication.
+	// The occupant is not this job's document. If this attempt committed a
+	// receipt a moment ago, it must be withdrawn before anything else: the
+	// link was refused with EEXIST, so nothing was created, and a receipt
+	// describing a publication that provably did not happen would otherwise
+	// block the hold below.
+	//
+	// That interaction is exactly what stranded a job here. A receipt blocks a
+	// hold -- deliberately, so a sibling cannot close an authorised
+	// publication -- so a job that had committed one and then found its
+	// destination occupied could not be held at all. It returned the delivery,
+	// was redelivered, and spun in `publishing` forever.
+	if existing.JobID != "" && existing.DestinationRoot == root &&
+		existing.DeliveredName == candidate {
+		wctx, wcancel := durably(ctx)
+		werr := p.led.WithdrawPublicationReceipt(wctx, job.JobID,
+			existing.PublishedDevice, existing.PublishedInode, attempt)
+		wcancel()
+		if werr != nil && !errors.Is(werr, ledger.ErrNotFound) &&
+			!errors.Is(werr, ledger.ErrOutcomeAlreadyRecorded) {
+			log.Error("a refused publication's receipt could not be withdrawn",
+				slog.String("event", "publication_receipt_not_withdrawn"),
+				slog.String("error_kind", logging.ErrorKind(werr)))
+			return unsettled(werr), true
+		}
+	}
+
+	// Whether the bytes match is recorded but decides nothing: equal content is
+	// exactly the case the identity check exists for, and treating it as
+	// ownership would be implicit deduplication.
 	matches := false
 	if sum, _, serr := storage.Fingerprint(final); serr == nil && job.Fingerprint != nil {
 		matches = bytes.Equal(sum, job.Fingerprint)
