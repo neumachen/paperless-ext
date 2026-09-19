@@ -679,150 +679,127 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		return unsettled(ledger.ErrOutcomeAlreadyRecorded), true
 	}
 
-	published, err := storage.PublishFromDescriptor(dir, stagedFile, filepath.Base(tmp), candidate)
-	if published {
-		linked = true
-		// Ownership is decided by what was LINKED, not by what was claimed.
-		// Recorded before anything else can fail, because a link that is not
-		// recorded is a document no later attempt can recognise as this job's.
-		mctx, mcancel := durably(ctx)
-		if merr := p.led.MarkPublicationLinked(mctx, job.JobID, int64(staged.Device), int64(staged.Inode)); merr != nil {
-			log.Error("published but could not record which file was linked",
-				slog.String("event", "linked_identity_not_recorded"),
-				slog.String("error_kind", logging.ErrorKind(merr)))
-		}
-		mcancel()
+	// ---------------------------------------------------------------------
+	// Publication, in the only order that survives its own failures.
+	//
+	// The staged temporary is already a dotfile in the destination directory,
+	// hard-linked to the bytes verified a moment ago. The consumer ignores
+	// dotfiles, so the document is published-but-invisible: everything that
+	// can go wrong from here leaves it hidden rather than exposed.
+	//
+	// 1. Commit the receipt, under the job row's lock, refusing if anybody has
+	//    closed the job. Nothing is visible, so a refusal withdraws nothing.
+	// 2. Reveal by atomic rename, which never replaces.
+	// 3. Mark the job delivered.
+	//
+	// The old order was link-then-record, and its failure was the one that
+	// cannot be undone: an attempt whose claim had expired put a consumable
+	// document into the consumer's directory for a job a sibling had already
+	// closed, and could only apologise afterwards.
+	//
+	// The filesystem and the ledger still do not share a transaction. What
+	// this buys is that every gap between them is survivable: a document that
+	// is hidden can be revealed or removed later from what the ledger says,
+	// and a document that is visible always has a committed receipt behind it.
+	// ---------------------------------------------------------------------
+	receipt := ledger.Receipt{
+		JobID: job.JobID, DestinationRoot: root, DeliveredName: candidate,
+		SizeBytes: stagedSize, Fingerprint: stagedSum, Attempt: attempt,
+		// The file this receipt is about, identified before it was visible.
+		PublishedDevice: int64(staged.Device), PublishedInode: int64(staged.Inode),
 	}
-	if published {
-		// Fired only when the link actually succeeded, so `after_link` means
-		// what its name says. An EEXIST interruption is a different scenario
-		// and would need its own point.
-		p.faults.Fire(config.FaultAfterLink, log)
-		// Held open, if armed, so a real consumer can take the document before
-		// the read below. The publication has already happened at this point;
-		// what follows must not be able to undo that.
-		p.faults.Pause(config.FaultHoldAfterLink, log)
+	// Refuse early if the destination is already taken, so the common case
+	// does not commit a receipt it then cannot honour. The reveal re-checks
+	// atomically; this only avoids the wasted commit.
+	if _, ierr := storage.Identify(final); ierr == nil {
+		return p.resolveOccupiedDestination(ctx, job, root, candidate, key, final, attempt, log)
 	}
 
-	// A successful link is not yet a sole publication. The claim can have been
-	// taken over while this attempt was between its claim and its link -- a
-	// takeout is a timeout, and a timeout cannot tell a dead worker from a
-	// slow one, while the slow one keeps its filesystem access. If another
-	// attempt's delivery is already recorded, this attempt has just created a
-	// SECOND copy of a document that is already delivered, and it is the only
-	// party that knows which inode is its own.
-	if published {
-		if out, done := p.withdrawDuplicate(ctx, job, dir, candidate, staged, token, attempt, log); done {
+	// The interval the job can be closed under this attempt. Held open, if
+	// armed, so a consumer has a real chance to see anything this attempt has
+	// put in the destination directory -- the point being that there is
+	// nothing to see.
+	p.faults.Pause(config.FaultHoldBeforeCommit, log)
+
+	cctx, ccancel := durably(ctx)
+	cerr2 := p.led.CommitPublication(cctx, receipt)
+	ccancel()
+	switch {
+	case errors.Is(cerr2, ledger.ErrOutcomeAlreadyRecorded):
+		// The job was closed while this attempt was working. Nothing was ever
+		// visible: the document is still the dotfile the deferred cleanup
+		// above removes. This is the case that used to expose a document.
+		log.Warn("this job was closed while this attempt was publishing; nothing was made visible",
+			slog.String("event", "publication_superseded"))
+		if out, ok := p.settleAgainstPreserved(ctx, job.JobID, log); ok {
 			return out, true
 		}
+		return unsettled(cerr2), true
+	case errors.Is(cerr2, ledger.ErrPublicationSuperseded):
+		log.Info("a delivery for this job already stands; not making a second document visible",
+			slog.String("event", "publication_superseded"))
+		if out, ok := p.settleAgainstPreserved(ctx, job.JobID, log); ok {
+			return out, true
+		}
+		return settled("delivered", jobs.StateDelivered, ""), true
+	case cerr2 != nil:
+		// Including an unknown commit outcome. Do NOT reveal: if the receipt
+		// did commit, a later attempt finds it and finishes the publication;
+		// if it did not, the document is still hidden and nothing is lost.
+		log.Error("could not commit the publication; the document stays invisible",
+			slog.String("event", "publication_not_committed"),
+			slog.String("dependency", "postgres_primary"))
+		return unsettled(cerr2), true
+	}
+
+	// Committed. From here the document is authorised, and the fault points
+	// below hold the window a consumer could act in -- which is now the window
+	// AFTER the receipt exists, not before it.
+	p.faults.Fire(config.FaultAfterLink, log)
+	p.faults.Pause(config.FaultHoldAfterLink, log)
+
+	err := dir.RevealNoReplace(filepath.Base(tmp), candidate)
+	published := err == nil
+	if published {
+		linked = true
 	}
 
 	switch {
 	case published:
-		// `published`, not `err == nil`. The link created the directory entry;
-		// the sync and the removal of the staged temporary happen to a
-		// document the consumer can already see. Judging those by their errno
-		// -- which is what happened before -- let a post-link EACCES be read
-		// as "nothing was published", withdraw the claim, and leave a retry
-		// free to publish the document a second time after a consumer had
-		// taken the first.
-		if err != nil {
-			log.Error("the document was published, but the step after it failed",
-				slog.String("event", "publication_completed_with_error"),
-				slog.String("category", string(jobs.Category(storage.RejectionCategory(err)))))
-		}
-		// The link returned success, so publication HAPPENED. What is at the
-		// destination now is a separate question: a consumer may already have
-		// taken it. Reading the destination is therefore best-effort evidence,
-		// never the thing that decides whether we published.
-		// The content was verified BEFORE the link, from the descriptor of the
-		// very inode that was linked, so the receipt records what was
-		// published without reading it again. The only question left is
-		// whether the document is still there, and the answer changes nothing
-		// about whether it was published.
 		size, fp := stagedSize, stagedSum
+		_ = fp
 		absent := false
 		switch _, ierr := storage.Identify(final); {
 		case ierr == nil:
 		case errors.Is(ierr, fs.ErrNotExist):
-			// Gone between the link and the read. The old code ran this
-			// through the generic storage classifier and held the job as
-			// source_absent -- reporting a missing SOURCE for a document that
-			// had just been published successfully, and losing the delivery
-			// from the accounting entirely.
+			// Taken by the consumer between the reveal and this read. The
+			// publication happened and the receipt already records it.
 			absent = true
-			log.Info("the destination was removed immediately after publication; recording the delivery",
+			log.Info("the destination was removed immediately after publication; the delivery stands",
 				slog.String("event", "destination_consumed_immediately"))
 		case errors.Is(ierr, storage.ErrMutated):
-			// The name now leads to a different file: this job's document was
-			// taken and something else was put there, or it was replaced
-			// outright. The publication still happened -- the link returned
-			// success and the inode it created was this attempt's -- so the
-			// delivery stands and its file is absent. What occupies the name
-			// now belongs to whoever put it there; republishing over it, or
-			// calling this job's completed delivery a conflict, would both be
-			// wrong.
 			absent = true
 			log.Warn("the destination was replaced immediately after publication; the delivery stands",
 				slog.String("event", "destination_replaced_after_publication"))
 		default:
-			// The document is published and the receipt is what records it.
-			// An unreadable destination is worth saying out loud, but it
-			// cannot unpublish anything, and holding the job here would lose a
-			// completed delivery from the accounting.
 			log.Warn("the published destination could not be examined afterwards",
 				slog.String("event", "destination_unexaminable"),
 				slog.String("error_kind", storage.RejectionCategory(ierr)))
 		}
 
-		receipt := ledger.Receipt{
-			JobID: job.JobID, DestinationRoot: root, DeliveredName: candidate,
-			SizeBytes: size, Fingerprint: fp, Attempt: attempt,
-			// The file this receipt is about. Without it the record says a
-			// document was delivered under a name but not which file that was,
-			// and a later attempt cannot tell its own publication from somebody
-			// else's.
-			PublishedDevice: int64(staged.Device), PublishedInode: int64(staged.Inode),
-		}
-		// The link already succeeded, so this receipt records something that
-		// has happened. It is written even if the attempt's budget has just
-		// run out; otherwise a completed publication is reconciled later as a
-		// recovery instead of being recorded now.
-		rctx, rcancel := durably(ctx)
-		defer rcancel()
-		if derr := p.led.RecordDelivered(rctx, receipt, false); derr != nil {
-			if errors.Is(derr, ledger.ErrOutcomeAlreadyRecorded) {
-				// The job was closed while this attempt was publishing. Its
-				// authority check passed before the link and stopped being
-				// true afterwards -- which no check placed before a link can
-				// prevent, because the answer is only ever a snapshot. What
-				// CAN be prevented is the consequence: this attempt has just
-				// put a document into the consumer's directory for a job whose
-				// durable record says it is finished, so it takes that document
-				// back out. It is identified by the inode this attempt linked a
-				// moment ago and removed only while that is still what the name
-				// resolves to.
-				removed, rerr := dir.RemoveOwned(candidate, staged)
-				if rerr != nil {
-					log.Error("could not withdraw a publication made into a closed job",
-						slog.String("event", "publication_not_withdrawn"),
-						slog.String("error_kind", storage.RejectionCategory(rerr)))
-				}
-				log.Warn("this job was closed while this attempt was publishing; withdrawing what it linked",
-					slog.String("event", "publication_superseded"),
-					slog.Bool("removed", removed))
-				if out, ok := p.settleAgainstPreserved(ctx, job.JobID, log); ok {
-					return out, true
-				}
-				return unsettled(derr), true
-			}
-			log.Error("published but could not record the receipt; the delivery will be retried and reconciled",
-				slog.String("event", "receipt_write_failed"),
+		dctx, dcancel := durably(ctx)
+		defer dcancel()
+		if derr := p.led.MarkDelivered(dctx, job.JobID, attempt); derr != nil {
+			// The document IS visible and its receipt IS committed. Only the
+			// final state write failed, which recovery completes from the
+			// receipt. Reporting this as a failed publication would be false.
+			log.Error("published and recorded, but the job could not be closed",
+				slog.String("event", "delivery_state_not_closed"),
 				slog.String("dependency", "postgres_primary"))
 			return unsettled(derr), true
 		}
 		if absent {
-			if nerr := p.led.NoteDeliveredFileAbsent(rctx, job.JobID); nerr != nil {
+			if nerr := p.led.NoteDeliveredFileAbsent(dctx, job.JobID); nerr != nil {
 				log.Warn("could not record that the delivered file was already absent",
 					slog.String("event", "absence_note_failed"))
 			}
@@ -1141,17 +1118,30 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 		return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt), true
 	}
 
-	// Ownership is a question about the JOB, not about the attempt asking.
-	// Comparing against the current claim's inode made an attempt that resumed
-	// after the claim moved on treat a SIBLING ATTEMPT'S document -- this job's
-	// own document, under this job's own reserved name -- as foreign, and
-	// advance to a suffixed second copy. Separate staging and consume
-	// filesystems make that the ordinary case, because competing attempts then
-	// stage different inodes by construction.
-	ours, oerr := p.led.OwnsDestination(ctx, job.JobID, int64(got.Device), int64(got.Inode))
-	if oerr != nil {
-		return unsettled(oerr), true
+	// What makes an occupant this job's document is the RECEIPT, not the inode.
+	//
+	// A retained device/inode pair stops meaning anything the moment the file
+	// holding it is gone: the filesystem is free to hand that identity to the
+	// next file created, and a foreign submission landing at this job's
+	// reserved name can carry it. Equal bytes do not rescue that -- two
+	// distinct submissions are allowed to be byte-identical, and the contract
+	// says they stay distinct.
+	//
+	// Publication now commits the receipt while the document is still an
+	// invisible dotfile and only then reveals it, so a file visible at a job's
+	// reserved name always has a committed receipt behind it. That makes the
+	// receipt both necessary and sufficient here, and makes the inode a
+	// corroborating detail rather than the authority.
+	existing, rerr := p.led.GetReceipt(ctx, job.JobID)
+	switch {
+	case rerr == nil:
+	case errors.Is(rerr, ledger.ErrNotFound):
+		existing = ledger.Receipt{}
+	default:
+		return unsettled(rerr), true
 	}
+	ours := existing.JobID != "" &&
+		existing.DestinationRoot == root && existing.DeliveredName == candidate
 
 	if ours {
 		sum, size, serr := fingerprintPublished(root, candidate, got)
@@ -1188,9 +1178,11 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 		return settled("reconciled", jobs.StateDelivered, ""), true
 	}
 
-	// Not ours. Whether the bytes match is recorded but decides nothing: equal
-	// content is exactly the case the identity check exists for, and treating
-	// it as ownership would be implicit deduplication.
+	// No receipt naming this destination for this job, so the occupant is not
+	// this job's document however much it resembles one. Whether the bytes
+	// match is recorded but decides nothing: equal content is exactly the case
+	// the identity check exists for, and treating it as ownership would be
+	// implicit deduplication.
 	matches := false
 	if sum, _, serr := storage.Fingerprint(final); serr == nil && job.Fingerprint != nil {
 		matches = bytes.Equal(sum, job.Fingerprint)
@@ -1270,15 +1262,29 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 		// Identity first. A foreign file whose bytes matched this job's was
 		// previously adopted here, which both took someone else's file and
 		// deduplicated two submissions that must stay distinct.
-		// Any inode this job ever staged, not just the current claim's: an
-		// attempt of this job that published before the claim moved on left a
-		// file that is still this job's own.
-		ours, oerr := p.led.OwnsDestination(ctx, job.JobID, int64(got.Device), int64(got.Inode))
-		if oerr != nil {
-			return unsettled(oerr)
+		// The RECEIPT decides, not the inode.
+		//
+		// A retained device/inode pair is authority only while the file
+		// holding it exists; once it is gone the filesystem may hand that
+		// identity to the next file created, and a foreign submission landing
+		// at this job's reserved name then carries it. Equal bytes do not
+		// help: byte-identical submissions are required to stay distinct.
+		//
+		// Publication commits the receipt while the document is still an
+		// invisible dotfile and reveals it only afterwards, so a file visible
+		// at a job's reserved name always has a committed receipt behind it.
+		// No receipt naming this destination means the occupant is somebody
+		// else's, whatever its inode or its contents.
+		existing, rerr := p.led.GetReceipt(ctx, job.JobID)
+		switch {
+		case rerr == nil:
+		case errors.Is(rerr, ledger.ErrNotFound):
+			existing = ledger.Receipt{}
+		default:
+			return unsettled(rerr)
 		}
-		if !ours {
-			log.Error("the reserved destination holds a file this job did not link",
+		if existing.JobID == "" || existing.DestinationRoot != root || existing.DeliveredName != name {
+			log.Error("the reserved destination holds a file no receipt of this job's describes",
 				slog.String("event", "destination_conflict"),
 				slog.String("category", string(jobs.CategoryDestinationConflict)))
 			return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt)

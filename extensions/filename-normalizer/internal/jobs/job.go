@@ -216,6 +216,10 @@ const (
 	EventReservationBlocked EventType = "reservation_blocked"
 	// EventPublishAttempted is written immediately before the destination link.
 	EventPublishAttempted EventType = "publish_attempted"
+	// EventPublicationCommitted is written when the receipt is committed for a
+	// document that is staged but not yet visible to the consumer. It is the
+	// first half of a publication; EventDelivered is the second.
+	EventPublicationCommitted EventType = "publication_committed"
 	// EventDelivered is written with the durable delivery receipt.
 	EventDelivered EventType = "delivered"
 	// EventReconciled is written when recovery established an existing

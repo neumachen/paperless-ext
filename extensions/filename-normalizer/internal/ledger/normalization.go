@@ -304,28 +304,6 @@ func (l *Ledger) ClaimPublication(ctx context.Context, jobID, reserved string, i
 	return claim, nil
 }
 
-// MarkPublicationLinked records that this job actually linked an inode into
-// the destination directory.
-//
-// Ownership is decided by this, not by the claim. A claim records what an
-// attempt INTENDS to link; a temporary that is staged and then removed without
-// being linked leaves that record behind, and inodes are reused. Without this
-// distinction a file some other writer creates later at this job's reserved
-// name can carry a recycled device/inode pair the job still claims, and
-// recovery adopts it. Only an inode that was linked can have been this job's
-// document at that name.
-func (l *Ledger) MarkPublicationLinked(ctx context.Context, jobID string, device, inode int64) error {
-	_, err := l.primary.Exec(ctx, `
-		UPDATE job_publication_inodes
-		   SET linked_at = COALESCE(linked_at, now())
-		 WHERE job_id = $1 AND device = $2 AND inode = $3`,
-		jobID, device, inode)
-	if err != nil {
-		return fmt.Errorf("record the linked publication identity: %w", err)
-	}
-	return nil
-}
-
 // ForgetStagedInode drops the record of an inode that was staged and then
 // removed without ever being linked.
 //
@@ -343,30 +321,6 @@ func (l *Ledger) ForgetStagedInode(ctx context.Context, jobID string, device, in
 		return fmt.Errorf("forget a staged publication identity: %w", err)
 	}
 	return nil
-}
-
-// OwnsDestination reports whether a file identity belongs to this job.
-//
-// It asks about the JOB, across every attempt that ever staged a file for it,
-// which is the question that matters at an occupied destination. Asking only
-// about the current claim's inode made an attempt that resumed after the claim
-// moved on classify a SIBLING ATTEMPT'S document -- this job's own document,
-// under this job's own reserved name -- as foreign, and advance to a suffix.
-// With separate staging and consume filesystems that is the ordinary case, not
-// an exotic one, because competing attempts stage different inodes by
-// construction.
-func (l *Ledger) OwnsDestination(ctx context.Context, jobID string, device, inode int64) (bool, error) {
-	var owns bool
-	err := l.primary.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM job_publication_inodes
-			 WHERE job_id = $1 AND device = $2 AND inode = $3
-			   AND linked_at IS NOT NULL)`,
-		jobID, device, inode).Scan(&owns)
-	if err != nil {
-		return false, fmt.Errorf("check destination ownership: %w", err)
-	}
-	return owns, nil
 }
 
 // PublicationStanding is what the durable record says about a job's
@@ -643,6 +597,142 @@ func (l *Ledger) RecordDelivered(ctx context.Context, r Receipt, reconciled bool
 			EventType: evt,
 			ToState:   ptr(string(jobs.StateDelivered)),
 			Attempt:   ptr(r.Attempt),
+		})
+	})
+}
+
+// ErrPublicationSuperseded means a delivery for this job already stands, so
+// this attempt must not make a second document visible.
+var ErrPublicationSuperseded = errors.New("a delivery for this job already stands")
+
+// CommitPublication records the receipt for a document that is staged but NOT
+// yet visible to the consumer, and leaves the job in `publishing`.
+//
+// # What this is for
+//
+// Publication is two steps that cannot share a transaction: a filesystem
+// rename and a durable record. Whichever runs second can fail, and the
+// question is only which failure is survivable.
+//
+// Making the document visible first and recording it second produced the
+// unsurvivable one: an attempt whose claim had expired could put a consumable
+// document into the consumer's directory for a job a sibling had already
+// closed, discover the refusal afterwards, and remove a file the consumer may
+// already have taken.
+//
+// So the record goes first, while the document is still a dotfile the consumer
+// ignores. This call takes the job row's lock, refuses if anybody has closed
+// the job or already has a receipt, and commits the receipt with the job still
+// in `publishing`. Only after it returns does the caller make the document
+// visible, and only then is the job marked delivered.
+//
+// A receipt with the job in `publishing` therefore means exactly "the
+// publication is authorised and committed; the document may or may not be
+// visible yet". Recovery resolves that state by looking, which is safe because
+// the document is either hidden under a name this job owns or visible under
+// its reserved name -- never duplicated and never lost.
+//
+// This does NOT claim the filesystem and the ledger change atomically. If the
+// commit's outcome is unknown, the caller must not reveal; the document stays
+// hidden and a later attempt resolves it from what the ledger actually says.
+func (l *Ledger) CommitPublication(ctx context.Context, r Receipt) error {
+	return l.tx(ctx, func(tx pgx.Tx) error {
+		var state string
+		if err := tx.QueryRow(ctx,
+			`SELECT state FROM jobs WHERE job_id = $1 FOR UPDATE`, r.JobID).Scan(&state); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		switch state {
+		case string(jobs.StateProcessing), string(jobs.StatePublishing):
+		default:
+			// Terminal, or closed by somebody else while this attempt was
+			// working. Nothing is visible yet, so nothing has to be withdrawn.
+			return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
+		}
+		var hasReceipt bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM delivery_receipts WHERE job_id = $1)`,
+			r.JobID).Scan(&hasReceipt); err != nil {
+			return err
+		}
+		if hasReceipt {
+			return ErrPublicationSuperseded
+		}
+		// The inode this job is publishing, marked linked in the same
+		// transaction as the receipt that describes it. Separately they could
+		// disagree. The row itself was created when the claim was taken, so
+		// this is an update: inserting one here omits the columns that claim
+		// fills in and the write is rejected.
+		if _, err := tx.Exec(ctx, `
+			UPDATE job_publication_inodes
+			   SET linked_at = COALESCE(linked_at, now())
+			 WHERE job_id = $1 AND device = $2 AND inode = $3`,
+			r.JobID, r.PublishedDevice, r.PublishedInode); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO delivery_receipts
+				(job_id, destination_root, delivered_name, size_bytes,
+				 content_fingerprint, attempt, published_device, published_inode)
+			VALUES ($1, $2, $3, $4, $5, $6,
+			        NULLIF($7::bigint, 0), NULLIF($8::bigint, 0))
+			ON CONFLICT (job_id) DO NOTHING`,
+			r.JobID, r.DestinationRoot, r.DeliveredName, r.SizeBytes,
+			r.Fingerprint, r.Attempt, r.PublishedDevice, r.PublishedInode); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE jobs SET state = 'publishing', updated_at = now()
+			  WHERE job_id = $1 AND state <> 'publishing'`, r.JobID); err != nil {
+			return err
+		}
+		return l.appendEvent(ctx, tx, eventInput{
+			JobID:     r.JobID,
+			EventType: jobs.EventPublicationCommitted,
+			ToState:   ptr(string(jobs.StatePublishing)),
+			Attempt:   ptr(r.Attempt),
+		})
+	})
+}
+
+// MarkDelivered closes a job whose document is now visible under its reserved
+// name. The receipt already exists; this is the second half of a publication
+// whose first half was CommitPublication.
+func (l *Ledger) MarkDelivered(ctx context.Context, jobID string, attempt int) error {
+	return l.tx(ctx, func(tx pgx.Tx) error {
+		ct, err := tx.Exec(ctx, `
+			UPDATE jobs j
+			   SET state = 'delivered',
+			       reserved_name = r.delivered_name,
+			       terminal_at = COALESCE(j.terminal_at, now()),
+			       failure_category = NULL,
+			       publish_claimed_by = NULL,
+			       updated_at = now()
+			  FROM delivery_receipts r
+			 WHERE j.job_id = $1 AND r.job_id = j.job_id
+			   AND j.state IN ('processing','publishing','delivered')`, jobID)
+		if err != nil {
+			return err
+		}
+		if ct.RowsAffected() == 0 {
+			// No receipt, or the job is in a state this must not reopen.
+			var state string
+			if qerr := tx.QueryRow(ctx, `SELECT state FROM jobs WHERE job_id = $1`, jobID).Scan(&state); qerr != nil {
+				if errors.Is(qerr, pgx.ErrNoRows) {
+					return ErrNotFound
+				}
+				return qerr
+			}
+			return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
+		}
+		return l.appendEvent(ctx, tx, eventInput{
+			JobID:     jobID,
+			EventType: jobs.EventDelivered,
+			ToState:   ptr(string(jobs.StateDelivered)),
+			Attempt:   ptr(attempt),
 		})
 	})
 }
