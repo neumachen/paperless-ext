@@ -146,7 +146,19 @@ compose stop renamer-1 renamer-2 >/dev/null 2>&1
 # receipt. That is correct behaviour and a useless observation: the sequence
 # under test never occurs. One message at a time is what makes the sibling the
 # one that finds it.
-start_fault renamer-hold FN_FAULT_POINTS=hold_before_reveal FN_FAULT_HOLD=75s \
+#
+# The hold must be SHORTER than A's handler budget, and the budget is raised
+# here to make that true. The budget is the shutdown timeout -- processor.go
+# sets `HandlerBudget: cfg.ShutdownTimeout` -- and it bounds the delivery's
+# context, pause included. At the default 20s a 75s hold expired A's context
+# while A was still paused, so A never resumed into its publication path at
+# all: it woke with a dead context and logged
+# `delivery_requeued`/`ledger_unavailable`/`timeout`. Every substantive
+# assertion below still passed, because the SIBLING did all the work -- which
+# is exactly how this exercise reported "A did not stand down" for a step that
+# had never run.
+start_fault renamer-hold FN_FAULT_POINTS=hold_before_reveal FN_FAULT_HOLD=60s \
+    FN_SHUTDOWN_TIMEOUT=180s \
     FN_PUBLISH_TAKEOVER_AFTER=10s FN_RENAMER_PREFETCH=1 || exit 1
 sleep 6
 compose run --rm --no-deps -T --entrypoint sh storage-init -c \
@@ -247,12 +259,16 @@ sleep 6
 # What "standing down" looks like now.
 #
 # A publishes from its own descriptor, so its staged NAME being gone does not
-# stop it: the link succeeds or returns EEXIST against the destination the
-# sibling already published. It then recognises that occupant as its own file
-# -- same inode, the one its receipt records -- and reconciles. That is the
-# property this exercise is about, and `delivery_reconciled` is how it is
-# reported; the older event names are kept for runs against earlier builds.
-KEPT="$(compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | grep -c 'publication_reconciled_by_sibling\|publication_superseded\|publication_completed_elsewhere\|delivery_reconciled' || true)"
+# stop it: the reveal returns EEXIST against the destination the sibling
+# already published, and A enters resolveOccupiedDestination.
+#
+# The event to look for is `outcome_preserved`. The FIRST thing that function
+# does is re-read the job, and the sibling has already driven it to delivered,
+# so A stands down there -- "a sibling attempt completed this job while this
+# one was publishing" -- without ever reaching the inode-ownership branch.
+# This exercise previously grepped for four event names that the source does
+# not emit on this path, so the check could only ever fail.
+KEPT="$(compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | grep -c 'outcome_preserved\|publication_reconciled_by_sibling\|publication_superseded\|publication_completed_elsewhere\|delivery_reconciled' || true)"
 {
     printf '\n--- what A logged for %s ---\n' "$JOB"
     compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | tail -12
