@@ -528,10 +528,13 @@ func (l *Ledger) BeginDelivery(ctx context.Context, jobID string, attempt int, r
 // This is the only terminal outcome this increment produces. It explicitly
 // does not assert delivery: no file has been moved, and no delivery receipt
 // exists. A consumer acknowledgement is issued only after this commit returns.
-func (l *Ledger) RecordHold(ctx context.Context, jobID string, category jobs.Category, attempt int) error {
+func (l *Ledger) RecordHold(ctx context.Context, jobID string, category jobs.Category, attempt int, staleAfter time.Duration) error {
+	if staleAfter <= 0 {
+		staleAfter = time.Minute
+	}
 	err := l.tx(ctx, func(tx pgx.Tx) error {
-		// A stale attempt must not demote a newer outcome, and it must not
-		// close a publication that is already authorised.
+		// A stale attempt must not demote a newer outcome, and a LIVE
+		// publication must not be closed under the attempt performing it.
 		//
 		// The state guard alone was not enough once the receipt began to
 		// precede the reveal. A redelivered sibling -- a policy mismatch, a
@@ -541,8 +544,17 @@ func (l *Ledger) RecordHold(ctx context.Context, jobID string, category jobs.Cat
 		// and was refused its final state: a document in the consumer's
 		// directory for a job recorded `held`.
 		//
-		// A committed receipt therefore blocks a hold outright. The caller
-		// settles against what actually stands instead.
+		// So a committed receipt blocks a hold only while the publication
+		// CLAIM IS STILL LIVE. Blocking it outright was too broad and broke
+		// the opposite case: the publisher itself discovering it cannot
+		// publish -- an unverifiable destination, a refused reveal -- could no
+		// longer close its own job, so the delivery was returned, redelivered,
+		// and the job spun in `publishing` indefinitely.
+		//
+		// Once the claim is older than the takeover window, whoever is holding
+		// the job is entitled to close it, and the receipt it withdraws
+		// describes a publication that never became visible. The withdrawal is
+		// recorded as an event, so the history survives the receipt.
 		tag, err := tx.Exec(ctx, `
 			UPDATE jobs
 			   SET state = 'held',
@@ -551,8 +563,10 @@ func (l *Ledger) RecordHold(ctx context.Context, jobID string, category jobs.Cat
 			       updated_at = now()
 			 WHERE job_id = $1
 			   AND state NOT IN ('delivered','uncertain')
-			   AND NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = $1)`,
-			jobID, string(category))
+			   AND (NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = $1)
+			        OR publish_attempted_at IS NULL
+			        OR publish_attempted_at < now() - $3::interval)`,
+			jobID, string(category), staleAfter.String())
 		if err != nil {
 			return err
 		}
@@ -568,6 +582,28 @@ func (l *Ledger) RecordHold(ctx context.Context, jobID string, category jobs.Cat
 				return qerr
 			}
 			return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
+		}
+		// A receipt surviving a hold would describe a delivery that is not
+		// going to happen, for a job now recorded as needing intervention.
+		// It only reaches here when the claim was stale, so the publication
+		// it authorised is not in flight.
+		ct, derr := tx.Exec(ctx, `DELETE FROM delivery_receipts WHERE job_id = $1`, jobID)
+		if derr != nil {
+			return derr
+		}
+		if ct.RowsAffected() > 0 {
+			if _, uerr := tx.Exec(ctx,
+				`UPDATE job_publication_inodes SET linked_at = NULL WHERE job_id = $1`, jobID); uerr != nil {
+				return uerr
+			}
+			if aerr := l.appendEvent(ctx, tx, eventInput{
+				JobID:     jobID,
+				EventType: jobs.EventPublishAbandoned,
+				Attempt:   ptr(attempt),
+				Detail:    map[string]any{"reason": "held after the publication claim went stale"},
+			}); aerr != nil {
+				return aerr
+			}
 		}
 		return l.appendEvent(ctx, tx, eventInput{
 			JobID:     jobID,
