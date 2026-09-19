@@ -794,14 +794,24 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	// this publication in.
 	p.faults.Pause(config.FaultHoldBeforeReveal, log)
 
-	err := dir.RevealNoReplace(filepath.Base(tmp), candidate)
-	published := err == nil
+	// Published from the descriptor whose bytes were verified, so the inode
+	// that becomes visible is the inode that was checked. `published` is what
+	// the link did; `err` may describe something that failed afterwards, to a
+	// document that is already visible.
+	published, err := dir.RevealFromDescriptor(stagedFile, candidate)
 	if published {
 		linked = true
 	}
 
 	switch {
 	case published:
+		// Cleanup, on a document that is already published. A failure here is
+		// reported and changes nothing about the publication.
+		if _, rerr := dir.RemoveOwned(filepath.Base(tmp), staged); rerr != nil {
+			log.Warn("the published document's staged link could not be removed",
+				slog.String("event", "staged_link_left_behind"),
+				slog.String("error_kind", storage.RejectionCategory(rerr)))
+		}
 		// The document is visible NOW, and only now. `hold_after_link` pauses
 		// here so a real consumer has a genuine chance to take it before the
 		// read-back below -- which is what that fault point has always been
@@ -858,7 +868,7 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			slog.Int64("size_bytes", size))
 		return settled("delivered", jobs.StateDelivered, ""), true
 
-	case errors.Is(err, fs.ErrNotExist):
+	case !published && errors.Is(err, fs.ErrNotExist):
 		// This attempt's staged file is gone, so it is not the one that will
 		// reveal it. Under the current order that means the publication was
 		// already committed -- it must have been, or there would be nothing to
@@ -873,10 +883,10 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		}
 		return settled("delivered", jobs.StateDelivered, ""), true
 
-	case errors.Is(err, storage.ErrDestinationExists):
+	case !published && errors.Is(err, storage.ErrDestinationExists):
 		return p.resolveOccupiedDestination(ctx, job, root, candidate, key, final, attempt, log)
 
-	case definitelyNotPublished(err):
+	case !published && definitelyNotPublished(err):
 		// The kernel refused the rename, and renameat2 is atomic: no
 		// directory entry was created. The receipt committed a moment ago
 		// therefore describes a delivery that provably did not happen, and it
@@ -953,6 +963,16 @@ func (p *Pipeline) settleAgainstPreserved(ctx context.Context, jobID string, log
 		log.Warn("a durable outcome is recorded but could not be read; returning the delivery",
 			slog.String("event", "preserved_outcome_unreadable"),
 			slog.String("error_kind", logging.ErrorKind(err)))
+		return Outcome{}, false
+	}
+	if !jobs.IsTerminal(fresh.State) {
+		// Not an outcome. Settling here acknowledged the delivery for a job
+		// still in `publishing`, so nothing ever came back to finish it and
+		// the work was stranded. Returning the delivery is what lets a later
+		// attempt resolve it.
+		log.Info("this job has not reached an outcome; returning the delivery rather than settling",
+			slog.String("event", "outcome_not_reached"),
+			slog.String("state", string(fresh.State)))
 		return Outcome{}, false
 	}
 	cat := jobs.Category(categoryOfJob(fresh))
@@ -1224,8 +1244,26 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 	default:
 		return unsettled(rerr), true
 	}
+	// The receipt names a destination this job is AUTHORISED to publish to. It
+	// does not say that whatever is sitting there now is this job's document.
+	//
+	// The receipt is committed before the reveal, so there is a real interval
+	// in which a foreign file can arrive at the reserved name. Accepting it on
+	// "the receipt names this root and name, and the bytes match" adopted
+	// somebody else's submission, recorded this job delivered against it, and
+	// removed this job's own unpublished temporary. No inode reuse is needed
+	// for that; byte-identical submissions are ordinary and the contract says
+	// they stay distinct.
+	//
+	// What identifies this job's document is the inode the receipt RECORDED at
+	// commit time -- the file this attempt staged and still holds, so it
+	// cannot have been recycled while this window is open. A receipt with no
+	// recorded inode cannot establish ownership of anything.
 	ours := existing.JobID != "" &&
-		existing.DestinationRoot == root && existing.DeliveredName == candidate
+		existing.DestinationRoot == root && existing.DeliveredName == candidate &&
+		existing.PublishedInode != 0 && existing.PublishedDevice != 0 &&
+		existing.PublishedInode == int64(got.Inode) &&
+		existing.PublishedDevice == int64(got.Device)
 
 	if ours {
 		sum, size, serr := fingerprintPublished(root, candidate, got)
@@ -1286,6 +1324,59 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 //
 // It runs after the root verification in Process, so a recovery cannot read or
 // write through a root that is no longer the directory it was.
+// recoverOccupied decides what a destination that became occupied while this
+// job was resolving means. Identity answers it, not the name.
+func (p *Pipeline) recoverOccupied(ctx context.Context, job ledger.Job, root, name string, attempt int, log *slog.Logger) Outcome {
+	got, gerr := storage.Identify(filepath.Join(root, name))
+	if gerr != nil {
+		cat := jobs.Category(storage.RejectionCategory(gerr))
+		log.Error("the occupied destination could not be identified",
+			slog.String("event", "destination_unverifiable"),
+			slog.String("category", string(cat)))
+		out, _ := p.holdOr(ctx, job, cat, attempt, gerr)
+		return out
+	}
+	existing, rerr := p.led.GetReceipt(ctx, job.JobID)
+	if rerr != nil {
+		return unsettled(rerr)
+	}
+	if existing.PublishedInode != 0 && existing.PublishedDevice != 0 &&
+		existing.PublishedInode == int64(got.Inode) &&
+		existing.PublishedDevice == int64(got.Device) {
+		if merr := p.led.MarkDelivered(ctx, job.JobID, attempt, true); merr != nil {
+			return unsettled(merr)
+		}
+		log.Info("the destination holds this job's own published document",
+			slog.String("event", "delivery_reconciled"))
+		return settled("reconciled", jobs.StateDelivered, "")
+	}
+	log.Error("the reserved destination holds a file this job's receipt does not identify",
+		slog.String("event", "destination_conflict"),
+		slog.String("category", string(jobs.CategoryDestinationConflict)))
+	return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt)
+}
+
+// uncertainWithReceipt records durable uncertainty for a job whose publication
+// was AUTHORISED -- its receipt is committed -- but whose document can be
+// neither found nor shown to have been taken.
+//
+// The ordinary uncertain path refuses a job that holds a receipt, because a
+// receipt used to mean the document had been published. It does not any more:
+// the receipt is committed first. So this case needs its own door rather than
+// being forced into "delivered", which would record a delivery nobody can
+// point at, or into an acknowledgement, which would strand the job.
+//
+// The receipt is KEPT. It is evidence that a publication was authorised, and
+// the person resolving this needs it.
+func (p *Pipeline) uncertainWithReceipt(ctx context.Context, job ledger.Job, attempt int) Outcome {
+	uctx, ucancel := durably(ctx)
+	defer ucancel()
+	if err := p.led.RecordUncertainWithReceipt(uctx, job.JobID, jobs.CategoryPublicationUncertain, attempt); err != nil {
+		return unsettled(err)
+	}
+	return settled("uncertain", jobs.StateUncertain, jobs.CategoryPublicationUncertain)
+}
+
 func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attempt int, log *slog.Logger) Outcome {
 	root := p.cfg.Storage.Consume
 
@@ -1367,8 +1458,15 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 		default:
 			return unsettled(rerr)
 		}
-		if existing.JobID == "" || existing.DestinationRoot != root || existing.DeliveredName != name {
-			log.Error("the reserved destination holds a file no receipt of this job's describes",
+		// Same rule as the publication path: the receipt authorises a
+		// destination, the recorded inode identifies the document. A file that
+		// merely occupies the reserved name is somebody else's until its
+		// identity says otherwise.
+		if existing.JobID == "" || existing.DestinationRoot != root || existing.DeliveredName != name ||
+			existing.PublishedInode == 0 || existing.PublishedDevice == 0 ||
+			existing.PublishedInode != int64(got.Inode) ||
+			existing.PublishedDevice != int64(got.Device) {
+			log.Error("the reserved destination holds a file this job's receipt does not identify",
 				slog.String("event", "destination_conflict"),
 				slog.String("category", string(jobs.CategoryDestinationConflict)))
 			return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt)
@@ -1430,32 +1528,103 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 		//                                is the ordinary consumer case. The
 		//                                delivery stands and its file is gone.
 		//   no receipt                -> unchanged: uncertain, below.
-		if existing, rerr := p.led.GetReceipt(ctx, job.JobID); rerr == nil &&
-			existing.DestinationRoot == root && existing.DeliveredName == name {
-			if dir, derr := storage.OpenDir(root); derr == nil {
-				defer func() { _ = dir.Close() }()
-				if staged, ferr := dir.FindStagedFor(job.JobID); ferr == nil && staged != "" {
-					if rverr := dir.RevealNoReplace(staged, name); rverr == nil {
-						if merr := p.led.MarkDelivered(ctx, job.JobID, attempt, true); merr != nil {
-							return unsettled(merr)
-						}
-						log.Info("finished a publication that was committed but never revealed",
-							slog.String("event", "publication_reveal_completed"))
-						return settled("reconciled", jobs.StateDelivered, "")
-					}
+		existing, rerr := p.led.GetReceipt(ctx, job.JobID)
+		switch {
+		case rerr == nil && existing.DestinationRoot == root && existing.DeliveredName == name:
+		case rerr != nil && !errors.Is(rerr, ledger.ErrNotFound):
+			return unsettled(rerr)
+		default:
+			existing = ledger.Receipt{}
+		}
+		if existing.JobID != "" {
+			// A receipt and no visible document. Finish the publication if the
+			// staged file is still here and still this job's content; say so
+			// honestly if it cannot be established either way.
+			//
+			// "Receipt and nothing staged" is NOT proof that a consumer took
+			// it. An unreadable directory looks identical, and so does a
+			// staging root that was replaced. Only an inspection that actually
+			// succeeded and found nothing supports that reading.
+			dir, derr := storage.OpenDir(root)
+			if derr != nil {
+				cat := jobs.Category(storage.RejectionCategory(derr))
+				log.Error("a committed publication could not be resolved: the destination root is unusable",
+					slog.String("event", "destination_root_unusable"),
+					slog.String("category", string(cat)))
+				out, _ := p.holdOr(ctx, job, cat, attempt, derr)
+				return out
+			}
+			defer func() { _ = dir.Close() }()
+
+			candidates, ferr := dir.FindStagedFor(job.JobID)
+			if ferr != nil {
+				cat := jobs.Category(storage.RejectionCategory(ferr))
+				log.Error("a committed publication could not be resolved: the destination could not be listed",
+					slog.String("event", "staging_unreadable"),
+					slog.String("category", string(cat)))
+				out, _ := p.holdOr(ctx, job, cat, attempt, ferr)
+				return out
+			}
+
+			// Every candidate, each verified against what discovery recorded.
+			// Staging precedes claiming, so a job can have more than one, and
+			// an attempt that died before claiming left one no attempt was
+			// authorised to publish. Publishing whichever the directory listed
+			// first chose a file on no evidence at all.
+			for _, cand := range candidates {
+				ent, ierr := dir.Identify(cand)
+				if ierr != nil {
+					continue
 				}
+				f, sum, _, verr := openAndFingerprintOwnTemp(dir, cand, ent)
+				if verr != nil {
+					continue
+				}
+				if job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint) {
+					_ = f.Close()
+					log.Warn("a staged temporary of this job does not hold this job's content; leaving it",
+						slog.String("event", "staged_content_mismatch"))
+					continue
+				}
+				pub, rverr := dir.RevealFromDescriptor(f, name)
+				_ = f.Close()
+				if pub {
+					if _, cerr := dir.RemoveOwned(cand, ent); cerr != nil {
+						log.Warn("the published document's staged link could not be removed",
+							slog.String("event", "staged_link_left_behind"),
+							slog.String("error_kind", storage.RejectionCategory(cerr)))
+					}
+					if merr := p.led.MarkDelivered(ctx, job.JobID, attempt, true); merr != nil {
+						return unsettled(merr)
+					}
+					log.Info("finished a publication that was committed but never revealed",
+						slog.String("event", "publication_reveal_completed"))
+					return settled("reconciled", jobs.StateDelivered, "")
+				}
+				if errors.Is(rverr, storage.ErrDestinationExists) {
+					// Somebody published while this was deciding. Whether it
+					// is this job's document is the occupied-destination
+					// question, answered by identity rather than here.
+					return p.recoverOccupied(ctx, job, root, name, attempt, log)
+				}
+				// A refusal that is not "already there" is a storage failure,
+				// and the document is still staged and safe.
+				cat := jobs.Category(storage.RejectionCategory(rverr))
+				log.Error("a committed publication could not be revealed",
+					slog.String("event", "publication_refused"),
+					slog.String("category", string(cat)))
+				out, _ := p.holdOr(ctx, job, cat, attempt, rverr)
+				return out
 			}
-			// Recorded, and its file is not here. Keep the delivery.
-			if merr := p.led.MarkDelivered(ctx, job.JobID, attempt, true); merr != nil {
-				return unsettled(merr)
-			}
-			if nerr := p.led.NoteDeliveredFileAbsent(ctx, job.JobID); nerr != nil {
-				log.Warn("could not record that the delivered file was already absent",
-					slog.String("event", "absence_note_failed"))
-			}
-			log.Info("a committed delivery whose file is no longer present; the delivery stands",
-				slog.String("event", "delivery_reconciled"))
-			return settled("reconciled", jobs.StateDelivered, "")
+
+			// The directory was read and holds nothing of this job's. Either
+			// the document was revealed and taken, or it never was. A receipt
+			// alone cannot tell those apart, and inventing "the consumer took
+			// it" would record a delivery nobody can point at.
+			log.Error("a committed publication has no document and no staged copy; it cannot be confirmed",
+				slog.String("event", "publication_uncertain"),
+				slog.String("category", string(jobs.CategoryPublicationUncertain)))
+			return p.uncertainWithReceipt(ctx, job, attempt)
 		}
 		// The honest answer. The file may never have been created, or it may
 		// have been created and already taken by the consumer. A filesystem
