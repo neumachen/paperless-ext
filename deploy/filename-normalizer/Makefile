@@ -218,6 +218,16 @@ test-reconcile-resume: ## Prove a reconciled receipt does not make the published
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-reconcile-resume.sh
 
+.PHONY: test-post-commit-interval
+test-post-commit-interval: ## Prove the interval between a committed receipt and a visible document holds
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-post-commit-interval.sh
+
+.PHONY: test-restore-replay
+test-restore-replay: ## Prove the documented restore quarantine prevents the replay a live-root restore causes
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-restore-replay.sh
+
 .PHONY: test-refusal-safety
 test-refusal-safety: ## Prove a refusal changes nothing and cleanup respects ownership
 	@mkdir -p $(EVIDENCE)
