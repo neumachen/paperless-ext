@@ -51,15 +51,12 @@ psqlq() {
     fi
 }
 
-# An existence probe that cannot report absence it did not observe. FN-R5-05's
-# rule applies to this script too: a check that could not run is `unknown`, and
-# `unknown` is not `no`.
-in_storage() {
-    _is_out="$(compose run --rm --no-deps -T --entrypoint sh storage-init -c "$1" 2>/dev/null < /dev/null | tr -d ' \r\n' || true)"
-    case "$_is_out" in
-        yes|no) printf '%s' "$_is_out" ;;
-        *) printf 'unknown' ;;
-    esac
+# note_unknown records a probe that could not answer, so the completeness
+# verdict at the top of the artifact accounts for it. A per-job probe returning
+# `unknown` used to leave the inventory claiming COMPLETE: the word was in the
+# body and the header did not know about it.
+note_unknown() {
+    printf 'filesystem probe could not answer: %s\n' "$1" >> "$FAILURES"
 }
 
 {
@@ -170,9 +167,13 @@ else
         | sed '/^$/d' > "$EVIDENCE_DIR/.uncertain-rows.txt"
     while IFS='|' read -r jid src res when; do
         [ -n "$jid" ] || continue
-        _src="$(in_storage "test -e '/srv/fn/incoming/$src' && echo yes || echo no")"
+        _src="$(probe_exists "/srv/fn/incoming/$src")"
+        [ "$_src" = "unknown" ] && note_unknown "incoming entry for job $jid"
         _dst="n/a"
-        [ "$res" != "-" ] && _dst="$(in_storage "test -e '/srv/fn/consume/$res' && echo yes || echo no")"
+        if [ "$res" != "-" ]; then
+            _dst="$(probe_exists "/srv/fn/consume/$res")"
+            [ "$_dst" = "unknown" ] && note_unknown "consume entry for job $jid"
+        fi
         _rec="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$jid';" | tr -d ' ')"
         {
             printf '%s\n' "$jid"
