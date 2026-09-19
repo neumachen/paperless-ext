@@ -219,26 +219,22 @@ restore() {
     # the directory and this exercise would remove it from the library. So the
     # last check before the irreversible step is whether that happened, and if
     # it did the volumes stay, named, for a person to recover from.
-    _r_foreign="$(psqlq "SELECT count(*) FROM delivery_receipts r JOIN jobs j USING (job_id)
-                          WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';" 2>/dev/null)"
-    _r_foreign_gone=0
-    if [ "${_r_foreign:-0}" -gt 0 ]; then
-        for _n in $(psqlq "SELECT r.delivered_name FROM delivery_receipts r JOIN jobs j USING (job_id)
-                            WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';" 2>/dev/null); do
-            if [ "$(in_storage "test -e '/srv/fn/consume/$_n' && echo yes || echo no")" = "no" ]; then
-                _r_foreign_gone=$((_r_foreign_gone + 1))
-            fi
-        done
-    fi
-    if [ "${_r_foreign_gone:-0}" -gt 0 ]; then
-        echo "error: $_r_foreign_gone document(s) belonging to other work were consumed by this" >&2
-        echo "       exercise's Paperless instance. Its volumes are NOT being removed:" >&2
+    # Destroying these volumes is irreversible, so it happens only on a
+    # definite "nothing of anyone else's is in here". `unknown` keeps them.
+    _r_verdict="$(foreign_content_verdict)"
+    if [ "$_r_verdict" != "none" ]; then
+        if [ "$_r_verdict" = "present" ]; then
+            echo "error: document(s) belonging to other work were consumed by this" >&2
+            echo "       exercise's Paperless instance. Its volumes are NOT being removed:" >&2
+        else
+            echo "error: whether documents belonging to other work are inside this" >&2
+            echo "       exercise's Paperless instance COULD NOT BE ESTABLISHED. Its" >&2
+            echo "       volumes are NOT being removed:" >&2
+        fi
         for _v in $CREATED_VOLUMES; do echo "         ${PROJECT}_$_v" >&2; done
         {
-            printf '  volumes KEPT: %s document(s) belonging to other work were consumed
-' "$_r_foreign_gone"
-            printf '  the copies are inside:%s
-' "$CREATED_VOLUMES"
+            printf '  volumes KEPT (foreign content: %s)\n' "$_r_verdict"
+            printf '  restoration is INCOMPLETE; the copies are inside:%s\n' "$CREATED_VOLUMES"
         } >> "$OUT"
         CREATED_VOLUMES=""
         _r_ok=0
@@ -297,6 +293,71 @@ emit ""
 
 # The moment before the consumer exists, so deliveries made by other work
 # while it runs can be told from what was already there.
+# foreign_content_verdict answers one question -- is anything belonging to other
+# work inside this consumer's library? -- with three possible answers, and
+# `unknown` is one of them.
+#
+# # Why it cannot default to "none"
+#
+# The restoration path used to read the count with
+#
+#     _r_foreign="$(psqlq "SELECT count(*) ..." 2>/dev/null)"
+#
+# and test "${_r_foreign:-0}" -gt 0. PostgreSQL being unavailable during
+# cleanup -- which is ordinary, since cleanup runs after fault scenarios -- made
+# that zero, skipped the enumeration entirely, and went on to destroy the media
+# volumes. A document another job delivered and this consumer ingested would
+# have been in them. The same held for the per-name probe: anything that was not
+# the literal string "no" was read as "still present", so a probe that could not
+# run also cleared the way.
+#
+# Two sources, because the receipt query only sees what it can enumerate:
+# receipts written since T0 for non-consumer sources, and separately every entry
+# that was in the destination before this exercise began. A document that was
+# delivered earlier and consumed now appears only in the second.
+#
+# Any step that cannot answer makes the whole verdict `unknown`, and `unknown`
+# preserves.
+foreign_content_verdict() {
+    _fv_count="$(psqlq "SELECT count(*) FROM delivery_receipts r JOIN jobs j USING (job_id)
+                         WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';" 2>/dev/null | tr -d ' \r\n')"
+    case "$_fv_count" in
+        ''|*[!0-9]*) printf 'unknown'; return 0 ;;
+    esac
+    if [ "$_fv_count" -gt 0 ]; then
+        _fv_names="$(psqlq "SELECT r.delivered_name FROM delivery_receipts r JOIN jobs j USING (job_id)
+                             WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';" 2>/dev/null)"
+        _fv_seen=0
+        for _fv_n in $_fv_names; do
+            _fv_seen=$((_fv_seen + 1))
+            case "$(probe_exists "/srv/fn/consume/$_fv_n")" in
+                no)      printf 'present'; return 0 ;;
+                unknown) printf 'unknown'; return 0 ;;
+            esac
+        done
+        # The count said there are rows and the listing produced none: the
+        # second query failed where the first succeeded.
+        [ "$_fv_seen" -ge "$_fv_count" ] || { printf 'unknown'; return 0; }
+    fi
+
+    # Everything that was here before this exercise started must still be here.
+    if [ -z "$IGNORED_JSON" ]; then
+        printf 'unknown'; return 0
+    fi
+    _fv_gone="$(printf '%s' "$IGNORED_JSON" | docker run --rm -i \
+        -v "${PROJECT}_fn-consume:/consume:ro" "$UTIL_PY_IMAGE" python3 -c "
+import json, os, sys
+before = set(json.load(sys.stdin))
+now = set(os.listdir('/consume'))
+missing = [n for n in sorted(before - now) if not n.startswith('consumer-')]
+print(len(missing))" 2>/dev/null | tr -d ' \r\n')"
+    case "$_fv_gone" in
+        ''|*[!0-9]*) printf 'unknown'; return 0 ;;
+        0)           printf 'none' ;;
+        *)           printf 'present' ;;
+    esac
+}
+
 T0="$(psqlq "SELECT now();")"
 BEFORE_CONSUME="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | wc -l")"
 log "1/4: starting an isolated Paperless instance against the real consume directory"
@@ -588,16 +649,15 @@ fi
 # not to happen.
 ARRIVED="$(psqlq "SELECT count(*) FROM delivery_receipts r JOIN jobs j USING (job_id)
                    WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';")"
+FOREIGN_VERDICT="$(foreign_content_verdict)"
 ARRIVED_GONE=0
-if [ "${ARRIVED:-0}" -gt 0 ]; then
-    for _n in $(psqlq "SELECT r.delivered_name FROM delivery_receipts r JOIN jobs j USING (job_id)
-                        WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';"); do
-        if [ "$(in_storage "test -e '/srv/fn/consume/$_n' && echo yes || echo no")" = "no" ]; then
-            ARRIVED_GONE=$((ARRIVED_GONE + 1))
-        fi
-    done
-fi
-emit "documents other work delivered while this ran:     ${ARRIVED:-0}, of which ${ARRIVED_GONE} were consumed"
+case "$FOREIGN_VERDICT" in
+    present) ARRIVED_GONE=1 ;;
+    unknown) bad "whether other work's documents were ingested could not be established; \
+the consumer's data is preserved and restoration is incomplete" ;;
+esac
+emit "documents other work delivered while this ran:     ${ARRIVED:-unknown}"
+emit "anything of other work's inside this consumer:     $FOREIGN_VERDICT   (expected none)"
 [ "${ARRIVED_GONE:-0}" = "0" ] || bad "$ARRIVED_GONE document(s) belonging to other work were ingested by this exercise's consumer"
 # The ignore list is a snapshot and cannot name a document that had not arrived
 # when it was taken. That is a real hole and it is reported as one rather than
