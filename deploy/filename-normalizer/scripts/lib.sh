@@ -233,6 +233,43 @@ wait_for_unacked() {
     return 1
 }
 
+# wait_for_instance_in_flight blocks until ONE NAMED instance reports at least
+# N deliveries in flight, read from that instance's own /metrics.
+#
+# `wait_for_unacked` above asks the broker, and the broker answers for the
+# whole queue. The drain assertion does not: it reads renamer-2's own
+# `readiness_withdrawn count`, its own `consumer_draining`, and deliveries it
+# settled itself. A run satisfied the queue-wide condition with four
+# unacknowledged deliveries across two consumers, terminated renamer-2, and
+# found nothing in flight on it — the phase reported "this phase did not
+# exercise a drain", correctly. A precondition has to be about the same
+# instance the assertion is about, or it is not a precondition for it.
+#
+# Scraped through a container on the stack network, like every other probe
+# here; nothing runs on the host.
+wait_for_instance_in_flight() {
+    _wi_host="$1"; _wi_min="${2:-1}"; _wi_limit="${3:-90}"; _wi_waited=0
+    _wi_seen="none"
+    while [ "$_wi_waited" -lt "$_wi_limit" ]; do
+        _wi_val="$(compose exec -T rabbitmq sh -c \
+            "wget -q -T 2 -O - 'http://$_wi_host:8080/metrics'" 2>/dev/null \
+            | sed -n 's/^fn_deliveries_in_flight \([0-9][0-9]*\).*$/\1/p' | head -1 || true)"
+        case "$_wi_val" in
+            ''|*[!0-9]*) : ;;
+            *)
+                _wi_seen="$_wi_val"
+                if [ "$_wi_val" -ge "$_wi_min" ]; then
+                    note "$_wi_host reports $_wi_val delivery/deliveries in flight on its OWN metrics"
+                    return 0
+                fi
+                ;;
+        esac
+        _wi_waited=$((_wi_waited + 1))
+    done
+    echo "error: $_wi_host never reported $_wi_min in-flight delivery/deliveries within ${_wi_limit} polls (last reading: $_wi_seen)" >&2
+    return 1
+}
+
 # record_public_command_evidence executes the public entry points whose exit
 # status the contract depends on, and records both the positive and the
 # negative outcome for the suite to assert on.

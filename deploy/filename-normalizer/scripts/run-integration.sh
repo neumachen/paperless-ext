@@ -271,6 +271,16 @@ if ! wait_for_unacked "${FN_AMQP_QUEUE:-filename_normalizer.jobs.v1}" 1 90; then
     echo "error: cannot terminate renamer-2 during a drain that is not happening" >&2
     exit 1
 fi
+# The broker's count is queue-wide, and the assertion is not: it reads
+# renamer-2's own in-flight count, its own draining log and the deliveries it
+# settled itself. A run satisfied the queue-wide condition with four
+# unacknowledged deliveries that were all on renamer-1, terminated renamer-2
+# idle, and the phase reported that no drain had been exercised. The instance
+# under test has to be the instance holding work.
+if ! wait_for_instance_in_flight renamer-2 1 120; then
+    echo "error: renamer-2 is holding no delivery; terminating it now would exercise an idle exit, not a drain" >&2
+    exit 1
+fi
 stop_timed renamer-2 40 renamer2
 # Keep sampling past the termination so the endpoint's disappearance is
 # recorded rather than inferred.
