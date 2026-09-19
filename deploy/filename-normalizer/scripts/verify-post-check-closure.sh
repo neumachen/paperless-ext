@@ -42,16 +42,27 @@ in_storage() {
 
 start_fault() {
     _sf="$1"; shift
-    if [ -n "$(compose --profile fault ps -aq "$_sf" 2>/dev/null)" ]; then
+    # An inspection that FAILED is not an absence. `compose ps -aq` returning
+    # nothing because the command itself errored read as "there is no such
+    # service", and this went on to create -- or adopt -- something it had not
+    # established was absent.
+    if ! _sf_existing="$(compose --profile fault ps -aq "$_sf" 2>/dev/null)"; then
+        echo "error: could not determine whether '$_sf' already exists; refusing to create it." >&2
+        return 1
+    fi
+    if [ -n "$_sf_existing" ]; then
         echo "error: '$_sf' already exists; this invocation did not create it." >&2
         return 1
     fi
     MUTATED=1
-    CREATED="$CREATED $_sf"
     (
         for _kv in "$@"; do export "$_kv"; done
         compose --profile fault up -d "$_sf" >/dev/null 2>&1
     ) || { echo "error: could not start '$_sf'" >&2; return 1; }
+    # Ownership is recorded only once creation has actually succeeded. Claiming
+    # it beforehand meant a failed start still put the name on the cleanup
+    # list, and cleanup then removed whatever else was answering to it.
+    CREATED="$CREATED $_sf"
     return 0
 }
 
@@ -237,7 +248,7 @@ WHATLOGGED="$(compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB
 FINAL="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB';")"
 RECEIPTS="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB';")"
 COPIES="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^post-check-$LOWER' || true")"
-SRC="$(in_storage "test -f '/srv/fn/incoming/$DOC' && echo yes || echo no")"
+SRC="$(probe_exists "/srv/fn/incoming/$DOC")"
 {
     printf '\n--- what each side logged for %s ---\n' "$JOB"
     compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | tail -10

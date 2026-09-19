@@ -98,12 +98,18 @@ stop_ordinary() { MUTATED=1; compose stop renamer-1 renamer-2 >/dev/null 2>&1; }
 start_fault() {
     _sf_svc="$1"; shift
     MUTATED=1
-    if [ -n "$(compose --profile fault ps -aq "$_sf_svc" 2>/dev/null)" ]; then
+    # A failed inspection is not an absence: `compose ps -aq` returning nothing
+    # because the command errored read as "no such service", and this went on
+    # to create or adopt something it had not established was absent.
+    if ! _sf_existing="$(compose --profile fault ps -aq "$_sf_svc" 2>/dev/null)"; then
+        echo "error: could not determine whether '$_sf_svc' exists; refusing to create it." >&2
+        return 1
+    fi
+    if [ -n "$_sf_existing" ]; then
         echo "error: service '$_sf_svc' already exists; this invocation did not create it" >&2
         echo "       and will not remove it. Refusing before anything is changed." >&2
         return 1
     fi
-    CREATED="$CREATED $_sf_svc"
     # The variables are exported in a SUBSHELL rather than passed through
     # `env`: `compose` is a shell function, and env can only exec a binary, so
     # `env VAR=v compose ...` failed to find a command and took the whole
@@ -118,6 +124,9 @@ start_fault() {
         compose --profile fault logs --tail 20 "$_sf_svc" >&2 2>/dev/null || true
         return 1
     }
+    # Only now. Claiming ownership before the start succeeded put the name on
+    # the cleanup list even when this run had created nothing.
+    CREATED="$CREATED $_sf_svc"
     return 0
 }
 
@@ -223,7 +232,17 @@ cleanup_planted() {
             "$PLANTED_PATH" "$PLANTED_INODE" "$_cp_now" >> "$OUT"
         return 1
     fi
-    in_storage "rm -f '$PLANTED_PATH' 2>/dev/null; true" >/dev/null 2>&1 || true
+    # Identity and removal in ONE invocation. Checking the inode in one
+    # container and then removing the PATHNAME in another left an interval in
+    # which the entry could be replaced, and the removal would then delete
+    # whatever had taken the name. The path travels as an environment variable
+    # so the filename is never parsed by a shell.
+    compose run --rm --no-deps -T \
+        -e FN_RM_PATH="$PLANTED_PATH" -e FN_RM_INODE="$PLANTED_INODE" \
+        --entrypoint sh storage-init -c '
+            if [ -e "$FN_RM_PATH" ] && [ "$(stat -c %i "$FN_RM_PATH")" = "$FN_RM_INODE" ]; then
+                rm -f "$FN_RM_PATH"
+            fi' >/dev/null 2>&1 </dev/null || true
     # Verified, not assumed. `rm -f` reports nothing, and an inspection that
     # cannot run reports nothing either; reading the second as the first let a
     # run announce a clean restoration with its planted file still in place.

@@ -42,16 +42,27 @@ in_storage() {
 
 start_fault() {
     _sf="$1"; shift
-    if [ -n "$(compose --profile fault ps -aq "$_sf" 2>/dev/null)" ]; then
+    # An inspection that FAILED is not an absence. `compose ps -aq` returning
+    # nothing because the command itself errored read as "there is no such
+    # service", and this went on to create -- or adopt -- something it had not
+    # established was absent.
+    if ! _sf_existing="$(compose --profile fault ps -aq "$_sf" 2>/dev/null)"; then
+        echo "error: could not determine whether '$_sf' already exists; refusing to create it." >&2
+        return 1
+    fi
+    if [ -n "$_sf_existing" ]; then
         echo "error: '$_sf' already exists; this invocation did not create it." >&2
         return 1
     fi
     MUTATED=1
-    CREATED="$CREATED $_sf"
     (
         for _kv in "$@"; do export "$_kv"; done
         compose --profile fault up -d "$_sf" >/dev/null 2>&1
     ) || { echo "error: could not start '$_sf'" >&2; return 1; }
+    # Ownership is recorded only once creation has actually succeeded. Claiming
+    # it beforehand meant a failed start still put the name on the cleanup
+    # list, and cleanup then removed whatever else was answering to it.
+    CREATED="$CREATED $_sf"
     return 0
 }
 
@@ -166,7 +177,12 @@ while [ "$_i" -lt 150 ]; do
 done
 LINKED="$(probe_exists "/srv/fn/consume/$NAME")"
 STAGED_NAME="$(in_storage "ls -a /srv/fn/consume 2>/dev/null | grep '^\.fn-$JOB\.' | head -1")"
-INODE_A="$(in_storage "ls -i '/srv/fn/consume/$STAGED_NAME' 2>/dev/null | awk '{print \$1}'")"
+# STAGED_NAME comes from a directory listing, and `consume` is shared: anything
+# with write access can create a name there. Interpolating it into shell source
+# that runs as root in the storage container made a filename executable again.
+# probe_inode passes the path as an environment variable, so nothing in it is
+# ever parsed by a shell.
+INODE_A="$(probe_inode "/srv/fn/consume/$STAGED_NAME")"
 RECEIPTS_BEFORE="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB';")"
 [ "$STAGED_A" = "1" ] || bad "A never reached the committed-but-unrevealed state this exercise is about"
 
@@ -231,8 +247,8 @@ KEPT="$(compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | gr
     compose --profile fault logs renamer-taker 2>/dev/null | grep "$JOB" | tail -12
 } >> "$EVIDENCE_DIR/reconcile-resume-events.log" 2>/dev/null || true
 WITHDREW="$(compose --profile fault logs renamer-hold 2>/dev/null | grep -c 'duplicate_publication_withdrawn' || true)"
-PRESENT="$(in_storage "test -f '/srv/fn/consume/$NAME' && echo yes || echo no")"
-INODE_FINAL="$(in_storage "ls -i '/srv/fn/consume/$NAME' 2>/dev/null | awk '{print \$1}'")"
+PRESENT="$(probe_exists "/srv/fn/consume/$NAME")"
+INODE_FINAL="$(probe_inode "/srv/fn/consume/$NAME")"
 COPIES="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^reconcile-resume-$LOWER' || true")"
 RECEIPTS_FINAL="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB';")"
 STATE_FINAL="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB';")"
