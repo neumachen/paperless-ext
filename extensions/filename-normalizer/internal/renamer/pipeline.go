@@ -787,11 +787,12 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		return unsettled(cerr2), true
 	}
 
-	// Committed. From here the document is authorised, and the fault points
-	// below hold the window a consumer could act in -- which is now the window
-	// AFTER the receipt exists, not before it.
+	// Committed. `after_link` stops the process here, between the receipt and
+	// the reveal, which is the interruption recovery has to survive.
 	p.faults.Fire(config.FaultAfterLink, log)
-	p.faults.Pause(config.FaultHoldAfterLink, log)
+	// Recorded, still invisible: the interval a sibling's recovery can finish
+	// this publication in.
+	p.faults.Pause(config.FaultHoldBeforeReveal, log)
 
 	err := dir.RevealNoReplace(filepath.Base(tmp), candidate)
 	published := err == nil
@@ -801,6 +802,14 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 
 	switch {
 	case published:
+		// The document is visible NOW, and only now. `hold_after_link` pauses
+		// here so a real consumer has a genuine chance to take it before the
+		// read-back below -- which is what that fault point has always been
+		// for, and what makes "the destination was gone when we looked" an
+		// observation rather than a simulation. Before the reveal there was
+		// nothing for a consumer to take, so pausing there measured nothing.
+		p.faults.Pause(config.FaultHoldAfterLink, log)
+
 		size, fp := stagedSize, stagedSum
 		_ = fp
 		absent := false
@@ -824,7 +833,7 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 
 		dctx, dcancel := durably(ctx)
 		defer dcancel()
-		if derr := p.led.MarkDelivered(dctx, job.JobID, attempt); derr != nil {
+		if derr := p.led.MarkDelivered(dctx, job.JobID, attempt, false); derr != nil {
 			// The document IS visible and its receipt IS committed. Only the
 			// final state write failed, which recovery completes from the
 			// receipt. Reporting this as a failed publication would be false.
@@ -866,6 +875,31 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 
 	case errors.Is(err, storage.ErrDestinationExists):
 		return p.resolveOccupiedDestination(ctx, job, root, candidate, key, final, attempt, log)
+
+	case definitelyNotPublished(err):
+		// The kernel refused the rename, and renameat2 is atomic: no
+		// directory entry was created. The receipt committed a moment ago
+		// therefore describes a delivery that provably did not happen, and it
+		// has to go before this is classified -- otherwise a refused
+		// publication reads as a delivered one.
+		wctx, wcancel := durably(ctx)
+		werr := p.led.WithdrawPublicationReceipt(wctx, job.JobID,
+			int64(staged.Device), int64(staged.Inode), attempt)
+		wcancel()
+		if werr != nil {
+			// The receipt stands and the document is not there. Say so
+			// rather than reporting either half alone.
+			log.Error("a refused publication's receipt could not be withdrawn",
+				slog.String("event", "publication_receipt_not_withdrawn"),
+				slog.String("error_kind", logging.ErrorKind(werr)))
+			return unsettled(werr), true
+		}
+		cat := jobs.Category(storage.RejectionCategory(err))
+		log.Error("the destination refused the publication; its receipt was withdrawn",
+			slog.String("event", "publication_refused"),
+			slog.String("category", string(cat)))
+		out, _ := p.holdOr(ctx, job, cat, attempt, err)
+		return out, true
 
 	default:
 		cat := jobs.Category(storage.RejectionCategory(err))
@@ -1402,7 +1436,7 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 				defer func() { _ = dir.Close() }()
 				if staged, ferr := dir.FindStagedFor(job.JobID); ferr == nil && staged != "" {
 					if rverr := dir.RevealNoReplace(staged, name); rverr == nil {
-						if merr := p.led.MarkDelivered(ctx, job.JobID, attempt); merr != nil {
+						if merr := p.led.MarkDelivered(ctx, job.JobID, attempt, true); merr != nil {
 							return unsettled(merr)
 						}
 						log.Info("finished a publication that was committed but never revealed",
@@ -1412,7 +1446,7 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 				}
 			}
 			// Recorded, and its file is not here. Keep the delivery.
-			if merr := p.led.MarkDelivered(ctx, job.JobID, attempt); merr != nil {
+			if merr := p.led.MarkDelivered(ctx, job.JobID, attempt, true); merr != nil {
 				return unsettled(merr)
 			}
 			if nerr := p.led.NoteDeliveredFileAbsent(ctx, job.JobID); nerr != nil {

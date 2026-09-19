@@ -135,7 +135,7 @@ compose stop renamer-1 renamer-2 >/dev/null 2>&1
 # receipt. That is correct behaviour and a useless observation: the sequence
 # under test never occurs. One message at a time is what makes the sibling the
 # one that finds it.
-start_fault renamer-hold FN_FAULT_POINTS=hold_after_link FN_FAULT_HOLD=75s \
+start_fault renamer-hold FN_FAULT_POINTS=hold_before_reveal FN_FAULT_HOLD=75s \
     FN_PUBLISH_TAKEOVER_AFTER=10s FN_RENAMER_PREFETCH=1 || exit 1
 sleep 6
 compose run --rm --no-deps -T --entrypoint sh storage-init -c \

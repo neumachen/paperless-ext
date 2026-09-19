@@ -23,11 +23,11 @@ Every process reports three identities, and they are independent:
 | Policy identity | the naming policy version plus a fingerprint of every setting that can change a produced name | same, and stamped on every job |
 
 ```sh
-docker compose -f compose.prod.yml exec watcher /usr/local/bin/watcher version
+docker compose -f compose.prod.yml exec watcher /usr/local/bin/fn-watcher version
 curl -s localhost:8080/healthz | jq '{revision, sourceDigest, policyIdentity}'
 # or over the private gRPC surface
 docker run --rm --network "${FN_PROJECT:-filename-normalizer}_fn" \
-    -e FN_GRPC_TARGET=renamer-1:9090 "$FN_IMAGE" fnctl status
+    -e FN_GRPC_TARGET=renamer-1:9090 "$FN_FNCTL_IMAGE" status
 ```
 
 A job accepted under one policy identity is never reinterpreted under another:
@@ -119,20 +119,30 @@ It is read-only — there is no runtime configuration mutation, by design.
 #    the effective-configuration view are one code path, so "it validates" and
 #    "this is what it means" cannot disagree. The output carries no credentials.
 docker run --rm --env-file ./prod.env \
-    -v "$FN_HOST_CONFIG:/etc/fn/normalizer.json:ro" "$FN_IMAGE" \
-    watcher check-config
+    -e FN_DB_PASSWORD_FILE=/run/secrets/db -e FN_AMQP_PASSWORD_FILE=/run/secrets/amqp \
+    -v "$FN_SECRET_DB_PASSWORD:/run/secrets/db:ro" \
+    -v "$FN_SECRET_AMQP_PASSWORD:/run/secrets/amqp:ro" \
+    -v "$FN_HOST_CONFIG:/etc/fn/normalizer.json:ro" \
+    "$FN_WATCHER_IMAGE" check-config
 
 # 3. apply the schema, as one deliberate run. The services in this manifest
 #    have FN_DB_APPLY_MIGRATIONS=false, so none of them will migrate on
 #    startup; this is the only thing that does.
 docker run --rm --env-file ./prod.env \
     -e FN_DB_APPLY_MIGRATIONS=true -e FN_STORAGE_REQUIRED=false \
-    "$FN_IMAGE" watcher check-config
+    -e FN_DB_PASSWORD_FILE=/run/secrets/db -e FN_AMQP_PASSWORD_FILE=/run/secrets/amqp \
+    -v "$FN_SECRET_DB_PASSWORD:/run/secrets/db:ro" \
+    -v "$FN_SECRET_AMQP_PASSWORD:/run/secrets/amqp:ro" \
+    "$FN_WATCHER_IMAGE" check-config
 
 # 4. start
 docker compose -f compose.prod.yml --env-file ./prod.env up -d
 ```
 
+> Three image references, because there are three images: `FN_WATCHER_IMAGE`,
+> `FN_RENAMER_IMAGE` and `FN_FNCTL_IMAGE`. Each carries its own entrypoint
+> binary, so a subcommand is passed directly rather than selecting a program.
+>
 > `check-config` is used for step 3 because migrations are applied by the
 > watcher's startup path when `FN_DB_APPLY_MIGRATIONS=true`. There is no
 > separate `migrate` subcommand; inventing one in a runbook would be worse
@@ -157,12 +167,15 @@ Rolling, one renamer at a time; the watcher last.
 # 1. apply any new migrations FIRST, explicitly, with the new image
 docker run --rm --env-file ./prod.env \
     -e FN_DB_APPLY_MIGRATIONS=true -e FN_STORAGE_REQUIRED=false \
-    "$FN_NEW_IMAGE" watcher check-config
+    -e FN_DB_PASSWORD_FILE=/run/secrets/db -e FN_AMQP_PASSWORD_FILE=/run/secrets/amqp \
+    -v "$FN_SECRET_DB_PASSWORD:/run/secrets/db:ro" \
+    -v "$FN_SECRET_AMQP_PASSWORD:/run/secrets/amqp:ro" \
+    "$FN_NEW_WATCHER_IMAGE" check-config
 # 2. replace renamers one at a time, waiting for health between them
-FN_IMAGE=$FN_NEW_IMAGE docker compose -f compose.prod.yml up -d --no-deps renamer-1
+FN_RENAMER_IMAGE=$FN_NEW_RENAMER_IMAGE docker compose -f compose.prod.yml up -d --no-deps renamer-1
 # ... wait for healthy, then renamer-2
 # 3. replace the watcher
-FN_IMAGE=$FN_NEW_IMAGE docker compose -f compose.prod.yml up -d --no-deps watcher
+FN_RENAMER_IMAGE=$FN_NEW_RENAMER_IMAGE docker compose -f compose.prod.yml up -d --no-deps watcher
 ```
 
 A renamer whose policy identity differs from a job's holds that job as
@@ -181,7 +194,7 @@ rollback is a restore (below), not an image change.
 docker compose -f compose.prod.yml stop watcher
 # 2. let renamers drain (watch fn_deliveries_in_flight reach 0)
 # 3. put the previous image back, renamers first, then the watcher
-FN_IMAGE=$FN_PREVIOUS_IMAGE docker compose -f compose.prod.yml up -d
+FN_WATCHER_IMAGE=$FN_PREV_WATCHER_IMAGE FN_RENAMER_IMAGE=$FN_PREV_RENAMER_IMAGE docker compose -f compose.prod.yml up -d
 ```
 
 Files and durable state are preserved throughout: no procedure here deletes a
@@ -211,11 +224,11 @@ redeliver it nor call it failed.
 ```sh
 # the processing state, including the uncertain count
 docker run --rm --network "${FN_PROJECT:-filename-normalizer}_fn" \
-    -e FN_GRPC_TARGET=renamer-1:9090 "$FN_IMAGE" fnctl state
+    -e FN_GRPC_TARGET=renamer-1:9090 "$FN_FNCTL_IMAGE" state
 
 # one job in full, by id
 docker run --rm --network "${FN_PROJECT:-filename-normalizer}_fn" \
-    -e FN_GRPC_TARGET=renamer-1:9090 "$FN_IMAGE" fnctl inspect <job-id>
+    -e FN_GRPC_TARGET=renamer-1:9090 "$FN_FNCTL_IMAGE" inspect <job-id>
 ```
 
 The job ids themselves come from the ledger; `fnctl` reads, it does not list

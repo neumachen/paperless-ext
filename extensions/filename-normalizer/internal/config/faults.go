@@ -52,8 +52,8 @@ const (
 	// file at the destination, so only the claim can stop it publishing a
 	// second copy.
 	FaultHoldAfterClaim FaultPoint = "hold_after_claim"
-	// FaultHoldAfterLink PAUSES -- it does not exit -- after the destination
-	// link has SUCCEEDED and before the destination is read back, for
+	// FaultHoldAfterLink PAUSES -- it does not exit -- after the document has
+	// become VISIBLE at its destination and before it is read back, for
 	// FN_FAULT_HOLD. It exists so a real consumer can be observed taking the
 	// document inside that window: the publication has genuinely happened, and
 	// the read that follows must treat a vanished destination as a completed
@@ -75,6 +75,19 @@ const (
 	// ever becomes visible. The fault point stays because the claim needs
 	// demonstrating against a real consumer, not asserting.
 	FaultHoldBeforeCommit FaultPoint = "hold_before_commit"
+	// FaultHoldBeforeReveal PAUSES between the committed receipt and the
+	// rename that makes the document visible.
+	//
+	// Publication has three points a pause means something different at, and
+	// each of these names exactly one of them:
+	//
+	//   hold_before_commit  nothing is recorded and nothing is visible
+	//   hold_before_reveal  recorded, still invisible
+	//   hold_after_link     recorded and visible, not yet read back
+	//
+	// This one is the interval a sibling's recovery can finish the
+	// publication in, which is what the reconcile exercise is about.
+	FaultHoldBeforeReveal FaultPoint = "hold_before_reveal"
 )
 
 // FaultPoints is the set a process will act on.
@@ -94,7 +107,7 @@ func LoadFaultPoints() (FaultPoints, []string) {
 		case "":
 			continue
 		case FaultBeforeLink, FaultAfterLink, FaultAfterReceipt, FaultHoldAfterClaim,
-			FaultHoldAfterLink, FaultHoldBeforeCommit:
+			FaultHoldAfterLink, FaultHoldBeforeCommit, FaultHoldBeforeReveal:
 			out[name] = true
 			names = append(names, string(name))
 		default:
