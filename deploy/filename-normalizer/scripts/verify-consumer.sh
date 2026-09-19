@@ -251,6 +251,7 @@ restore() {
         printf '\nRESTORATION FAILED — see the values above.\n' >> "$OUT"
         exit 1
     fi
+    report_restored
     note "restored: consumer removed, every recreated service reports itself READY"
 }
 

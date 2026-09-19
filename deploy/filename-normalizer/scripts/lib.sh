@@ -591,21 +591,35 @@ report_begin() {
 # taken at the pass point stops one section short of the evidence that the stack
 # was put back. Safe to call more than once; the last call wins.
 REPORT_PASSED=0
+REPORT_RESTORED_OK=0
+
+# report_keep copies this run's report into its own file, always. It promotes
+# to the success slot only when the run passed AND its restoration succeeded.
+#
+# Promotion used to happen the moment the exercise logged PASSED, which is
+# before the EXIT trap runs. Reordering the trap does not undo that: the copy
+# had already been made, so a run whose restoration then FAILED had already
+# replaced the last known-good report with its own. A report is only a
+# successful run's report if the run also put the stack back.
 report_keep() {
     [ -n "$REPORT_RUN" ] || return 0
     [ -f "$REPORT_OUT" ] || return 0
     cp "$REPORT_OUT" "$REPORT_RUN" 2>/dev/null || true
-    if [ "${REPORT_PASSED:-0}" = "1" ] && [ -n "$REPORT_NAME" ]; then
+    if [ "${REPORT_PASSED:-0}" = "1" ] && [ "${REPORT_RESTORED_OK:-0}" = "1" ] && [ -n "$REPORT_NAME" ]; then
         cp "$REPORT_OUT" "$EVIDENCE_DIR/successful/${REPORT_NAME}.txt" 2>/dev/null || true
     fi
 }
 
-# report_success marks this run as one that may be promoted. Only a run that
-# actually passed may call it; the copy itself happens in report_keep, after
-# restoration has had its say.
+# report_success records that the assertions passed. It copies nothing.
 report_success() {
     REPORT_PASSED=1
     report_keep
+}
+
+# report_restored records that restoration completed. Exercises call it at the
+# end of a restore that verified its own result.
+report_restored() {
+    REPORT_RESTORED_OK=1
 }
 
 # cksum_sha256 hashes a file in a container, like everything else here.
