@@ -24,7 +24,7 @@ emit ""
 # ---------------------------------------------------------------------------
 # 1. The manifest parses with a complete environment, and nothing is missing.
 # ---------------------------------------------------------------------------
-log "1/6: the manifest parses with a complete environment"
+log "1/7: the manifest parses with a complete environment"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 mkdir -p "$SCRATCH/incoming" "$SCRATCH/queued" "$SCRATCH/staging" "$SCRATCH/consume" "$SCRATCH/failed"
@@ -70,7 +70,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Safety properties of the rendered manifest.
 # ---------------------------------------------------------------------------
-log "2/6: the rendered manifest is safe"
+log "2/7: the rendered manifest is safe"
 if [ -n "$RENDERED" ]; then
     _pub="$(printf '%s' "$RENDERED" | grep -E '^\s+- (published|target):' -A0 | wc -l | tr -d ' ')"
     _nonloopback="$(printf '%s' "$RENDERED" | grep -E 'host_ip:' | grep -cv '127\.0\.0\.1' || true)"
@@ -106,7 +106,7 @@ fi
 # ---------------------------------------------------------------------------
 # 3. No credential is committed anywhere in the package.
 # ---------------------------------------------------------------------------
-log "3/6: no credential is committed"
+log "3/7: no credential is committed"
 if grep -rInE '(password|secret)[^A-Za-z_]*[:=][^:$]*[A-Za-z0-9]{8,}' "$PROD" \
      | grep -vE 'PASSWORD_FILE|_FILE:|\$\{|password file|password/' >/dev/null 2>&1; then
     bad "something that looks like a credential is committed under production/"
@@ -117,7 +117,7 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Every alert expression names a metric the applications actually export.
 # ---------------------------------------------------------------------------
-log "4/6: every alert names a metric that exists"
+log "4/7: every alert names a metric that exists"
 # Scraped from a container on the stack network. The renamer image is
 # distroless, so the scrape runs somewhere that has a shell.
 EXPORTED="$(compose exec -T rabbitmq sh -c \
@@ -136,9 +136,64 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. The rules do not fire on a HEALTHY stack.
+#
+# Metric-name existence is not enough, and checking only that was how a rule
+# shipped that pages on a working system: `fn_consumer_up == 0` also matches a
+# healthy WATCHER, which is not a broker consumer and exports 0 by design.
+# These evaluate the simple rules against what the live stack is exporting now.
+# ---------------------------------------------------------------------------
+log "4b/7: the rules do not fire on a healthy stack"
+scrape() {
+    compose exec -T rabbitmq sh -c "wget -q -T 5 -O - http://$1:8080/metrics" 2>/dev/null || true
+}
+W_METRICS="$(scrape watcher)"
+R_METRICS="$(scrape renamer-1)"
+if [ -z "$W_METRICS" ] || [ -z "$R_METRICS" ]; then
+    bad "could not scrape the live metric surface, so no alert rule was evaluated"
+else
+    # A healthy watcher exports fn_consumer_up 0. The rule must be scoped so
+    # that does not page.
+    _w_consumer="$(printf '%s' "$W_METRICS" | grep -E '^fn_consumer_up ' | awk '{print $2}')"
+    _r_consumer="$(printf '%s' "$R_METRICS" | grep -E '^fn_consumer_up ' | awk '{print $2}')"
+    emit "healthy watcher fn_consumer_up:   ${_w_consumer:-absent}   (0 is normal: not a consumer)"
+    emit "healthy renamer fn_consumer_up:   ${_r_consumer:-absent}   (expected 1)"
+    [ "${_r_consumer:-0}" = "1" ] || bad "a healthy renamer is not consuming; the rule would page correctly, but this stack is not healthy"
+    if [ "${_w_consumer:-1}" = "0" ] && ! grep -q 'application="renamer"' "$PROD/alerts.prometheus.yml"; then
+        bad "the consumer rule is not scoped to renamers, and a healthy watcher exports 0"
+    fi
+
+    # Every state label a rule names must be a state the ledger actually
+    # reports. `pending` was not one, so that rule could never fire.
+    for _st in $(grep -oE 'fn_jobs\{state="[a-z_]+"\}' "$PROD/alerts.prometheus.yml" \
+                  | sed 's/.*state="//; s/"}//' | sort -u); do
+        if ! printf '%s' "$W_METRICS" | grep -q "^fn_jobs{state=\"$_st\"}"; then
+            bad "an alert names fn_jobs state \"$_st\", which the ledger does not report"
+        fi
+    done
+    emit "alert job-states that the ledger does not report: none"
+
+    # Required dependencies are up, and the rule excludes the optional replica.
+    _down="$(printf '%s' "$R_METRICS" | grep -E '^fn_dependency_up\{' | awk '$2 == 0 {print $1}' | wc -l | tr -d ' ')"
+    emit "required dependencies reporting down on a healthy stack: $_down   (expected 0)"
+    grep -q 'dependency!="postgres_replica"' "$PROD/alerts.prometheus.yml" \
+        || bad "the dependency rule does not exclude the optional replica"
+
+    # Discovery is running, so the stalled-discovery rule must be quiet.
+    _disc="$(printf '%s' "$W_METRICS" | grep -E '^fn_discovery_last_run_timestamp_seconds ' | awk '{print $2}')"
+    if [ -n "$_disc" ]; then
+        _age="$(awk -v t="$_disc" 'BEGIN{printf "%d", systime() - t}')"
+        emit "seconds since discovery last ran: $_age   (rule fires above 900)"
+        [ "$_age" -lt 900 ] || bad "discovery has not run in $_age seconds on a stack claimed healthy"
+    else
+        bad "the watcher exports no discovery timestamp, so the stalled-discovery rule cannot work"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Every command the runbook tells an operator to run exists.
 # ---------------------------------------------------------------------------
-log "5/6: the runbook's commands exist"
+log "5/7: the runbook's commands exist"
 _badcmd=""
 # Each image carries its own entrypoint binary, so the subcommand goes to the
 # image's own entrypoint rather than to a program selected by name.
@@ -178,7 +233,7 @@ done
 # ---------------------------------------------------------------------------
 # 6. The configuration the package ships validates.
 # ---------------------------------------------------------------------------
-log "6/6: the shipped configuration validates"
+log "6/7: the shipped configuration validates"
 if docker run --rm -e FN_STORAGE_REQUIRED=false -e FN_DB_APPLY_MIGRATIONS=false \
     -e FN_DB_PRIMARY_HOST=unused -e FN_AMQP_HOST=unused \
     -e FN_DB_NAME=unused -e FN_DB_USER=unused -e FN_AMQP_USER=unused \

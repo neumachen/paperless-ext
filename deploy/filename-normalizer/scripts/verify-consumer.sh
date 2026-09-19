@@ -443,7 +443,7 @@ _i=0
 TAKEN=no
 if [ "${RECEIPTS:-0}" = "1" ]; then
     while [ "$_i" -lt 240 ]; do
-        if [ "$(in_storage "test -e '/srv/fn/consume/$NAME' && echo yes || echo no")" = "no" ]; then TAKEN=yes; break; fi
+        if [ "$(probe_exists "/srv/fn/consume/$NAME")" = "no" ]; then TAKEN=yes; break; fi
         sleep 2; _i=$((_i + 2))
     done
 else
@@ -481,7 +481,7 @@ STATE_AFTER="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB';")"
 CAT_AFTER="$(psqlq "SELECT coalesce(failure_category,'-') FROM jobs WHERE job_id = '$JOB';")"
 RECEIPTS_AFTER="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB';")"
 REPUB="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c 'consumer-handoff-$LOWER' || true")"
-SRC_AFTER="$(in_storage "test -f '/srv/fn/incoming/$DOC' && echo yes || echo no")"
+SRC_AFTER="$(probe_exists "/srv/fn/incoming/$DOC")"
 
 emit "3. after the consumer took the document"
 emit "   state:                        $STATE_AFTER   (expected delivered: a taken file is not a failure)"
@@ -589,7 +589,7 @@ RECEIPTS4="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB4
 ABSENT4="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB4' AND absent_observed_at IS NOT NULL;")"
 CAT4="$(psqlq "SELECT coalesce(failure_category,'-') FROM jobs WHERE job_id = '$JOB4';")"
 REPUB4="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c 'consumer-window-$LOWER' || true")"
-SRC4="$(in_storage "test -f '/srv/fn/incoming/$DOC4' && echo yes || echo no")"
+SRC4="$(probe_exists "/srv/fn/incoming/$DOC4")"
 
 emit "4. the consumer took it between the link and the read-back"
 emit "   the publisher held the window open: $PAUSED4 log line(s)"

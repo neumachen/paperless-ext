@@ -18,36 +18,57 @@ groups:
         labels: {severity: page, receiver: UNRESOLVED}
         annotations:
           summary: "No watcher is reporting"
-          description: >-
-            Nothing is discovering submissions. Documents dropped into incoming
-            are not being registered; they are not lost, they are simply not
-            moving.
           action: >-
-            Check the watcher container. Exactly one must run. Start it, then
-            confirm fn_build_info reappears and the oldest pending age falls.
+            Exactly one watcher must run. Start it, then confirm fn_build_info
+            reappears and the oldest pending-dispatch age falls.
 
-      - alert: FnRenamerNotConsuming
-        expr: fn_consumer_up == 0
+      - alert: FnNoRenamerReporting
+        expr: absent(fn_build_info{application="renamer"}) == 1
         for: 5m
         labels: {severity: page, receiver: UNRESOLVED}
         annotations:
-          summary: "A renamer is up but not consuming from the broker"
+          summary: "No renamer is reporting"
           description: >-
-            The process is alive and its readiness may be green, but it holds
-            no consumer on the work queue, so it will never take a job.
+            Work is registered and dispatched but nothing is processing it.
+            Previously uncovered: the consumer rule below cannot fire for an
+            instance that is not there to export a metric.
+          action: "Start at least one renamer."
+
+      - alert: FnRenamerNotConsuming
+        # Restricted to renamers on purpose. A HEALTHY WATCHER EXPORTS
+        # fn_consumer_up 0 -- it is not a broker consumer -- so the unqualified
+        # form paged on a working system. The join carries `application`, which
+        # fn_consumer_up itself does not have.
+        expr: (fn_consumer_up == 0) and on(instance) (fn_build_info{application="renamer"} == 1)
+        for: 5m
+        labels: {severity: page, receiver: UNRESOLVED}
+        annotations:
+          summary: "A renamer is up but holds no consumer on the work queue"
           action: >-
             Check broker connectivity and credentials for that instance. A
             restart re-attaches the consumer.
 
-      - alert: FnDependencyDown
-        expr: fn_dependency_up == 0
+      - alert: FnRequiredDependencyDown
+        # The replica is optional (FN_DB_REPLICA_REQUIRED defaults false), so
+        # an unconfigured or absent one must not page.
+        expr: fn_dependency_up{dependency!="postgres_replica"} == 0
         for: 3m
         labels: {severity: page, receiver: UNRESOLVED}
         annotations:
           summary: "A required dependency is unavailable ({{ $labels.dependency }})"
           action: >-
-            Restore the dependency. The applications hold work rather than
-            inventing outcomes, so nothing is lost while it is down.
+            Restore it. The applications hold work rather than inventing
+            outcomes, so nothing is lost while it is down.
+
+      - alert: FnReplicaDown
+        expr: fn_dependency_up{dependency="postgres_replica"} == 0
+        for: 30m
+        labels: {severity: ticket, receiver: UNRESOLVED}
+        annotations:
+          summary: "The optional PostgreSQL replica is not answering"
+          action: >-
+            Only a ticket: the replica is read-only and optional. Ignore this
+            rule entirely if you run without one.
 
       - alert: FnStorageUnavailable
         expr: fn_storage_root_available == 0
@@ -56,76 +77,100 @@ groups:
         annotations:
           summary: "A storage root is unavailable ({{ $labels.role }})"
           description: >-
-            Unavailable storage is never treated as an empty directory. The
-            applications refuse to proceed rather than conclude that documents
-            have vanished.
-          action: >-
-            Check the mount. If a share is disconnected, remount it before
-            restarting anything.
+            Unavailable storage is never treated as an empty directory.
+          action: "Check the mount before restarting anything."
 
       # --- work is arriving but not moving ---------------------------------
+      - alert: FnDiscoveryStalled
+        expr: time() - fn_discovery_last_run_timestamp_seconds > 900
+        for: 5m
+        labels: {severity: page, receiver: UNRESOLVED}
+        annotations:
+          summary: "Discovery has not completed a pass in 15 minutes"
+          description: >-
+            The watcher process can be alive and healthy while discovery is
+            not running. Previously uncovered.
+          action: "Check the watcher's logs for a stuck or failing pass."
+
       - alert: FnBacklogStalled
         expr: fn_oldest_pending_dispatch_age_seconds > 1800
         for: 10m
         labels: {severity: page, receiver: UNRESOLVED}
         annotations:
-          summary: "The oldest pending submission is over 30 minutes old"
-          action: >-
-            Check that at least one renamer is consuming and that the broker
-            queue is draining. This fires when the pipeline is up but stuck.
+          summary: "The oldest job owing a broker publication is over 30 minutes old"
+          action: "Check that the broker is reachable and the queue is draining."
 
-      - alert: FnQueueGrowing
-        expr: fn_jobs{state="pending"} > 500
+      - alert: FnPendingDispatchGrowing
+        # `pending` is not a ledger state. The states are pending_dispatch,
+        # dispatching, dispatched, processing, publishing, delivered, held,
+        # uncertain -- the earlier rule named one that does not exist and so
+        # could never fire.
+        expr: fn_jobs{state="pending_dispatch"} > 500
         for: 30m
         labels: {severity: ticket, receiver: UNRESOLVED}
         annotations:
-          summary: "Pending work is accumulating"
-          action: >-
-            Capacity. Add a renamer instance or raise concurrency, and check
-            that intake is not exceeding what the storage can absorb.
+          summary: "Work owing dispatch is accumulating"
+          action: "Capacity: add a renamer or raise concurrency."
 
-      # --- work that needs a person ----------------------------------------
-      - alert: FnUncertainPublication
-        expr: increase(fn_jobs{state="uncertain"}[1h]) > 0
+      - alert: FnPublishingStuck
+        expr: fn_jobs{state="publishing"} > 0
+        for: 30m
         labels: {severity: page, receiver: UNRESOLVED}
         annotations:
-          summary: "A publication could not be confirmed"
+          summary: "A job has been mid-publication for 30 minutes"
           description: >-
-            An uncertain job is terminal without intervention and deliberately
-            so: the document may already be with the consumer, so the system
-            will neither redeliver it nor declare it failed.
+            Publication commits its receipt and then reveals the document. A
+            job that stays in `publishing` has been interrupted between the
+            two and needs a redelivery to finish it.
+          action: >-
+            Check for a renamer that died mid-publication. Recovery completes
+            these on redelivery; one that persists needs looking at.
+
+      # --- work that needs a person ----------------------------------------
+      - alert: FnUncertainPublicationAppeared
+        # `increase` is for counters. fn_jobs is a GAUGE, so the earlier rule
+        # was not measuring what it claimed. `delta` is the gauge equivalent.
+        expr: delta(fn_jobs{state="uncertain"}[1h]) > 0
+        labels: {severity: page, receiver: UNRESOLVED}
+        annotations:
+          summary: "A new publication could not be confirmed"
+          description: >-
+            Uncertain is terminal without intervention, deliberately: the
+            document may already be with the consumer.
           action: >-
             Follow "Uncertain outcomes" in the operations document. The source
-            is preserved; resolve it by hand. Never bulk-resolve these.
+            is preserved. Never bulk-resolve these.
+
+      - alert: FnUncertainBacklogPersists
+        expr: fn_jobs{state="uncertain"} > 0
+        for: 24h
+        labels: {severity: ticket, receiver: UNRESOLVED}
+        annotations:
+          summary: "Unresolved uncertain publications are outstanding ({{ $value }})"
+          description: >-
+            EXPECTED TO FIRE until a person resolves them, and it stays firing
+            on purpose -- the delta rule above only catches new ones, so
+            without this a standing backlog is invisible.
+          action: "Resolve them one at a time, by hand."
 
       - alert: FnHeldWorkAccumulating
-        expr: increase(fn_jobs{state="held"}[6h]) > 20
+        expr: delta(fn_jobs{state="held"}[6h]) > 20
         labels: {severity: ticket, receiver: UNRESOLVED}
         annotations:
           summary: "Held jobs are accumulating"
           action: >-
             Group by failure_category. A rising single category usually means
-            one upstream cause (a permission change, a full disk, a producer
-            writing incomplete files).
+            one upstream cause.
 
       # --- capacity ---------------------------------------------------------
       #
       # THE APPLICATION EXPORTS NO FREE-SPACE METRIC. There is no
-      # fn_storage_free_bytes, and writing a rule against one would be an alert
-      # that never fires while looking like coverage. Capacity has to come from
-      # whatever already watches these filesystems at the node level; the rule
-      # below is the shape to add THERE, with the roles this deployment uses.
+      # fn_storage_free_bytes, and a rule against one would look like coverage
+      # while never firing. Capacity must come from whatever already watches
+      # these filesystems at the node level:
       #
       #   - alert: FnStorageNearlyFull
       #     expr: node_filesystem_avail_bytes{mountpoint=~"<incoming|staging|consume>"}
       #           / node_filesystem_size_bytes{...} < 0.10
       #
-      # The application's own contribution is that running out of space leaves
-      # a categorised hold and the document bytes accounted for, rather than a
-      # lost document -- which fn_jobs{state="held"} above will show.
-      #
-      # Storage capacity alerting is therefore UNRESOLVED in this package, and
-      # is listed as such in README, "What is still unresolved".
-
-      # A storage root that stops being usable is covered by
-      # FnStorageUnavailable above, which does use a metric that exists.
+      # Storage capacity alerting is therefore UNRESOLVED in this package.

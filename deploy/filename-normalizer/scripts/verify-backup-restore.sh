@@ -22,6 +22,12 @@ OUT="$EVIDENCE_DIR/backup-restore.txt"
 FAILURES=0
 CREATED_VOLUMES=""
 RESTORE_DB="fn_restore_check_$$"
+# Set only when THIS run created them. `docker volume create` succeeds on a
+# name that already exists and CREATE DATABASE fails on one that does -- in
+# both cases the harness would otherwise go on to write to, and then destroy,
+# something it did not make.
+OWNS_DB=0
+OWNED_VOLUMES=""
 report_begin backup-restore "$OUT" "$0"
 
 emit() { printf '%s\n' "$*" >> "$OUT"; }
@@ -34,17 +40,32 @@ psqlq() {
 
 restore_cleanup() {
     log "removing the throwaway restore target"
-    compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
-        postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d postgres \
-        -c "DROP DATABASE IF EXISTS $RESTORE_DB;" >/dev/null 2>&1 </dev/null || true
-    for _v in $CREATED_VOLUMES; do
+    # Only what this run owns. A database that already existed under this name
+    # belongs to somebody else, and dropping it would destroy their data to
+    # tidy up after a collision this run caused.
+    if [ "$OWNS_DB" = "1" ]; then
+        compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+            postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d postgres \
+            -c "DROP DATABASE IF EXISTS $RESTORE_DB;" >/dev/null 2>&1 </dev/null || true
+    fi
+    for _v in $OWNED_VOLUMES; do
         docker volume rm "$_v" >/dev/null 2>&1 || true
     done
     _left=0
-    for _v in $CREATED_VOLUMES; do
-        [ -z "$(docker volume ls -q --filter "name=^${_v}$" 2>/dev/null)" ] || _left=$((_left + 1))
+    for _v in $OWNED_VOLUMES; do
+        # An inspection that fails is not an absence. Anything but a definite
+        # "gone" counts as still there.
+        if docker volume inspect "$_v" >/dev/null 2>&1; then
+            _left=$((_left + 1))
+        elif ! docker volume ls -q >/dev/null 2>&1; then
+            _left=$((_left + 1))
+        fi
     done
-    _db_left="$(psqlq "SELECT count(*) FROM pg_database WHERE datname = '$RESTORE_DB';" postgres)"
+    if [ "$OWNS_DB" = "1" ]; then
+        _db_left="$(psqlq "SELECT count(*) FROM pg_database WHERE datname = '$RESTORE_DB';" postgres)"
+    else
+        _db_left=0
+    fi
     emit ""
     emit "restoration of this exercise's own resources:"
     emit "  throwaway volumes left:       ${_left}   (expected 0)"
@@ -53,6 +74,13 @@ restore_cleanup() {
     [ "${_db_left:-1}" = "0" ] || bad "this exercise left its throwaway database behind"
     if [ "$FAILURES" = "0" ]; then report_restored; fi
     report_keep
+    # The exit status was chosen before this ran. A failure discovered during
+    # cleanup has to change it, or the command reports success while saying in
+    # its own report that it did not restore what it borrowed.
+    if [ "$FAILURES" != "0" ]; then
+        echo "FAILED: $FAILURES expectation(s) not met (including cleanup); see $OUT" >&2
+        exit 1
+    fi
 }
 trap restore_cleanup EXIT
 
@@ -87,7 +115,14 @@ case "$LIVE_JOBS" in ''|*[!0-9]*) bad "could not read the live job count; nothin
 # ---------------------------------------------------------------------------
 log "2/4: dumping the database and the documents"
 BACKUP_VOL="fn-backup-$$"
-docker volume create "$BACKUP_VOL" >/dev/null 2>&1 && CREATED_VOLUMES="$CREATED_VOLUMES $BACKUP_VOL"
+if docker volume inspect "$BACKUP_VOL" >/dev/null 2>&1; then
+    bad "volume $BACKUP_VOL already exists; this run did not create it and will not use it"
+elif docker volume create "$BACKUP_VOL" >/dev/null 2>&1; then
+    CREATED_VOLUMES="$CREATED_VOLUMES $BACKUP_VOL"
+    OWNED_VOLUMES="$OWNED_VOLUMES $BACKUP_VOL"
+else
+    bad "could not create the backup volume"
+fi
 DUMP_OK=no
 compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
     pg_dump -U "${FN_DB_USER:-fn_app}" -d "${FN_DB_NAME:-filename_normalizer}" -Fc \
@@ -111,15 +146,28 @@ emit "   document archive written:     $TAR_OK   (${TAR_BYTES:-0} bytes)"
 # 3. Restore into a throwaway database and throwaway volume.
 # ---------------------------------------------------------------------------
 log "3/4: restoring into a throwaway target"
-compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
-    psql -U "${FN_DB_USER:-fn_app}" -d postgres -c "CREATE DATABASE $RESTORE_DB;" >/dev/null 2>&1 </dev/null
+if [ "$(psqlq "SELECT count(*) FROM pg_database WHERE datname = '$RESTORE_DB';" postgres)" != "0" ]; then
+    bad "database $RESTORE_DB already exists; this run did not create it and will not use it"
+elif compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
+    psql -U "${FN_DB_USER:-fn_app}" -d postgres -c "CREATE DATABASE $RESTORE_DB;" >/dev/null 2>&1 </dev/null; then
+    OWNS_DB=1
+else
+    bad "could not create the throwaway restore database"
+fi
 RESTORE_DB_OK=no
 compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
     pg_restore -U "${FN_DB_USER:-fn_app}" -d "$RESTORE_DB" --no-owner \
     < "$EVIDENCE_DIR/.fn-backup-$$.dump" >/dev/null 2>&1 && RESTORE_DB_OK=yes
 
 RESTORE_VOL="fn-restore-$$"
-docker volume create "$RESTORE_VOL" >/dev/null 2>&1 && CREATED_VOLUMES="$CREATED_VOLUMES $RESTORE_VOL"
+if docker volume inspect "$RESTORE_VOL" >/dev/null 2>&1; then
+    bad "volume $RESTORE_VOL already exists; this run did not create it and will not use it"
+elif docker volume create "$RESTORE_VOL" >/dev/null 2>&1; then
+    CREATED_VOLUMES="$CREATED_VOLUMES $RESTORE_VOL"
+    OWNED_VOLUMES="$OWNED_VOLUMES $RESTORE_VOL"
+else
+    bad "could not create the restore volume"
+fi
 RESTORE_FS_OK=no
 docker run --rm -v "$BACKUP_VOL:/backup:ro" -v "$RESTORE_VOL:/restored" \
     "$UTIL_IMAGE" sh -c 'tar -xf /backup/consume.tar -C /restored && echo ok' >/dev/null 2>&1 && RESTORE_FS_OK=yes
