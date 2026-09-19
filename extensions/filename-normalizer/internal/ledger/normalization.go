@@ -701,7 +701,7 @@ func (l *Ledger) CommitPublication(ctx context.Context, r Receipt) error {
 // MarkDelivered closes a job whose document is now visible under its reserved
 // name. The receipt already exists; this is the second half of a publication
 // whose first half was CommitPublication.
-func (l *Ledger) MarkDelivered(ctx context.Context, jobID string, attempt int) error {
+func (l *Ledger) MarkDelivered(ctx context.Context, jobID string, attempt int, reconciled bool) error {
 	return l.tx(ctx, func(tx pgx.Tx) error {
 		ct, err := tx.Exec(ctx, `
 			UPDATE jobs j
@@ -728,11 +728,81 @@ func (l *Ledger) MarkDelivered(ctx context.Context, jobID string, attempt int) e
 			}
 			return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
 		}
+		evt := jobs.EventDelivered
+		if reconciled {
+			evt = jobs.EventReconciled
+		}
 		return l.appendEvent(ctx, tx, eventInput{
 			JobID:     jobID,
-			EventType: jobs.EventDelivered,
+			EventType: evt,
 			ToState:   ptr(string(jobs.StateDelivered)),
 			Attempt:   ptr(attempt),
+		})
+	})
+}
+
+// WithdrawPublicationReceipt removes a receipt for a publication the kernel
+// DEFINITELY refused, and returns the job to an ordinary retry.
+//
+// # Why this exists, and why it is narrow
+//
+// The receipt is committed before the document is revealed, so that nothing
+// becomes visible for a job somebody has closed. The cost of that order is
+// this case: the reveal can be refused -- a read-only destination, no space,
+// a permission revoked between the check and the rename -- and the receipt is
+// already there, describing a delivery that provably did not happen.
+//
+// `renameat2` is atomic: a refusal means no directory entry was created. So
+// "this publication did not happen" is not an inference here, it is what the
+// kernel returned. Leaving the receipt would record a delivery that does not
+// exist, which is worse than any retry.
+//
+// It is deliberately narrow. It only applies while the job is still
+// `publishing`, only to a receipt this attempt's own inode identifies, and it
+// writes an event recording the withdrawal -- so the HISTORY of what happened
+// is retained even though the receipt is not. Nothing here can touch a
+// delivered job or a receipt that describes a real file.
+func (l *Ledger) WithdrawPublicationReceipt(ctx context.Context, jobID string, device, inode int64, attempt int) error {
+	return l.tx(ctx, func(tx pgx.Tx) error {
+		var state string
+		if err := tx.QueryRow(ctx,
+			`SELECT state FROM jobs WHERE job_id = $1 FOR UPDATE`, jobID).Scan(&state); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if state != string(jobs.StatePublishing) {
+			return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
+		}
+		ct, err := tx.Exec(ctx, `
+			DELETE FROM delivery_receipts
+			 WHERE job_id = $1
+			   AND published_device IS NOT DISTINCT FROM NULLIF($2::bigint, 0)
+			   AND published_inode  IS NOT DISTINCT FROM NULLIF($3::bigint, 0)`,
+			jobID, device, inode)
+		if err != nil {
+			return err
+		}
+		if ct.RowsAffected() == 0 {
+			return fmt.Errorf("%w: no receipt of this attempt's to withdraw", ErrNotFound)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE job_publication_inodes SET linked_at = NULL
+			 WHERE job_id = $1 AND device = $2 AND inode = $3`, jobID, device, inode); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE jobs SET state = 'processing', publish_claimed_by = NULL, updated_at = now()
+			 WHERE job_id = $1`, jobID); err != nil {
+			return err
+		}
+		return l.appendEvent(ctx, tx, eventInput{
+			JobID:     jobID,
+			EventType: jobs.EventPublishAbandoned,
+			ToState:   ptr(string(jobs.StateProcessing)),
+			Attempt:   ptr(attempt),
+			Detail:    map[string]any{"reason": "the destination refused the publication"},
 		})
 	})
 }

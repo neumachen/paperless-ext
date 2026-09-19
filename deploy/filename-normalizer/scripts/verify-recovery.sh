@@ -1614,7 +1614,15 @@ FINAL12="$(await_state "$DOC12" "delivered held uncertain" 240)"
 RECEIPTS12="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = (SELECT job_id FROM jobs WHERE source_name = '$DOC12');")"
 CAT12="$(psqlq "SELECT coalesce(failure_category,'-') FROM jobs WHERE source_name = '$DOC12';")"
 PRESENT12="$(in_storage "test -f '/srv/fn/consume/$NAME12' && echo yes || echo no")"
-STRANDED12="$(compose --profile fault logs renamer-fault 2>/dev/null | grep -c 'staged_link_left_behind' || true)"
+# The staged temporary BECOMES the published document now: publication is a
+# rename, not a link followed by an unlink of the temporary. There is no
+# post-publication cleanup step left, so the failure this used to count --
+# `staged_link_left_behind` -- cannot occur any more. What is checked instead
+# is the consequence: nothing of this job's is left staged, and the other
+# assertions below still hold the actual requirement, that a failure after a
+# successful publication does not unpublish it.
+JOB12="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC12';")"
+STRANDED12="$(in_storage "ls -a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-$JOB12\.' || true")"
 
 # Give the permissions back through the same helper the restore trap uses, so
 # there is one implementation of "put it back and check that it went back".
@@ -1624,7 +1632,7 @@ PERM_NOW12="$(in_storage "stat -c '%a:%u:%g' $PERM_ROOT 2>/dev/null || echo unkn
 emit "12. a real failure AFTER a successful link"
 emit "   the link happened:            $LINKED12   (expected yes: the document was really published)"
 emit "   write revoked while paused:   $REVOKED12   (expected yes: the post-link step must really fail)"
-emit "   cleanup reported its failure: $STRANDED12 line(s)   (expected >= 1)"
+emit "   this job's staged temporaries left: $STRANDED12   (expected 0: the rename consumed it)"
 emit "   final state:                  $FINAL12   (expected delivered: a post-link error does not unpublish)"
 emit "   category:                     $CAT12   (expected '-')"
 emit "   delivery receipts:            $RECEIPTS12   (expected 1)"
@@ -1636,7 +1644,7 @@ emit "   destination permissions back: $PERM_NOW12   (expected $PERM_BEFORE)"
 [ "$CAT12" = "-" ] || bad "a completed delivery acquired the failure category '$CAT12'"
 [ "${RECEIPTS12:-0}" = "1" ] || bad "$RECEIPTS12 receipts for a publication that succeeded"
 [ "$PRESENT12" = "yes" ] || bad "the published document is gone after a post-link failure"
-[ "${STRANDED12:-0}" -ge 1 ] || bad "the failed cleanup was not reported"
+[ "${STRANDED12:-1}" = "0" ] || bad "$STRANDED12 staged temporaries of this job were left in the destination"
 [ "$PERM_NOW12" = "$PERM_BEFORE" ] || bad "the destination permissions were not restored ($PERM_NOW12, was $PERM_BEFORE)"
 drop_fault renamer-fault
 compose start renamer-1 renamer-2 >/dev/null 2>&1 || true

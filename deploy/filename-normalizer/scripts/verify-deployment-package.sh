@@ -33,9 +33,11 @@ printf 'placeholder\n' > "$SCRATCH/amqp_password"
 cp "$DEPLOY_DIR/config/normalizer.json" "$SCRATCH/normalizer.json" 2>/dev/null \
     || printf '{}' > "$SCRATCH/normalizer.json"
 
-IMAGE_REF="${FN_IMAGE_UNDER_TEST:-filename-normalizer/renamer:0.1.0-foundation}"
+WATCHER_REF="${FN_WATCHER_IMAGE_UNDER_TEST:-filename-normalizer/watcher:0.1.0-foundation}"
+RENAMER_REF="${FN_RENAMER_IMAGE_UNDER_TEST:-filename-normalizer/renamer:0.1.0-foundation}"
 cat > "$SCRATCH/prod.env" <<ENV
-FN_IMAGE=$IMAGE_REF
+FN_WATCHER_IMAGE=$WATCHER_REF
+FN_RENAMER_IMAGE=$RENAMER_REF
 FN_DB_PRIMARY_HOST=postgres-primary
 FN_AMQP_HOST=rabbitmq
 FN_HOST_INCOMING=$SCRATCH/incoming
@@ -116,14 +118,17 @@ fi
 # 4. Every alert expression names a metric the applications actually export.
 # ---------------------------------------------------------------------------
 log "4/6: every alert names a metric that exists"
-EXPORTED="$(compose exec -T renamer-1 sh -c 'true' 2>/dev/null; \
-    compose exec -T rabbitmq sh -c "wget -q -T 3 -O - http://renamer-1:8080/metrics" 2>/dev/null \
-    | grep -oE '^fn_[a-z_]+' | sort -u)"
+# Scraped from a container on the stack network. The renamer image is
+# distroless, so the scrape runs somewhere that has a shell.
+EXPORTED="$(compose exec -T rabbitmq sh -c \
+    "wget -q -T 5 -O - http://renamer-1:8080/metrics" 2>/dev/null \
+    | grep -oE '^fn_[a-z_]+' | sort -u || true)"
 if [ -z "$EXPORTED" ]; then
     bad "could not read the live metric surface, so the alert rules were not checked"
 else
     _missing=""
-    for _m in $(grep -oE '\bfn_[a-z_]+' "$PROD/alerts.prometheus.yml" | sort -u); do
+    for _m in $(grep -E '^\s+expr:' "$PROD/alerts.prometheus.yml" \
+                  | grep -oE '\bfn_[a-z_]+' | sort -u); do
         printf '%s\n' "$EXPORTED" | grep -qx "$_m" || _missing="$_missing $_m"
     done
     emit "alert metrics that do not exist: ${_missing:-none}"
@@ -135,20 +140,40 @@ fi
 # ---------------------------------------------------------------------------
 log "5/6: the runbook's commands exist"
 _badcmd=""
-for _sub in check-config probe version; do
-    docker run --rm --entrypoint /usr/local/bin/watcher "$IMAGE_REF" "$_sub" --help >/dev/null 2>&1 \
-        || docker run --rm --entrypoint /usr/local/bin/watcher "$IMAGE_REF" "$_sub" >/dev/null 2>&1 \
-        || _badcmd="$_badcmd watcher:$_sub"
+# Each image carries its own entrypoint binary, so the subcommand goes to the
+# image's own entrypoint rather than to a program selected by name.
+for _sub in version; do
+    docker run --rm "$WATCHER_REF" "$_sub" >/dev/null 2>&1 || _badcmd="$_badcmd fn-watcher:$_sub"
+    docker run --rm "$RENAMER_REF" "$_sub" >/dev/null 2>&1 || _badcmd="$_badcmd fn-renamer:$_sub"
 done
+# check-config needs enough environment to load a configuration at all; it is
+# the command the runbook's first-start step uses, so it is run as written.
+docker run --rm -e FN_STORAGE_REQUIRED=false -e FN_DB_APPLY_MIGRATIONS=false \
+    -e FN_DB_PRIMARY_HOST=unused -e FN_AMQP_HOST=unused \
+    -e FN_DB_NAME=unused -e FN_DB_USER=unused -e FN_AMQP_USER=unused \
+    -e FN_DB_PASSWORD_FILE=/run/secrets/db -e FN_AMQP_PASSWORD_FILE=/run/secrets/amqp \
+    -e FN_CONFIG_FILE=/etc/fn/normalizer.json \
+    -v "$SCRATCH/db_password:/run/secrets/db:ro" \
+    -v "$SCRATCH/amqp_password:/run/secrets/amqp:ro" \
+    -v "$DEPLOY_DIR/config/normalizer.json:/etc/fn/normalizer.json:ro" \
+    "$WATCHER_REF" check-config >/dev/null 2>&1 || _badcmd="$_badcmd fn-watcher:check-config"
 emit "runbook subcommands that do not exist: ${_badcmd:-none}"
-[ -z "$_badcmd" ] || bad "the runbook names subcommands the image does not have:$_badcmd"
+[ -z "$_badcmd" ] || bad "the runbook names subcommands the images do not have:$_badcmd"
 
 # A command the runbook does NOT claim, asserted absent so the claim stays true.
-if docker run --rm --entrypoint /usr/local/bin/watcher "$IMAGE_REF" migrate >/dev/null 2>&1; then
+if docker run --rm "$WATCHER_REF" migrate >/dev/null 2>&1; then
     bad "a 'migrate' subcommand exists; the runbook says it does not"
 else
     emit "no 'migrate' subcommand:         confirmed   (the runbook says so)"
 fi
+
+# The healthcheck binaries the manifest names must be the ones that exist.
+for _probe in "fn-watcher $WATCHER_REF" "fn-renamer $RENAMER_REF"; do
+    set -- $_probe
+    if ! docker run --rm --entrypoint /usr/local/bin/"$1" "$2" version >/dev/null 2>&1; then
+        bad "the manifest's healthcheck names /usr/local/bin/$1, which $2 does not have"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # 6. The configuration the package ships validates.
@@ -156,9 +181,13 @@ fi
 log "6/6: the shipped configuration validates"
 if docker run --rm -e FN_STORAGE_REQUIRED=false -e FN_DB_APPLY_MIGRATIONS=false \
     -e FN_DB_PRIMARY_HOST=unused -e FN_AMQP_HOST=unused \
+    -e FN_DB_NAME=unused -e FN_DB_USER=unused -e FN_AMQP_USER=unused \
+    -e FN_DB_PASSWORD_FILE=/run/secrets/db -e FN_AMQP_PASSWORD_FILE=/run/secrets/amqp \
     -e FN_CONFIG_FILE=/etc/fn/normalizer.json \
+    -v "$SCRATCH/db_password:/run/secrets/db:ro" \
+    -v "$SCRATCH/amqp_password:/run/secrets/amqp:ro" \
     -v "$DEPLOY_DIR/config/normalizer.json:/etc/fn/normalizer.json:ro" \
-    --entrypoint /usr/local/bin/watcher "$IMAGE_REF" check-config >/dev/null 2>&1; then
+    "$WATCHER_REF" check-config >/dev/null 2>&1; then
     emit "shipped configuration validates: yes"
 else
     emit "shipped configuration validates: NO"

@@ -63,8 +63,9 @@ x-app-hardening: &app-hardening
   # "Access boundary".
   networks: [fn]
 
-x-app-image: &app-image
-  image: ${FN_IMAGE:?set FN_IMAGE to a digest-pinned image reference}
+# Two images, not one. Each carries its own entrypoint binary -- fn-watcher and
+# fn-renamer -- so there is no single image with a subcommand to select. An
+# earlier draft of this file assumed there was, and would not have started.
 
 x-storage: &storage
   - type: bind
@@ -103,8 +104,8 @@ services:
   # Two watchers would both discover the same submissions.
   # ---------------------------------------------------------------------
   watcher:
-    <<: [*app-hardening, *app-image]
-    command: ["watcher"]
+    <<: *app-hardening
+    image: ${FN_WATCHER_IMAGE:?set FN_WATCHER_IMAGE to a digest-pinned reference}
     environment:
       <<: *app-env
       FN_INSTANCE: watcher-1
@@ -113,7 +114,7 @@ services:
     ports:
       - "127.0.0.1:${FN_WATCHER_HEALTH_PORT:-8080}:8080"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/watcher", "probe", "--once", "http://127.0.0.1:8080"]
+      test: ["CMD", "/usr/local/bin/fn-watcher", "probe", "--once", "http://127.0.0.1:8080"]
       interval: 15s
       timeout: 5s
       retries: 4
@@ -124,8 +125,8 @@ services:
   # concurrent progress, and the ceiling is the storage, not this file.
   # ---------------------------------------------------------------------
   renamer-1: &renamer
-    <<: [*app-hardening, *app-image]
-    command: ["renamer"]
+    <<: *app-hardening
+    image: ${FN_RENAMER_IMAGE:?set FN_RENAMER_IMAGE to a digest-pinned reference}
     environment:
       <<: *app-env
       FN_INSTANCE: renamer-1
@@ -136,7 +137,7 @@ services:
     ports:
       - "127.0.0.1:${FN_RENAMER1_HEALTH_PORT:-8081}:8080"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/renamer", "probe", "--once", "http://127.0.0.1:8080"]
+      test: ["CMD", "/usr/local/bin/fn-renamer", "probe", "--once", "http://127.0.0.1:8080"]
       interval: 15s
       timeout: 5s
       retries: 4
