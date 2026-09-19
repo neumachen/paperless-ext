@@ -212,12 +212,26 @@ while [ "$_i" -lt 240 ]; do
         VISIBLE_BEFORE_RECEIPT=$((VISIBLE_BEFORE_RECEIPT + 1))
     fi
     CLOSED="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB';")"
-    case "$CLOSED" in uncertain|held|delivered) break ;; esac
+    # The job reaching a terminal state is NOT the end of the window. The held
+    # publisher is still paused at that point and has not yet tried to reveal;
+    # the interval this exercise is about runs until IT has resumed and been
+    # refused. Stopping at closure sampled only the first half and claimed the
+    # whole.
+    case "$CLOSED" in
+        uncertain|held|delivered)
+            if compose --profile fault logs renamer-hold 2>/dev/null | grep -q "$JOB"; then
+                if compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" \
+                    | grep -qE 'publication_superseded|document_published|delivery_settled'; then
+                    break
+                fi
+            fi
+            ;;
+    esac
     sleep 2; _i=$((_i + 2))
 done
 SIBLING_ACTED="$(compose --profile fault logs renamer-taker 2>/dev/null | grep -c "$JOB" || true)"
 
-emit "   consume-directory samples while it resolved: $SAMPLES"
+emit "   consume-directory samples, until the held publisher resumed: $SAMPLES"
 emit "   reserved name visible while no receipt existed: $VISIBLE_BEFORE_RECEIPT   (expected 0)"
 [ "${VISIBLE_BEFORE_RECEIPT:-1}" = "0" ] || bad "the reserved name was visible to the consumer in $VISIBLE_BEFORE_RECEIPT sample(s) taken while this job had no receipt"
 
