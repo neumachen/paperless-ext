@@ -233,6 +233,11 @@ test-harness-ownership: ## Prove the ownership harness itself preserves pre-exis
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-harness-ownership.sh
 
+.PHONY: verify-backup-restore
+verify-backup-restore: ## Back up and restore into disposable copies; the live system is only read
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-backup-restore.sh
+
 .PHONY: verify-deployment-package
 verify-deployment-package: ## Check the production/ package against the real image and stack
 	@mkdir -p $(EVIDENCE)

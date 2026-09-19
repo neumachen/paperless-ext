@@ -532,7 +532,18 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		return out, true
 	}
 	linked := false
+	// Set when this attempt does not know whether its receipt committed. The
+	// staged file must then survive: if the receipt DID commit, it is the only
+	// copy of an authorised publication, and recovery finds it by name and
+	// finishes the reveal. Removing it would leave a receipt describing a
+	// document that no longer exists.
+	keepStaged := false
 	defer func() {
+		if keepStaged {
+			log.Warn("leaving this attempt's staged document in place; its publication may be recorded",
+				slog.String("event", "staged_document_retained"))
+			return
+		}
 		if err := dir.RemoveIfOurs(filepath.Base(tmp), staged); err != nil {
 			log.Warn("could not remove the staged link",
 				slog.String("event", "staged_link_left_behind"),
@@ -757,11 +768,21 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		}
 		return settled("delivered", jobs.StateDelivered, ""), true
 	case cerr2 != nil:
-		// Including an unknown commit outcome. Do NOT reveal: if the receipt
-		// did commit, a later attempt finds it and finishes the publication;
-		// if it did not, the document is still hidden and nothing is lost.
-		log.Error("could not commit the publication; the document stays invisible",
-			slog.String("event", "publication_not_committed"),
+		// An error here does not say whether the transaction committed. A
+		// connection lost at COMMIT is indistinguishable from one lost before
+		// it, and no amount of ordering fixes that -- so this attempt must
+		// leave the system in a state that survives either answer.
+		//
+		// It does not reveal, so nothing becomes visible for a publication
+		// that may not be recorded. And it does not remove the staged file,
+		// because if the receipt did commit that file is the only copy of an
+		// authorised publication; recovery finds it by name and finishes it.
+		// The cost is a dotfile that may be redundant, which the next attempt
+		// resolves. The alternative is a receipt describing a document nobody
+		// has.
+		keepStaged = true
+		log.Error("could not confirm the publication was committed; the document stays invisible and is kept",
+			slog.String("event", "publication_not_confirmed"),
 			slog.String("dependency", "postgres_primary"))
 		return unsettled(cerr2), true
 	}
