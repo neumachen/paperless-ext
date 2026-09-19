@@ -209,9 +209,40 @@ restore() {
         compose --profile consumer rm -f -v "$_r" >/dev/null 2>&1 || true
     done
     # The consumer's own state volumes go too -- but only the ones this
-    # invocation created. Leaving its own behind would make a later run start
-    # against a half-ingested library; removing somebody else's would destroy a
-    # Paperless instance this exercise explicitly refused to touch.
+    # invocation created, and only when nothing belonging to other work is
+    # inside them.
+    #
+    # The ignore list is a snapshot taken before the consumer starts, so a
+    # document delivered by other work AFTER it cannot be in that list and is
+    # eligible for ingestion. Destroying the media volume then destroys the only
+    # remaining copy of somebody else's document: the consumer removed it from
+    # the directory and this exercise would remove it from the library. So the
+    # last check before the irreversible step is whether that happened, and if
+    # it did the volumes stay, named, for a person to recover from.
+    _r_foreign="$(psqlq "SELECT count(*) FROM delivery_receipts r JOIN jobs j USING (job_id)
+                          WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';" 2>/dev/null)"
+    _r_foreign_gone=0
+    if [ "${_r_foreign:-0}" -gt 0 ]; then
+        for _n in $(psqlq "SELECT r.delivered_name FROM delivery_receipts r JOIN jobs j USING (job_id)
+                            WHERE r.delivered_at >= '$T0' AND j.source_name NOT LIKE 'consumer-%';" 2>/dev/null); do
+            if [ "$(in_storage "test -e '/srv/fn/consume/$_n' && echo yes || echo no")" = "no" ]; then
+                _r_foreign_gone=$((_r_foreign_gone + 1))
+            fi
+        done
+    fi
+    if [ "${_r_foreign_gone:-0}" -gt 0 ]; then
+        echo "error: $_r_foreign_gone document(s) belonging to other work were consumed by this" >&2
+        echo "       exercise's Paperless instance. Its volumes are NOT being removed:" >&2
+        for _v in $CREATED_VOLUMES; do echo "         ${PROJECT}_$_v" >&2; done
+        {
+            printf '  volumes KEPT: %s document(s) belonging to other work were consumed
+' "$_r_foreign_gone"
+            printf '  the copies are inside:%s
+' "$CREATED_VOLUMES"
+        } >> "$OUT"
+        CREATED_VOLUMES=""
+        _r_ok=0
+    fi
     for _v in $CREATED_VOLUMES; do
         docker volume rm "${PROJECT}_$_v" >/dev/null 2>&1 || true
         if [ -n "$(docker volume ls -q --filter "name=^${PROJECT}_${_v}$" 2>/dev/null)" ]; then
@@ -574,8 +605,14 @@ emit "documents other work delivered while this ran:     ${ARRIVED:-0}, of which
 # were eligible for ingestion into a media store this exercise destroys.
 if [ "${ARRIVED:-0}" -gt 0 ]; then
     emit "   NOTE: those ${ARRIVED} arrived after the ignore list was taken, so the"
-    emit "   list could not protect them. None was consumed in this run; the"
-    emit "   protection is the check above, not the list."
+    emit "   list could not protect them. What protects them is the check above and"
+    emit "   the refusal to destroy this consumer's volumes when any of them was"
+    emit "   ingested -- not the list."
+else
+    emit "   This run observed NO unrelated arrivals, so it establishes the handoff"
+    emit "   and NOT isolation under new arrivals: an arrival after the snapshot is"
+    emit "   eligible for ingestion, and what this exercise guarantees is that its"
+    emit "   media is then preserved rather than destroyed."
 fi
 emit ""
 

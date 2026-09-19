@@ -228,6 +228,11 @@ test-harness-ownership: ## Prove the ownership harness itself preserves pre-exis
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-harness-ownership.sh
 
+.PHONY: inventory
+inventory: ## Write a retained inventory of durable and filesystem state
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/collect-inventory.sh
+
 .PHONY: evidence
 evidence: ## Collect logs, readiness and metrics snapshots into .evidence/
 	@mkdir -p $(EVIDENCE)
