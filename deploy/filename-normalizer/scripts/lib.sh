@@ -566,20 +566,18 @@ report_begin() {
     _rb_digest="$(cksum_sha256 "$_rb_script")"
     _rb_app="$(running_application_identity)"
     {
-        printf 'exercise:        %s
-' "$REPORT_NAME"
-        printf 'script:          %s
-' "$(basename "$_rb_script")"
-        printf 'script sha256:   %s
-' "$_rb_digest"
-        printf 'application:     %s
-' "$_rb_app"
-        printf 'started:         %s
-' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        printf 'run report:      %s
-' "$REPORT_RUN"
-        printf -- '--------------------------------------------------------------
-'
+        printf 'exercise:        %s\n' "$REPORT_NAME"
+        printf 'started:         %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'run report:      %s\n' "$REPORT_RUN"
+        printf -- '-- provenance: two independent facts -------------------------\n'
+        printf 'exercise script: %s\n' "$(basename "$_rb_script")"
+        printf '  sha256:        %s\n' "$_rb_digest"
+        printf 'application under test, asked of the running process:\n'
+        printf '  %s\n' "$_rb_app"
+        printf 'An exercise may be corrected without the application changing,\n'
+        printf 'and the application may be rebuilt without the exercise changing.\n'
+        printf 'Neither digest implies the other.\n'
+        printf -- '--------------------------------------------------------------\n'
     } > "$REPORT_OUT"
 }
 
