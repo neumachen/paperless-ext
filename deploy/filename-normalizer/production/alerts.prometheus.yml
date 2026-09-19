@@ -1,0 +1,131 @@
+# File Normalizer — alert rules.
+#
+# RECEIVERS ARE UNRESOLVED. No notification target has been supplied, so every
+# rule below routes nowhere until an operator sets one. They are written
+# against metrics the applications already export; nothing here needs new
+# instrumentation.
+#
+# Each rule states the operator action, because an alert nobody knows what to
+# do with is noise. Severities: `page` means a document pipeline is stopped or
+# a document needs a person; `ticket` means attention within a working day.
+groups:
+  - name: filename-normalizer
+    rules:
+      # --- the pipeline is not running -------------------------------------
+      - alert: FnWatcherAbsent
+        expr: absent(fn_build_info{application="watcher"}) == 1
+        for: 5m
+        labels: {severity: page, receiver: UNRESOLVED}
+        annotations:
+          summary: "No watcher is reporting"
+          description: >-
+            Nothing is discovering submissions. Documents dropped into incoming
+            are not being registered; they are not lost, they are simply not
+            moving.
+          action: >-
+            Check the watcher container. Exactly one must run. Start it, then
+            confirm fn_build_info reappears and the oldest pending age falls.
+
+      - alert: FnRenamerNotConsuming
+        expr: fn_consumer_up == 0
+        for: 5m
+        labels: {severity: page, receiver: UNRESOLVED}
+        annotations:
+          summary: "A renamer is up but not consuming from the broker"
+          description: >-
+            The process is alive and its readiness may be green, but it holds
+            no consumer on the work queue, so it will never take a job.
+          action: >-
+            Check broker connectivity and credentials for that instance. A
+            restart re-attaches the consumer.
+
+      - alert: FnDependencyDown
+        expr: fn_dependency_up == 0
+        for: 3m
+        labels: {severity: page, receiver: UNRESOLVED}
+        annotations:
+          summary: "A required dependency is unavailable ({{ $labels.dependency }})"
+          action: >-
+            Restore the dependency. The applications hold work rather than
+            inventing outcomes, so nothing is lost while it is down.
+
+      - alert: FnStorageUnavailable
+        expr: fn_storage_root_available == 0
+        for: 2m
+        labels: {severity: page, receiver: UNRESOLVED}
+        annotations:
+          summary: "A storage root is unavailable ({{ $labels.role }})"
+          description: >-
+            Unavailable storage is never treated as an empty directory. The
+            applications refuse to proceed rather than conclude that documents
+            have vanished.
+          action: >-
+            Check the mount. If a share is disconnected, remount it before
+            restarting anything.
+
+      # --- work is arriving but not moving ---------------------------------
+      - alert: FnBacklogStalled
+        expr: fn_oldest_pending_dispatch_age_seconds > 1800
+        for: 10m
+        labels: {severity: page, receiver: UNRESOLVED}
+        annotations:
+          summary: "The oldest pending submission is over 30 minutes old"
+          action: >-
+            Check that at least one renamer is consuming and that the broker
+            queue is draining. This fires when the pipeline is up but stuck.
+
+      - alert: FnQueueGrowing
+        expr: fn_jobs{state="pending"} > 500
+        for: 30m
+        labels: {severity: ticket, receiver: UNRESOLVED}
+        annotations:
+          summary: "Pending work is accumulating"
+          action: >-
+            Capacity. Add a renamer instance or raise concurrency, and check
+            that intake is not exceeding what the storage can absorb.
+
+      # --- work that needs a person ----------------------------------------
+      - alert: FnUncertainPublication
+        expr: increase(fn_jobs{state="uncertain"}[1h]) > 0
+        labels: {severity: page, receiver: UNRESOLVED}
+        annotations:
+          summary: "A publication could not be confirmed"
+          description: >-
+            An uncertain job is terminal without intervention and deliberately
+            so: the document may already be with the consumer, so the system
+            will neither redeliver it nor declare it failed.
+          action: >-
+            Follow "Uncertain outcomes" in the operations document. The source
+            is preserved; resolve it by hand. Never bulk-resolve these.
+
+      - alert: FnHeldWorkAccumulating
+        expr: increase(fn_jobs{state="held"}[6h]) > 20
+        labels: {severity: ticket, receiver: UNRESOLVED}
+        annotations:
+          summary: "Held jobs are accumulating"
+          action: >-
+            Group by failure_category. A rising single category usually means
+            one upstream cause (a permission change, a full disk, a producer
+            writing incomplete files).
+
+      # --- capacity ---------------------------------------------------------
+      #
+      # THE APPLICATION EXPORTS NO FREE-SPACE METRIC. There is no
+      # fn_storage_free_bytes, and writing a rule against one would be an alert
+      # that never fires while looking like coverage. Capacity has to come from
+      # whatever already watches these filesystems at the node level; the rule
+      # below is the shape to add THERE, with the roles this deployment uses.
+      #
+      #   - alert: FnStorageNearlyFull
+      #     expr: node_filesystem_avail_bytes{mountpoint=~"<incoming|staging|consume>"}
+      #           / node_filesystem_size_bytes{...} < 0.10
+      #
+      # The application's own contribution is that running out of space leaves
+      # a categorised hold and the document bytes accounted for, rather than a
+      # lost document -- which fn_jobs{state="held"} above will show.
+      #
+      # Storage capacity alerting is therefore UNRESOLVED in this package, and
+      # is listed as such in README, "What is still unresolved".
+
+      # A storage root that stops being usable is covered by
+      # FnStorageUnavailable above, which does use a metric that exists.

@@ -382,9 +382,19 @@ emit "FN-N010 — interruption, stale worker, filesystem boundaries, write failu
 emit ""
 
 # ---------------------------------------------------------------------------
-# 1. A6: a real interruption between the link and the receipt.
+# 1. A6: a real interruption between the RECEIPT and the REVEAL.
+#
+# This scenario used to interrupt between the link and the receipt, because
+# that was the order: the document became visible first and was recorded
+# afterwards. That order is gone -- it is what let a closed job's document
+# reach the consumer -- so the state it produced no longer exists.
+#
+# The equivalent interruption in the current order is the interesting one: the
+# receipt is committed while the document is still an invisible dotfile, and
+# the process dies before revealing it. The publication is authorised, present,
+# and invisible. Recovery must finish it rather than republish or lose it.
 # ---------------------------------------------------------------------------
-log "1/12: A6 — interrupting a renamer between the destination link and the receipt"
+log "1/12: A6 — interrupting a renamer between the receipt and the reveal"
 stop_ordinary
 DOC1="a6-after-link-$STAMP.pdf"
 NAME1="a6-after-link-$LOWER.pdf"
@@ -409,15 +419,20 @@ PUBLISHED1="$(in_storage "test -f '/srv/fn/consume/$NAME1' && echo yes || echo n
 RECEIPTS1="$(psqlq "SELECT count(*) FROM delivery_receipts r JOIN jobs j USING (job_id) WHERE j.source_name = '$DOC1';")"
 CLAIM1="$(psqlq "SELECT coalesce(publish_claimed_by,'-') FROM jobs WHERE source_name = '$DOC1';")"
 
-emit "1. A6 — interruption AFTER the link, BEFORE the receipt"
+JOB1="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC1';")"
+STAGED1="$(in_storage "ls -a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-$JOB1\.' || true")"
+
+emit "1. A6 — interruption AFTER the receipt, BEFORE the reveal"
 emit "   renamer exit code:            $EXIT1   (90 = injected stop)"
 emit "   job state after the crash:    $STATE1   (expected publishing)"
 emit "   publication claimed by:       $CLAIM1   (the dead attempt still holds it)"
-emit "   destination present:          $PUBLISHED1"
-emit "   delivery receipts:            $RECEIPTS1   (expected 0)"
+emit "   destination VISIBLE:          $PUBLISHED1   (expected no: committed, not yet revealed)"
+emit "   this job's staged dotfile:    $STAGED1   (expected 1: present and invisible)"
+emit "   delivery receipts:            $RECEIPTS1   (expected 1: the receipt precedes the reveal)"
 [ "$STATE1" = "publishing" ] || bad "the interrupted job is in state '$STATE1', not publishing"
-[ "$PUBLISHED1" = "yes" ] || bad "the document was not linked into place before the crash"
-[ "$RECEIPTS1" = "0" ] || bad "a receipt exists even though the crash preceded it"
+[ "$PUBLISHED1" = "no" ] || bad "the document was visible to the consumer before its publication was revealed"
+[ "${STAGED1:-0}" = "1" ] || bad "the staged document is not present, so this is not the interruption under test"
+[ "$RECEIPTS1" = "1" ] || bad "no receipt exists, so the crash did not land between the receipt and the reveal"
 
 # Recovery: an ordinary renamer must reconcile it without republishing.
 drop_fault renamer-fault
@@ -427,9 +442,12 @@ RECOVERED1="$(await_state "$DOC1" "delivered held uncertain" 180)"
 COUNT1="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | grep -c '^a6-after-link-$LOWER' || true")"
 RECON1="$(psqlq "SELECT count(*) FROM job_events e JOIN jobs j USING (job_id) WHERE j.source_name = '$DOC1' AND e.event_type = 'reconciled';")"
 
+STAGED1_AFTER="$(in_storage "ls -a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-$JOB1\.' || true")"
 emit "   after recovery:               $RECOVERED1   (expected delivered)"
 emit "   reconciled events:            $RECON1   (expected 1: not republished)"
 emit "   documents with that name:     $COUNT1   (expected 1)"
+emit "   staged dotfiles left:         $STAGED1_AFTER   (expected 0: the reveal consumed it)"
+[ "${STAGED1_AFTER:-1}" = "0" ] || bad "the staged dotfile is still there; the reveal was not completed"
 [ "$RECOVERED1" = "delivered" ] || bad "recovery left the job in '$RECOVERED1'"
 [ "$RECON1" = "1" ] || bad "the recovery did not record a reconciliation"
 [ "$COUNT1" = "1" ] || bad "$COUNT1 documents exist for one job after recovery"

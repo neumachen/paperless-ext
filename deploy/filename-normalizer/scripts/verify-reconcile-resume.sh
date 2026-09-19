@@ -143,26 +143,38 @@ compose run --rm --no-deps -T --entrypoint sh storage-init -c \
      mv /srv/fn/incoming/.wip-rr '/srv/fn/incoming/$DOC'" >/dev/null 2>&1
 emit "submitted: $DOC"
 
-# Wait for the link itself.
+# Wait for A to reach the state this exercise is about: its receipt committed
+# and its document staged but NOT yet revealed.
+#
+# Waiting for the visible file was right when publication linked first and
+# recorded afterwards. It is wrong now: the file only appears once A has
+# finished, so the wait ran past the pause and measured an ordinary delivery.
+JOB=""
 _i=0
 LINKED=no
-while [ "$_i" -lt 120 ]; do
-    if [ "$(in_storage "test -f '/srv/fn/consume/$NAME' && echo yes || echo no")" = "yes" ]; then
-        LINKED=yes
-        break
+STAGED_A=0
+while [ "$_i" -lt 150 ]; do
+    [ -n "$JOB" ] || JOB="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC';")"
+    if [ -n "$JOB" ]; then
+        if [ "$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB';")" = "1" ] \
+           && [ "$(in_storage "ls -a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-$JOB\.' || true")" != "0" ]; then
+            STAGED_A=1
+            break
+        fi
     fi
     sleep 2; _i=$((_i + 2))
 done
-JOB="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC';")"
-INODE_A="$(in_storage "ls -i '/srv/fn/consume/$NAME' 2>/dev/null | awk '{print \$1}'")"
+LINKED="$(probe_exists "/srv/fn/consume/$NAME")"
+STAGED_NAME="$(in_storage "ls -a /srv/fn/consume 2>/dev/null | grep '^\.fn-$JOB\.' | head -1")"
+INODE_A="$(in_storage "ls -i '/srv/fn/consume/$STAGED_NAME' 2>/dev/null | awk '{print \$1}'")"
 RECEIPTS_BEFORE="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB';")"
+[ "$STAGED_A" = "1" ] || bad "A never reached the committed-but-unrevealed state this exercise is about"
 
-emit "1. attempt A linked its document and paused"
-emit "   linked:                       $LINKED   (expected yes)"
+emit "1. attempt A committed its receipt and paused before revealing"
+emit "   destination visible:          $LINKED   (expected no: committed, not revealed)"
 emit "   inode at the destination:     ${INODE_A:-none}"
-emit "   receipts so far:              $RECEIPTS_BEFORE   (expected 0: A paused before recording)"
-[ "$LINKED" = "yes" ] || bad "A never linked; the sequence cannot be exercised"
-[ "${RECEIPTS_BEFORE:-1}" = "0" ] || bad "a receipt already exists; A did not pause where this exercise needs it"
+emit "   receipts so far:              $RECEIPTS_BEFORE   (expected 1: the receipt precedes the reveal)"
+[ "${RECEIPTS_BEFORE:-0}" = "1" ] || bad "no receipt exists; A did not pause where this exercise needs it"
 
 # The claim expires (10s), then a sibling delivery arrives for the same job.
 sleep 12
@@ -211,7 +223,7 @@ while [ "$_i" -lt 150 ]; do
     sleep 3; _i=$((_i + 3))
 done
 sleep 6
-KEPT="$(compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | grep -c 'publication_reconciled_by_sibling\|publication_superseded' || true)"
+KEPT="$(compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | grep -c 'publication_reconciled_by_sibling\|publication_superseded\|publication_completed_elsewhere' || true)"
 {
     printf '\n--- what A logged for %s ---\n' "$JOB"
     compose --profile fault logs renamer-hold 2>/dev/null | grep "$JOB" | tail -12
