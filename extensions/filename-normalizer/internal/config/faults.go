@@ -62,6 +62,19 @@ const (
 	// only way to "demonstrate" the case would be to simulate the consumer --
 	// which proves nothing about what a consumer actually does.
 	FaultHoldAfterLink FaultPoint = "hold_after_link"
+	// FaultHoldBeforeCommit PAUSES after this attempt has verified its staged
+	// document and passed its authority check, and BEFORE the receipt is
+	// committed -- which is the interval in which the job can be closed under
+	// it.
+	//
+	// This is the window that used to expose a document. Publication was a
+	// link followed by a receipt, so an attempt delayed here had already put a
+	// consumable file at the destination and could only withdraw it afterwards.
+	// The order is inverted now: the document is still an invisible dotfile
+	// while this pause runs, the commit that follows is refused, and nothing
+	// ever becomes visible. The fault point stays because the claim needs
+	// demonstrating against a real consumer, not asserting.
+	FaultHoldBeforeCommit FaultPoint = "hold_before_commit"
 )
 
 // FaultPoints is the set a process will act on.
@@ -80,7 +93,8 @@ func LoadFaultPoints() (FaultPoints, []string) {
 		switch name {
 		case "":
 			continue
-		case FaultBeforeLink, FaultAfterLink, FaultAfterReceipt, FaultHoldAfterClaim, FaultHoldAfterLink:
+		case FaultBeforeLink, FaultAfterLink, FaultAfterReceipt, FaultHoldAfterClaim,
+			FaultHoldAfterLink, FaultHoldBeforeCommit:
 			out[name] = true
 			names = append(names, string(name))
 		default:

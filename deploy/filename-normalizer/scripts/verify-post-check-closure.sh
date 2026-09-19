@@ -112,19 +112,25 @@ for _pf in renamer-hold renamer-taker; do
 done
 
 report_begin "post-check-closure" "$OUT" "$0"
-emit "A job closed after an attempt's last authority check is not reopened"
+emit "A job closed after an attempt's last authority check is not reopened,"
+emit "and that attempt never makes a document visible to the consumer"
 emit ""
 
 DOC="post-check-$STAMP.pdf"
 NAME="post-check-$LOWER.pdf"
 
-log "1/1: the attempt links, is delayed, and the job is closed underneath it"
+log "1/1: the attempt is delayed before committing, and the job is closed underneath it"
 MUTATED=1
 compose stop renamer-1 renamer-2 >/dev/null 2>&1
 
-# Paused AFTER the link and BEFORE the receipt: past every authority check it
-# makes. Prefetch 1 so it cannot also hold the sibling's delivery.
-start_fault renamer-hold FN_FAULT_POINTS=hold_after_link FN_FAULT_HOLD=75s \
+# Paused past every authority check this attempt makes and BEFORE the receipt
+# is committed. That is the interval in which the job can be closed under it,
+# and it is where a document used to be exposed: publication was a link
+# followed by a receipt, so an attempt delayed here had already put a
+# consumable file at the destination.
+#
+# Prefetch 1 so it cannot also hold the sibling's delivery.
+start_fault renamer-hold FN_FAULT_POINTS=hold_before_commit FN_FAULT_HOLD=75s \
     FN_PUBLISH_TAKEOVER_AFTER=10s FN_RENAMER_PREFETCH=1 || exit 1
 sleep 6
 compose run --rm --no-deps -T --entrypoint sh storage-init -c \
@@ -132,32 +138,38 @@ compose run --rm --no-deps -T --entrypoint sh storage-init -c \
      mv /srv/fn/incoming/.wip-pc '/srv/fn/incoming/$DOC'" >/dev/null 2>&1
 emit "submitted: $DOC"
 
+# Step 1: get the attempt to the interval under test, and confirm it is there.
+#
+# "There" means: staged into the destination directory, and holding before it
+# commits. The staged file is a dotfile, so it is the evidence that the attempt
+# really did put this job's bytes next to the consumer without the consumer
+# being able to see them. `ls` without -a does not list dotfiles, which is why
+# an earlier version of this check counted zero every time.
+JOB=""
 _i=0
-LINKED=no
-while [ "$_i" -lt 120 ]; do
-    if [ "$(in_storage "test -f '/srv/fn/consume/$NAME' && echo yes || echo no")" = "yes" ]; then
-        LINKED=yes
+STAGED_SEEN=0
+while [ "$_i" -lt 150 ]; do
+    [ -n "$JOB" ] || JOB="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC';")"
+    if [ -n "$JOB" ] && [ "$(in_storage "ls -a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-$JOB\.' || true")" != "0" ]; then
+        STAGED_SEEN=1
         break
     fi
     sleep 2; _i=$((_i + 2))
 done
-JOB="$(psqlq "SELECT job_id FROM jobs WHERE source_name = '$DOC';")"
 RECEIPTS_MID="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB';")"
+VIS_AT_HOLD="$(probe_exists "/srv/fn/consume/$NAME")"
 
-emit "1. the attempt linked its document and was delayed before recording it"
-emit "   linked:                       $LINKED   (expected yes)"
-emit "   receipts so far:              $RECEIPTS_MID   (expected 0: the delay is before the receipt)"
-[ "$LINKED" = "yes" ] || bad "nothing was linked; this is not the case under test"
-[ "${RECEIPTS_MID:-1}" = "0" ] || bad "a receipt already exists; the pause is not where this exercise needs it"
+emit "1. the attempt staged its document and is holding before it commits"
+emit "   this job's staged dotfile seen: $([ "$STAGED_SEEN" = "1" ] && echo yes || echo no)   (expected yes)"
+emit "   receipts so far:                $RECEIPTS_MID   (expected 0: the hold is before the receipt)"
+emit "   reserved name visible:          $VIS_AT_HOLD   (expected no: staged, not published)"
+[ "$STAGED_SEEN" = "1" ] || bad "this job's staged dotfile was never seen, so this run did not reach the interval under test"
+[ "${RECEIPTS_MID:-1}" = "0" ] || bad "a receipt already exists; the hold is not where this exercise needs it"
+[ "$VIS_AT_HOLD" = "no" ] || bad "the reserved name is already visible to the consumer, before any receipt exists"
 
-# The document is taken out of the directory, as a consumer takes it. The
-# sibling that follows therefore finds no destination and cannot confirm
-# anything about the publication.
-TAKEN="$(in_storage "rm -f '/srv/fn/consume/$NAME' 2>/dev/null; test -e '/srv/fn/consume/$NAME' && echo present || echo taken")"
-emit "   the document was taken:       $TAKEN   (as a consumer would take it)"
-[ "$TAKEN" = "taken" ] || bad "the document could not be taken, so the sibling would not face an absent destination"
-
-# The claim expires, then a sibling is given a delivery of its own.
+# The claim expires while the attempt is still held, then a sibling is given a
+# delivery of its own -- DURING the hold, which is the whole point. Doing this
+# after the hold ended measured an ordinary successful delivery.
 sleep 12
 start_fault renamer-taker FN_PUBLISH_TAKEOVER_AFTER=10s || exit 1
 sleep 4
@@ -173,16 +185,33 @@ compose exec -T rabbitmq rabbitmqadmin \
     --payload "{\"contract_version\":1,\"job_id\":\"$JOB\",\"attempt\":2,\"enqueued_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" >/dev/null 2>&1 \
     && SIBLING=yes || SIBLING=no
 
+# Sample what a consumer could see until the job reaches a terminal state. The
+# assertion is the requirement itself: while this job has no receipt, its
+# reserved name must never be visible. Tying it to the receipt rather than to a
+# clock makes it independent of how long the hold lasts.
 _i=0
+SAMPLES=0
+VISIBLE_BEFORE_RECEIPT=0
 CLOSED=""
-while [ "$_i" -lt 120 ]; do
+while [ "$_i" -lt 240 ]; do
+    SAMPLES=$((SAMPLES + 1))
+    _vis="$(probe_exists "/srv/fn/consume/$NAME")"
+    _rc="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB';")"
+    if [ "$_vis" = "yes" ] && [ "${_rc:-0}" = "0" ]; then
+        VISIBLE_BEFORE_RECEIPT=$((VISIBLE_BEFORE_RECEIPT + 1))
+    fi
     CLOSED="$(psqlq "SELECT state FROM jobs WHERE job_id = '$JOB';")"
     case "$CLOSED" in uncertain|held|delivered) break ;; esac
     sleep 2; _i=$((_i + 2))
 done
 SIBLING_ACTED="$(compose --profile fault logs renamer-taker 2>/dev/null | grep -c "$JOB" || true)"
 
-emit "2. a sibling closed the job while the attempt was delayed"
+emit "   consume-directory samples while it resolved: $SAMPLES"
+emit "   reserved name visible while no receipt existed: $VISIBLE_BEFORE_RECEIPT   (expected 0)"
+[ "${VISIBLE_BEFORE_RECEIPT:-1}" = "0" ] || bad "the reserved name was visible to the consumer in $VISIBLE_BEFORE_RECEIPT sample(s) taken while this job had no receipt"
+
+emit "2. a sibling closed the job while the attempt was still held"
+emit "   (it finds no destination because nothing was ever made visible)"
 emit "   a delivery was given to it:   $SIBLING"
 emit "   the sibling handled the job:  $SIBLING_ACTED log line(s)   (expected >= 1)"
 emit "   the outcome it recorded:      $CLOSED   (expected uncertain: it found no destination)"
@@ -216,6 +245,10 @@ SRC="$(in_storage "test -f '/srv/fn/incoming/$DOC' && echo yes || echo no")"
     compose --profile fault logs renamer-taker 2>/dev/null | grep "$JOB" | tail -10
 } >> "$EVIDENCE_DIR/post-check-closure-events.log" 2>/dev/null || true
 
+# One more look, after the delayed attempt has resumed and been refused.
+FINAL_VISIBLE="$(probe_exists "/srv/fn/consume/$NAME")"
+STRANDED="$(in_storage "ls -a /srv/fn/consume 2>/dev/null | grep -c '^\.fn-$JOB\.' || true")"
+
 emit "3. the delayed attempt tried to record its delivery"
 emit "   waited for it to resume:      ${_i}s (its pause is 75s)"
 emit "   it reported being superseded: $SUPERSEDED time(s)   (expected >= 1)"
@@ -224,6 +257,10 @@ emit "   final state:                  $FINAL   (expected uncertain: NOT reopene
 emit "   delivery receipts:            $RECEIPTS   (expected 0)"
 emit "   documents in the directory:   $COPIES   (expected 0)"
 emit "   source preserved:             $SRC   (expected yes)"
+emit "   reserved name visible now:    $FINAL_VISIBLE   (expected no)"
+emit "   this job's staged dotfiles left: $STRANDED   (expected 0)"
+[ "$FINAL_VISIBLE" = "no" ] || bad "the reserved name is visible to the consumer for a job that was closed"
+[ "${STRANDED:-1}" = "0" ] || bad "$STRANDED staged dotfile(s) of this job were left in the destination directory"
 [ "${SUPERSEDED:-0}" -ge 1 ] || bad "the delayed attempt never reported that the job had been closed under it"
 [ "$FINAL" = "uncertain" ] || bad "the job is '$FINAL': a terminal outcome was reopened by an attempt whose authority had expired"
 [ "${RECEIPTS:-0}" = "0" ] || bad "$RECEIPTS receipt(s) exist for a job nobody could confirm"

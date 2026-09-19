@@ -1043,6 +1043,55 @@ func (d *Dir) CreateFrom(src *os.File, name string, perm os.FileMode) (*os.File,
 	return f, got, sum, size, nil
 }
 
+// RevealNoReplace makes an already-staged file visible under its final name,
+// atomically, and never over an existing entry.
+//
+// # Why publication is a rename now, and why it is last
+//
+// Publication used to be a link from the staged temporary to the final name,
+// followed by the durable receipt. That order put a real, consumable document
+// into the consumer's directory BEFORE this attempt had established it was
+// still allowed to publish, and Paperless polls that directory every second.
+// When the receipt was then refused -- because a sibling had closed the job
+// while this attempt was slow -- the document was removed again, but removal
+// is an apology: the consumer may already have taken it.
+//
+// The order is inverted. The staged temporary is a dotfile in the destination
+// directory, hard-linked to the verified bytes, and the consumer ignores
+// dotfiles; it is a publication that is not yet visible. The receipt is
+// committed first, and only then is this called to make the document visible
+// under its real name.
+//
+// That gives one invariant, which the recovery path depends on: a consumer-
+// visible file at a job's reserved name implies a committed receipt for that
+// job. It does NOT claim that the filesystem and the database change together
+// -- they cannot, and every failure between them is handled by leaving the
+// document hidden rather than by pretending otherwise.
+//
+// RENAME_NOREPLACE because the destination must never be overwritten, and
+// because a check followed by a rename is two operations with a gap.
+func (d *Dir) RevealNoReplace(fromName, toName string) error {
+	if err := checkLeaf(fromName); err != nil {
+		return err
+	}
+	if err := checkLeaf(toName); err != nil {
+		return err
+	}
+	switch err := renameatNoReplace(int(d.f.Fd()), fromName, int(d.f.Fd()), toName); {
+	case err == nil:
+	case errors.Is(err, syscall.EEXIST):
+		return fmt.Errorf("%w: %s", ErrDestinationExists, toName)
+	default:
+		return &os.PathError{Op: "renameat2", Path: filepath.Join(d.root, toName), Err: err}
+	}
+	// The directory entry is what the consumer sees, so it is what has to
+	// reach the disk. A failure here does not unpublish anything.
+	if err := d.f.Sync(); err != nil {
+		return fmt.Errorf("sync destination directory after publication: %w", err)
+	}
+	return nil
+}
+
 // LinkAt promotes one name in this directory to another, never replacing an
 // existing entry. It reports whether the destination already existed.
 func (d *Dir) LinkAt(oldName, newName string) (existed bool, err error) {
