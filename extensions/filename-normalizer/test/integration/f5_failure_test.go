@@ -345,6 +345,16 @@ func TestF5LedgerOutageDeliveryIsSettledAfterRecovery(t *testing.T) {
 		t.Fatalf("read the job after recovery: %v", err)
 	}
 
+	// An empty work queue is not settlement of THIS delivery.
+	//
+	// The queue reaching zero is satisfied by any drain: the job's earlier
+	// delivery settling, another phase's backlog clearing, or the duplicate
+	// still being outstanding on a consumer that has taken it and not yet
+	// acknowledged it. The claim this test makes is narrower — the duplicate
+	// published during the outage was settled after recovery — so the
+	// condition is the renamer's own settlement record for this job id,
+	// timestamped after the outage began. Queue depth stays, as a timing
+	// precondition rather than as the evidence.
 	if derr := waitForErr(120*time.Second, func() error {
 		n, _, qerr := pub.QueueDepth(e.Cfg.Broker.Queue)
 		if qerr != nil {
@@ -356,6 +366,26 @@ func TestF5LedgerOutageDeliveryIsSettledAfterRecovery(t *testing.T) {
 		return nil
 	}); derr != nil {
 		t.Fatalf("the delivery held through the outage was not settled after recovery: %v", derr)
+	}
+
+	outageStart := e.Since(t, "primary_down")
+	settlements := 0
+	settledBy := ""
+	for _, svc := range []string{"renamer-1", "renamer-2"} {
+		for _, r := range recordsSince(t, e, svc, outageStart) {
+			if r.String("event") != "delivery_settled" || r.String("job_id") != jobID {
+				continue
+			}
+			settlements++
+			if settledBy == "" {
+				settledBy = svc
+			}
+		}
+	}
+	if settlements < 1 {
+		t.Errorf("no renamer logged delivery_settled for job %s after the outage began at %s; "+
+			"an empty work queue does not establish that the duplicate was settled rather "+
+			"than still outstanding", jobID, outageStart.Format(time.RFC3339Nano))
 	}
 
 	after, err := led.GetJob(ctx, jobID)
@@ -398,8 +428,11 @@ func TestF5LedgerOutageDeliveryIsSettledAfterRecovery(t *testing.T) {
 	t.Logf("duplicate delivery settled after recovery: state=%s delivery_attempts=%d->%d",
 		after.State, before.DeliveryAttempts, after.DeliveryAttempts)
 	e.WriteEvidence(t, "f5-ledger-outage-recovery.txt", []byte(fmt.Sprintf(
-		"job_id=%s state_before=%s state_after=%s delivery_attempts=%d->%d work_queue_drained=true\n",
-		jobID, before.State, after.State, before.DeliveryAttempts, after.DeliveryAttempts)))
+		"job_id=%s state_before=%s state_after=%s delivery_attempts=%d->%d work_queue_drained=true\n"+
+			"delivery_settled records for THIS job since the outage began: %d (first on %s)\n"+
+			"An empty queue is the timing precondition; the settlement record is the evidence.\n",
+		jobID, before.State, after.State, before.DeliveryAttempts, after.DeliveryAttempts,
+		settlements, settledBy)))
 }
 
 // TestF5PendingWorkIsNotStrandedByABrokerOutage asserts a job registered while
