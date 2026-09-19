@@ -93,8 +93,11 @@ restore() {
         report_keep
         exit 1
     fi
-    report_keep
+    # Order matters: report_keep promotes only when restoration has already
+    # been recorded, so keeping first meant this exercise's passing runs never
+    # reached the success slot and the one there stayed from an older run.
     report_restored
+    report_keep
     note "restored: ordinary renamers ready, fault services removed"
 }
 
