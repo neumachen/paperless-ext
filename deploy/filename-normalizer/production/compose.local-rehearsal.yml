@@ -1,0 +1,20 @@
+# Attaches the production manifest to dependencies that already exist locally,
+# so the DOCUMENTED procedures can be rehearsed against real PostgreSQL and
+# real RabbitMQ without inventing a second copy of them.
+#
+# It changes nothing about the services themselves: same images, same
+# hardening, same environment, same healthchecks. Only the network is
+# redirected, and the ports are dropped so this rehearsal cannot collide with
+# the stack it borrows.
+networks:
+  fn:
+    external: true
+    name: ${FN_EXTERNAL_NETWORK:?set the existing stack network}
+
+services:
+  watcher:
+    ports: []
+  renamer-1:
+    ports: []
+  renamer-2:
+    ports: []

@@ -93,6 +93,20 @@ if [ -n "$RENDERED" ]; then
     emit "application services running non-root: $_root   (expected 3)"
     [ "${_root:-0}" -ge 3 ] || bad "not every application service runs as 65532"
 
+    # Digest pinning, which the package claims and nothing checked. A tag can
+    # be moved; a digest cannot.
+    _unpinned=0
+    for _img in $(printf '%s' "$RENDERED" | grep -E '^\s+image:' | awk '{print $2}' | sort -u); do
+        case "$_img" in
+            *@sha256:*) ;;
+            *) _unpinned=$((_unpinned + 1)); emit "  NOT digest-pinned: $_img" ;;
+        esac
+    done
+    emit "image references that are not digest-pinned: $_unpinned"
+    if [ "$_unpinned" != "0" ] && [ "${FN_ALLOW_UNPINNED:-0}" != "1" ]; then
+        bad "$_unpinned image reference(s) are not digest-pinned, which this package requires"
+    fi
+
     if printf '%s' "$RENDERED" | grep -qE 'placeholder|password: *[A-Za-z0-9]'; then
         bad "a secret VALUE appears in the rendered manifest"
     else

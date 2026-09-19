@@ -233,6 +233,11 @@ test-harness-ownership: ## Prove the ownership harness itself preserves pre-exis
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-harness-ownership.sh
 
+.PHONY: verify-deployment-rehearsal
+verify-deployment-rehearsal: ## Rehearse the documented deployment procedures in an isolated deployment
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-deployment-rehearsal.sh
+
 .PHONY: verify-backup-restore
 verify-backup-restore: ## Back up and restore into disposable copies; the live system is only read
 	@mkdir -p $(EVIDENCE)
