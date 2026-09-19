@@ -208,6 +208,11 @@ test-consumer: ## Run a real isolated Paperless instance against the consume dir
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-consumer.sh
 
+.PHONY: test-post-check-closure
+test-post-check-closure: ## Prove a job closed after the last authority check is not reopened
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-post-check-closure.sh
+
 .PHONY: test-reconcile-resume
 test-reconcile-resume: ## Prove a reconciled receipt does not make the published document a duplicate
 	@mkdir -p $(EVIDENCE)
