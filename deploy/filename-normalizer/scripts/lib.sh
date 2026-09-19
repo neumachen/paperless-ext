@@ -233,6 +233,40 @@ wait_for_unacked() {
     return 1
 }
 
+# An existence probe that cannot report absence it did not observe, and that
+# treats the filename strictly as data.
+#
+# # Why the name goes through the environment
+#
+# This used to interpolate a name straight into a string handed to `sh -c`
+# inside the storage container, which runs as root over the real document
+# directories:
+#
+#     in_storage "test -e '/srv/fn/incoming/$src' && echo yes || echo no"
+#
+# The names come from the ledger, and a source name is whatever the filesystem
+# accepted when the document arrived. One apostrophe ends the quoted string and
+# the rest of the name is executed -- as root, with incoming and consume
+# mounted. A filename is data. It is passed as an environment variable, which
+# docker sets directly on the process, so it never passes through a shell at
+# all; the script body references it by name and nothing in it is expanded.
+#
+# FN-R5-05's rule applies here too: a check that could not run is `unknown`,
+# and `unknown` is not `no`. PRESENT and ABSENT are definite tokens only a
+# completed probe can print, so anything else -- an empty result, a container
+# that would not start, a partial line -- is unknown by construction.
+probe_exists() {
+    _pe_out="$(compose run --rm --no-deps -T \
+        -e FN_PROBE_PATH="$1" --entrypoint sh storage-init \
+        -c 'if [ -e "$FN_PROBE_PATH" ]; then echo PRESENT; else echo ABSENT; fi' \
+        2>/dev/null < /dev/null | tr -d ' \r\n' || true)"
+    case "$_pe_out" in
+        PRESENT) printf 'yes' ;;
+        ABSENT)  printf 'no' ;;
+        *)       printf 'unknown' ;;
+    esac
+}
+
 # wait_for_instance_in_flight blocks until ONE NAMED instance reports at least
 # N deliveries in flight, read from that instance's own /metrics.
 #
