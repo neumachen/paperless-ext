@@ -1,0 +1,153 @@
+# File Normalizer — deployment manifest.
+#
+# This is the local stack's topology with everything that exists for testing
+# taken out: no fault profile, no exercise services, no published application
+# ports, and no bundled Paperless. It deploys the two applications against a
+# PostgreSQL primary and a RabbitMQ the operator already runs.
+#
+# What it deliberately does NOT do:
+#   * create or migrate the database (see README, "First start")
+#   * enable any deletion or retention cleanup (no policy is approved)
+#   * enable fault injection (FN_FAULT_POINTS is never set here)
+#   * publish gRPC, health or metrics to anything but loopback
+#   * configure automatic failover (failover is manual and documented)
+#
+# Image and configuration identity are pinned by digest and by file, and both
+# are reported by every process at runtime. See README, "What is running".
+name: ${FN_PROJECT:-filename-normalizer}
+
+x-app-env: &app-env
+  FN_LOG_LEVEL: ${FN_LOG_LEVEL:-info}
+  FN_SHUTDOWN_TIMEOUT: ${FN_SHUTDOWN_TIMEOUT:-20s}
+
+  FN_DB_PRIMARY_HOST: ${FN_DB_PRIMARY_HOST:?set the PostgreSQL primary host}
+  FN_DB_PRIMARY_PORT: ${FN_DB_PRIMARY_PORT:-5432}
+  FN_DB_REPLICA_HOST: ${FN_DB_REPLICA_HOST:-}
+  FN_DB_REPLICA_PORT: ${FN_DB_REPLICA_PORT:-5432}
+  FN_DB_REPLICA_REQUIRED: ${FN_DB_REPLICA_REQUIRED:-false}
+  FN_DB_NAME: ${FN_DB_NAME:-filename_normalizer}
+  FN_DB_USER: ${FN_DB_USER:-fn_app}
+  FN_DB_PASSWORD_FILE: /run/secrets/fn_db_password
+  # TLS to the database is required wherever the database is not on this host.
+  FN_DB_SSLMODE: ${FN_DB_SSLMODE:-require}
+  # Migrations are applied by an explicit operator step, never by a service
+  # coming up. See README, "Upgrades".
+  FN_DB_APPLY_MIGRATIONS: "false"
+
+  FN_AMQP_HOST: ${FN_AMQP_HOST:?set the RabbitMQ host}
+  FN_AMQP_PORT: ${FN_AMQP_PORT:-5672}
+  FN_AMQP_VHOST: ${FN_AMQP_VHOST:-filename-normalizer}
+  FN_AMQP_USER: ${FN_AMQP_USER:-fn_app}
+  FN_AMQP_PASSWORD_FILE: /run/secrets/fn_amqp_password
+  FN_AMQP_DELIVERY_LIMIT: ${FN_AMQP_DELIVERY_LIMIT:-5}
+
+  FN_STORAGE_INCOMING: /srv/fn/incoming
+  FN_STORAGE_QUEUED: /srv/fn/queued
+  FN_STORAGE_STAGING: /srv/fn/staging
+  FN_STORAGE_CONSUME: /srv/fn/consume
+  FN_STORAGE_FAILED: /srv/fn/failed
+  # Refuse to start rather than run against storage that is not mounted. An
+  # unmounted share looks exactly like an empty directory.
+  FN_STORAGE_REQUIRED: "true"
+
+  FN_CONFIG_FILE: /etc/fn/normalizer.json
+
+x-app-hardening: &app-hardening
+  user: "65532:65532"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  # Loopback only. Nothing here is authenticated, so nothing here may be
+  # reachable from a network the operator does not control. See README,
+  # "Access boundary".
+  networks: [fn]
+
+x-app-image: &app-image
+  image: ${FN_IMAGE:?set FN_IMAGE to a digest-pinned image reference}
+
+x-storage: &storage
+  - type: bind
+    source: ${FN_HOST_INCOMING:?set the incoming directory}
+    target: /srv/fn/incoming
+  - type: bind
+    source: ${FN_HOST_QUEUED:?set the queued directory}
+    target: /srv/fn/queued
+  - type: bind
+    source: ${FN_HOST_STAGING:?set the staging directory}
+    target: /srv/fn/staging
+  - type: bind
+    source: ${FN_HOST_CONSUME:?set the Paperless consume directory}
+    target: /srv/fn/consume
+  - type: bind
+    source: ${FN_HOST_FAILED:?set the failed/quarantine directory}
+    target: /srv/fn/failed
+  - type: bind
+    source: ${FN_HOST_CONFIG:?set the configuration file}
+    target: /etc/fn/normalizer.json
+    read_only: true
+
+secrets:
+  fn_db_password:
+    file: ${FN_SECRET_DB_PASSWORD:?path to the database password file}
+  fn_amqp_password:
+    file: ${FN_SECRET_AMQP_PASSWORD:?path to the broker password file}
+
+networks:
+  fn:
+    driver: bridge
+
+services:
+  # ---------------------------------------------------------------------
+  # The watcher. Hosts discovery and completion accounting. Exactly ONE.
+  # Two watchers would both discover the same submissions.
+  # ---------------------------------------------------------------------
+  watcher:
+    <<: [*app-hardening, *app-image]
+    command: ["watcher"]
+    environment:
+      <<: *app-env
+      FN_INSTANCE: watcher-1
+    secrets: [fn_db_password, fn_amqp_password]
+    volumes: *storage
+    ports:
+      - "127.0.0.1:${FN_WATCHER_HEALTH_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/watcher", "probe", "--once", "http://127.0.0.1:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+
+  # ---------------------------------------------------------------------
+  # Renamers. Independently scalable; two is the minimum that demonstrates
+  # concurrent progress, and the ceiling is the storage, not this file.
+  # ---------------------------------------------------------------------
+  renamer-1: &renamer
+    <<: [*app-hardening, *app-image]
+    command: ["renamer"]
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-1
+      FN_RENAMER_CONCURRENCY: ${FN_RENAMER_CONCURRENCY:-2}
+      FN_RENAMER_PREFETCH: ${FN_RENAMER_PREFETCH:-2}
+    secrets: [fn_db_password, fn_amqp_password]
+    volumes: *storage
+    ports:
+      - "127.0.0.1:${FN_RENAMER1_HEALTH_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/renamer", "probe", "--once", "http://127.0.0.1:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+
+  renamer-2:
+    <<: *renamer
+    environment:
+      <<: *app-env
+      FN_INSTANCE: renamer-2
+      FN_RENAMER_CONCURRENCY: ${FN_RENAMER_CONCURRENCY:-2}
+      FN_RENAMER_PREFETCH: ${FN_RENAMER_PREFETCH:-2}
+    ports:
+      - "127.0.0.1:${FN_RENAMER2_HEALTH_PORT:-8082}:8080"

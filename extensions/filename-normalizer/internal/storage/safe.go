@@ -1043,6 +1043,40 @@ func (d *Dir) CreateFrom(src *os.File, name string, perm os.FileMode) (*os.File,
 	return f, got, sum, size, nil
 }
 
+// FindStagedFor returns the name of a staged temporary this job left in this
+// directory, or "" when there is none.
+//
+// Publication stages a dotfile named for the job and reveals it by renaming.
+// A process that dies between committing the receipt and revealing leaves that
+// dotfile behind: the document is present, authorised and invisible. Recovery
+// needs to find it to finish the publication, and the job id in the name is
+// what makes that possible without a second durable record.
+func (d *Dir) FindStagedFor(jobID string) (string, error) {
+	if strings.ContainsAny(jobID, "/\x00") || jobID == "" {
+		return "", fmt.Errorf("%w: %q is not a job id", ErrUnsafeName, jobID)
+	}
+	names, err := d.f.Readdirnames(-1)
+	if _, serr := d.f.Seek(0, io.SeekStart); serr != nil && err == nil {
+		err = serr
+	}
+	if err != nil {
+		return "", err
+	}
+	prefix := tempPrefixStaged + jobID + "."
+	for _, n := range names {
+		if strings.HasPrefix(n, prefix) && strings.HasSuffix(n, ".tmp") {
+			return n, nil
+		}
+	}
+	return "", nil
+}
+
+// tempPrefixStaged is the prefix the renamer gives a staged publication. It is
+// duplicated from the renamer package deliberately: this package must not
+// import it, and a constant that drifts is caught by the test that publishes
+// through the real path and then looks for the name here.
+const tempPrefixStaged = ".fn-"
+
 // RevealNoReplace makes an already-staged file visible under its final name,
 // atomically, and never over an existing entry.
 //

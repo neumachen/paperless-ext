@@ -186,8 +186,22 @@ func (p *Pipeline) Process(ctx context.Context, job ledger.Job, attempt int) Out
 		return p.hold(ctx, job, jobs.CategoryDestinationMismatch, attempt)
 	}
 
-	// An existing receipt means this job is already done.
+	// An existing receipt means the publication is AUTHORISED. It no longer
+	// means it is finished.
+	//
+	// Publication commits the receipt while the document is still an invisible
+	// dotfile and reveals it afterwards, so a receipt with the job still in
+	// `publishing` describes a publication that was interrupted between those
+	// two steps: present, authorised, and not yet visible to the consumer.
+	// Acking here left that document hidden forever -- the job stayed
+	// `publishing`, every redelivery settled against the receipt, and nothing
+	// ever finished it.
 	if receipt, err := p.led.GetReceipt(ctx, job.JobID); err == nil {
+		if job.State == jobs.StatePublishing {
+			log.Info("a committed publication was never revealed; finishing it",
+				slog.String("event", "publication_reveal_pending"))
+			return p.recoverPublishing(ctx, job, attempt, log)
+		}
 		log.Info("delivery settled against an existing receipt",
 			slog.String("event", "delivery_settled"),
 			slog.String("outcome", "delivered"),
@@ -814,6 +828,21 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 			slog.Int64("size_bytes", size))
 		return settled("delivered", jobs.StateDelivered, ""), true
 
+	case errors.Is(err, fs.ErrNotExist):
+		// This attempt's staged file is gone, so it is not the one that will
+		// reveal it. Under the current order that means the publication was
+		// already committed -- it must have been, or there would be nothing to
+		// reveal -- and another attempt's recovery finished it. Settling
+		// against what stands is right; treating it as a failed publication
+		// would report a document that IS delivered as lost, and withdrawing
+		// anything here would remove somebody's completed delivery.
+		log.Info("another attempt completed this publication while this one held its staged file",
+			slog.String("event", "publication_completed_elsewhere"))
+		if out, ok := p.settleAgainstPreserved(ctx, job.JobID, log); ok {
+			return out, true
+		}
+		return settled("delivered", jobs.StateDelivered, ""), true
+
 	case errors.Is(err, storage.ErrDestinationExists):
 		return p.resolveOccupiedDestination(ctx, job, root, candidate, key, final, attempt, log)
 
@@ -1336,6 +1365,43 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 		return settled("reconciled", jobs.StateDelivered, "")
 
 	case errors.Is(gerr, fs.ErrNotExist):
+		// Nothing at the reserved name. A committed receipt changes what that
+		// means, because publication commits the receipt BEFORE it reveals:
+		//
+		//   receipt + staged dotfile  -> this attempt died between the two.
+		//                                The document is present, authorised
+		//                                and invisible; finish the reveal.
+		//   receipt + nothing staged  -> it was revealed and then taken, which
+		//                                is the ordinary consumer case. The
+		//                                delivery stands and its file is gone.
+		//   no receipt                -> unchanged: uncertain, below.
+		if existing, rerr := p.led.GetReceipt(ctx, job.JobID); rerr == nil &&
+			existing.DestinationRoot == root && existing.DeliveredName == name {
+			if dir, derr := storage.OpenDir(root); derr == nil {
+				defer func() { _ = dir.Close() }()
+				if staged, ferr := dir.FindStagedFor(job.JobID); ferr == nil && staged != "" {
+					if rverr := dir.RevealNoReplace(staged, name); rverr == nil {
+						if merr := p.led.MarkDelivered(ctx, job.JobID, attempt); merr != nil {
+							return unsettled(merr)
+						}
+						log.Info("finished a publication that was committed but never revealed",
+							slog.String("event", "publication_reveal_completed"))
+						return settled("reconciled", jobs.StateDelivered, "")
+					}
+				}
+			}
+			// Recorded, and its file is not here. Keep the delivery.
+			if merr := p.led.MarkDelivered(ctx, job.JobID, attempt); merr != nil {
+				return unsettled(merr)
+			}
+			if nerr := p.led.NoteDeliveredFileAbsent(ctx, job.JobID); nerr != nil {
+				log.Warn("could not record that the delivered file was already absent",
+					slog.String("event", "absence_note_failed"))
+			}
+			log.Info("a committed delivery whose file is no longer present; the delivery stands",
+				slog.String("event", "delivery_reconciled"))
+			return settled("reconciled", jobs.StateDelivered, "")
+		}
 		// The honest answer. The file may never have been created, or it may
 		// have been created and already taken by the consumer. A filesystem
 		// handoff cannot distinguish those, so the job stops here rather than
