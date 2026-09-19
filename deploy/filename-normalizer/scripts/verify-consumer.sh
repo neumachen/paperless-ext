@@ -41,10 +41,27 @@ CREATED_VOLUMES=""
 emit() { printf '%s\n' "$*" >> "$OUT"; printf '%s\n' "$*"; }
 bad() { printf '    MISMATCH: %s\n' "$*" >&2; emit "    MISMATCH: $*"; FAILURES=$((FAILURES + 1)); }
 
+# psqlq runs one read-only query and returns its rows.
+#
+# It used to pipe through `tr -d ' \r'`, which deletes every SPACE in the
+# result. With `psql -tA` there is no padding to strip, so the spaces it
+# removed were always part of the DATA. Two things depended on values that
+# contain one:
+#
+#   * T0, captured as `SELECT now()`, became `2026-09-1913:33:38.868306+00`.
+#     Every later query comparing `delivered_at >= '$T0'` then failed to parse
+#     it, returned nothing, and was read as zero through `${ARRIVED:-0}` -- so
+#     the check that no document belonging to other work had been ingested was
+#     answered by a query that never ran.
+#   * a delivered name containing a space came back joined up, so the probe for
+#     it reported the document missing when it was there.
+#
+# Only carriage returns are removed now. The timestamp is also taken in a
+# space-free ISO form below, so the value does not depend on this at all.
 psqlq() {
     compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
         postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d "${FN_DB_NAME:-filename_normalizer}" -tA -c "$1" \
-        2>/dev/null | tr -d ' \r'
+        2>/dev/null | tr -d '\r'
 }
 
 in_storage() {
@@ -358,7 +375,8 @@ print(len(missing))" 2>/dev/null | tr -d ' \r\n')"
     esac
 }
 
-T0="$(psqlq "SELECT now();")"
+# Space-free by construction, so no downstream trimming can corrupt it.
+T0="$(psqlq "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.USZ');")"
 BEFORE_CONSUME="$(in_storage "ls -1 /srv/fn/consume 2>/dev/null | wc -l")"
 log "1/4: starting an isolated Paperless instance against the real consume directory"
 start_consumer || exit 1
@@ -658,7 +676,9 @@ the consumer's data is preserved and restoration is incomplete" ;;
 esac
 emit "documents other work delivered while this ran:     ${ARRIVED:-unknown}"
 emit "anything of other work's inside this consumer:     $FOREIGN_VERDICT   (expected none)"
-[ "${ARRIVED_GONE:-0}" = "0" ] || bad "$ARRIVED_GONE document(s) belonging to other work were ingested by this exercise's consumer"
+# A flag, not a count: the verdict establishes that something of other work's
+# is inside, not how much. Claiming a number here would be inventing one.
+[ "${ARRIVED_GONE:-0}" = "0" ] || bad "document(s) belonging to other work were ingested by this exercise's consumer"
 # The ignore list is a snapshot and cannot name a document that had not arrived
 # when it was taken. That is a real hole and it is reported as one rather than
 # left to the reader: if other work delivered while this ran, those documents

@@ -54,7 +54,7 @@ bad() { printf '    MISMATCH: %s\n' "$*" >&2; emit "    MISMATCH: $*"; FAILURES=
 psqlq() {
     compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
         postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d "${FN_DB_NAME:-filename_normalizer}" -tA -c "$1" \
-        2>/dev/null | tr -d ' \r'
+        2>/dev/null | tr -d '\r'
 }
 
 submit() {
