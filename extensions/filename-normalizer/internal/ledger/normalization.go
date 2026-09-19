@@ -576,6 +576,34 @@ func (l *Ledger) ReleaseDelivery(ctx context.Context, jobID string, attempt int,
 // not delivered.
 func (l *Ledger) RecordDelivered(ctx context.Context, r Receipt, reconciled bool) error {
 	return l.tx(ctx, func(tx pgx.Tx) error {
+		// A delivery may only be recorded for a job nobody has closed.
+		//
+		// Every authority check a publishing attempt makes is a SNAPSHOT: it
+		// reads the claim, and time passes before it links. An attempt that is
+		// descheduled after that read -- or simply slow -- can have its claim
+		// expire, have a sibling record the job `uncertain`, and then link and
+		// arrive here. The UPDATE below set state = 'delivered' with no
+		// condition, so it reopened a terminal outcome that a person was meant
+		// to resolve, and the document it had just linked became a delivery
+		// nobody had authorised.
+		//
+		// The row is locked and its state read inside this transaction, which
+		// is the only place the question can be asked and answered atomically
+		// with the write. `delivered` is permitted so a retry of a receipt
+		// this job already has stays idempotent.
+		var state string
+		if err := tx.QueryRow(ctx,
+			`SELECT state FROM jobs WHERE job_id = $1 FOR UPDATE`, r.JobID).Scan(&state); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		switch state {
+		case string(jobs.StateProcessing), string(jobs.StatePublishing), string(jobs.StateDelivered):
+		default:
+			return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
+		}
 		// ON CONFLICT DO NOTHING keeps the FIRST finisher's receipt, which is
 		// right: it describes the document that is actually in place. But the
 		// job row was then updated to THIS attempt's name regardless, so a
