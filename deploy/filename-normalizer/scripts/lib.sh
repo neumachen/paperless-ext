@@ -267,6 +267,24 @@ probe_exists() {
     esac
 }
 
+# probe_inode prints a path's inode number, ABSENT, or UNKNOWN.
+#
+# The same three-answer rule as probe_exists, for the checks that have to know
+# WHICH file is at a name rather than merely whether one is. An empty result
+# used to mean "absent", and an inspection that could not run produces exactly
+# that.
+probe_inode() {
+    _pi_out="$(compose run --rm --no-deps -T \
+        -e FN_PROBE_PATH="$1" --entrypoint sh storage-init \
+        -c 'if [ -e "$FN_PROBE_PATH" ]; then stat -c %i "$FN_PROBE_PATH"; else echo ABSENT; fi' \
+        2>/dev/null < /dev/null | tr -d ' \r\n' || true)"
+    case "$_pi_out" in
+        ABSENT)      printf 'ABSENT' ;;
+        ''|*[!0-9]*) printf 'UNKNOWN' ;;
+        *)           printf '%s' "$_pi_out" ;;
+    esac
+}
+
 # wait_for_instance_in_flight blocks until ONE NAMED instance reports at least
 # N deliveries in flight, read from that instance's own /metrics.
 #

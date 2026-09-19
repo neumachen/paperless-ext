@@ -188,44 +188,62 @@ restore_perm() { :; }
 # it is somebody else's file and this exercise does not touch it.
 PLANTED_PATH=""
 PLANTED_INODE=""
+PLANTED_RESOLUTION=""
+# cleanup_planted removes the file this exercise planted into the REAL consume
+# directory -- and only that file, and only when it can see that it is that
+# file.
+#
+# Three answers, everywhere. Absence and "could not look" are different facts
+# and were repeatedly collapsed into one: an inspection that failed for any
+# reason produced an empty string, which read as "already gone" and threw away
+# the only record that this run had written into the real destination. The
+# entry probe was fixed in an earlier pass; the check AFTER the removal was not,
+# and neither was the inline path in scenario 5.
+#
+# The record is not cleared unless the file is confirmed gone. An unresolved
+# one survives for the restoration report to name, because a note nobody can
+# act on is better than no note at all.
 cleanup_planted() {
     if [ -z "$PLANTED_PATH" ]; then return 0; fi
-    # Absence and "could not look" are different answers, and this treated them
-    # the same: an in_storage call that failed for any reason returned an empty
-    # string, which was read as "the file is already gone" and threw away the
-    # only record that this run had written a file into the real consume
-    # directory. The inspection reports which of the two it saw.
-    _cp_probe="$(in_storage "if [ -e '$PLANTED_PATH' ]; then ls -i '$PLANTED_PATH' | awk '{print \$1}'; else echo ABSENT; fi; echo OK")"
-    case "$_cp_probe" in
-        *OK) ;;
-        *)  echo "error: could not inspect $PLANTED_PATH; keeping its ownership record." >&2
+    _cp_now="$(probe_inode "$PLANTED_PATH")"
+    case "$_cp_now" in
+        ABSENT)
+            PLANTED_PATH=""; PLANTED_INODE=""; PLANTED_RESOLUTION=""
+            return 0 ;;
+        UNKNOWN)
+            PLANTED_RESOLUTION="not inspectable"
+            echo "error: could not inspect $PLANTED_PATH; keeping its ownership record." >&2
             printf '\nPLANTED FILE NOT INSPECTABLE: %s inode %s\n' "$PLANTED_PATH" "$PLANTED_INODE" >> "$OUT"
             return 1 ;;
     esac
-    _cp_now="${_cp_probe%OK}"
-    if [ "$_cp_now" = "ABSENT" ]; then
-        PLANTED_PATH=""; PLANTED_INODE=""
-        return 0
-    fi
     if [ "$_cp_now" != "$PLANTED_INODE" ]; then
+        PLANTED_RESOLUTION="a different file is at that name (inode $_cp_now)"
         echo "note: $PLANTED_PATH is inode $_cp_now, not the planted $PLANTED_INODE; leaving it alone." >&2
-        PLANTED_PATH=""; PLANTED_INODE=""
+        printf '\nPLANTED NAME HOLDS A DIFFERENT FILE: %s planted inode %s, now %s (left alone)\n' \
+            "$PLANTED_PATH" "$PLANTED_INODE" "$_cp_now" >> "$OUT"
         return 1
     fi
     in_storage "rm -f '$PLANTED_PATH' 2>/dev/null; true" >/dev/null 2>&1 || true
-    # Verified, then forgotten. Clearing the record unconditionally discarded
-    # the only note of a file this exercise had written into the real consume
-    # directory: `rm -f` reports nothing, so a removal that failed left the
-    # planted file in place and the variable that would have reported it empty,
-    # and the run went on to announce a clean restoration.
-    _cp_after="$(in_storage "ls -i '$PLANTED_PATH' 2>/dev/null | awk '{print \$1}'")"
-    if [ -n "$_cp_after" ]; then
-        echo "error: the planted file $PLANTED_PATH (inode $PLANTED_INODE) could not be removed." >&2
-        printf '\nPLANTED FILE NOT REMOVED: %s inode %s\n' "$PLANTED_PATH" "$PLANTED_INODE" >> "$OUT"
-        return 1
-    fi
-    PLANTED_PATH=""; PLANTED_INODE=""
-    return 0
+    # Verified, not assumed. `rm -f` reports nothing, and an inspection that
+    # cannot run reports nothing either; reading the second as the first let a
+    # run announce a clean restoration with its planted file still in place.
+    _cp_after="$(probe_inode "$PLANTED_PATH")"
+    case "$_cp_after" in
+        ABSENT)
+            PLANTED_PATH=""; PLANTED_INODE=""; PLANTED_RESOLUTION=""
+            return 0 ;;
+        UNKNOWN)
+            PLANTED_RESOLUTION="removal unverified"
+            echo "error: could not confirm $PLANTED_PATH (inode $PLANTED_INODE) was removed." >&2
+            printf '\nPLANTED FILE REMOVAL UNVERIFIED: %s inode %s\n' "$PLANTED_PATH" "$PLANTED_INODE" >> "$OUT"
+            return 1 ;;
+        *)
+            PLANTED_RESOLUTION="still present as inode $_cp_after"
+            echo "error: the planted file $PLANTED_PATH (inode $PLANTED_INODE) could not be removed." >&2
+            printf '\nPLANTED FILE NOT REMOVED: %s inode %s (now %s)\n' \
+                "$PLANTED_PATH" "$PLANTED_INODE" "$_cp_after" >> "$OUT"
+            return 1 ;;
+    esac
 }
 
 RESTORED=0
@@ -263,6 +281,14 @@ restore() {
 
     _r_ok=1
     if [ "${_r_perm_failed:-0}" = "1" ]; then _r_ok=0; fi
+    # A planted file whose fate was never established is named here rather than
+    # forgotten. It is the only record that this run wrote into the real
+    # consume directory, and a person needs it to finish the cleanup by hand.
+    if [ -n "$PLANTED_PATH" ]; then
+        _r_ok=0
+        printf '  PLANTED FILE UNRESOLVED: %s (planted inode %s) -- %s\n' \
+            "$PLANTED_PATH" "$PLANTED_INODE" "${PLANTED_RESOLUTION:-unresolved}" >> "$OUT"
+    fi
     # Anything this run disconnected and could not reconnect. The per-service
     # loop below only inspects the three application services, so a container
     # outside that set would otherwise be left off the network silently.
@@ -838,17 +864,26 @@ emit "   foreign file still intact:    $([ "$STILL_FOREIGN5" = "$FOREIGN_INO5" ]
 # unconditional rm. The one case where the path may hold somebody else's file
 # -- a real delivery, say -- was exactly the case that deleted it. The identity
 # is re-read here and the removal is gated on it.
-NOW5="$(in_storage "ls -i '/srv/fn/consume/$RESERVED5' 2>/dev/null | awk '{print \$1}'")"
-if [ -n "$NOW5" ] && [ "$NOW5" = "$FOREIGN_INO5" ]; then
+NOW5="$(probe_inode "/srv/fn/consume/$RESERVED5")"
+if [ "$NOW5" = "$FOREIGN_INO5" ]; then
     cleanup_planted || true
-    GONE5="$(in_storage "test -e '/srv/fn/consume/$RESERVED5' && echo present || echo removed")"
+    case "$(probe_exists "/srv/fn/consume/$RESERVED5")" in
+        no)  GONE5="removed" ;;
+        yes) GONE5="present" ;;
+        *)   GONE5="not inspectable" ;;
+    esac
     emit "   the planted intruder was:     $GONE5 afterwards (inode $FOREIGN_INO5, the one this exercise planted)"
-    [ "$GONE5" = "removed" ] || bad "the exercise left its planted file in the destination"
-elif [ -z "$NOW5" ]; then
-    PLANTED_PATH=""; PLANTED_INODE=""
+    [ "$GONE5" = "removed" ] || bad "the exercise left its planted file in the destination, or could not confirm it was gone"
+elif [ "$NOW5" = "ABSENT" ]; then
+    PLANTED_PATH=""; PLANTED_INODE=""; PLANTED_RESOLUTION=""
     emit "   the planted intruder was:     already gone before cleanup"
+elif [ "$NOW5" = "UNKNOWN" ]; then
+    # Not "already gone". The record stays, so restoration reports it.
+    PLANTED_RESOLUTION="not inspectable at scenario end"
+    emit "   the planted intruder was:     NOT INSPECTABLE; its ownership record is kept"
+    bad "the reserved name could not be inspected, so nothing was established about the planted file"
 else
-    PLANTED_PATH=""; PLANTED_INODE=""
+    PLANTED_RESOLUTION="a different file is at that name (inode $NOW5)"
     emit "   the planted intruder was:     NOT removed: inode $NOW5 is not the planted $FOREIGN_INO5"
     bad "the file at the reserved name is not the one this exercise planted; leaving it alone"
 fi
