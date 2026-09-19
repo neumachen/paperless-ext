@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -879,44 +880,173 @@ func (d *Dir) LinkFromDescriptor(src *os.File, name string) error {
 }
 
 // RemoveOwned removes an entry only while it is still the file the caller
-// identified, and reports whether the file it removed was that one.
+// identified, and reports exactly what it did.
 //
-// The identity check and the removal are issued against the same directory
-// descriptor, so neither re-resolves the root or the parent. That leaves one
-// unavoidable window -- the kernel has no "unlink this inode" -- so the file is
-// held open across the removal and its link count is read afterwards: if the
-// descriptor still has links, the name led to a different file by then and this
-// call removed somebody else's. That cannot be undone, and it is reported as a
-// failure rather than counted as a successful cleanup.
+// # Why it renames first
+//
+// There is no "unlink this inode" call. Checking a name and then unlinking that
+// name leaves a window in which the name can be repointed, and the unlink then
+// destroys whatever took it. The previous form tried to DETECT that afterwards
+// by reading the link count of a descriptor it held open, and got it wrong in
+// both directions: a staged temporary is a hard link to the same inode as the
+// document just published, so removing the temporary legitimately leaves links
+// behind and every successful publication reported "a file this process does
+// not own was removed"; and in the opposite case -- our own last link already
+// replaced by somebody else's file -- the count reaches zero and a foreign
+// deletion is reported as a clean removal.
+//
+// Renaming to a private name closes it. The name being removed at the end is
+// one this process generated and nothing else knows, so the unlink can only
+// destroy what this call put there. If the rename moved something else -- the
+// entry was replaced before the rename -- it is moved straight back and nothing
+// is deleted at all, which is the outcome that matters: a foreign file survives.
+//
+// It returns (true, nil) when the caller's own file was removed, (false, nil)
+// when the name was already gone, and (false, err) when the entry was not this
+// caller's, in which case the filesystem is left as it was found.
 func (d *Dir) RemoveOwned(name string, expect Entry) (bool, error) {
-	f, _, err := d.OpenOwn(name, expect)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return false, nil
-		}
+	if err := checkLeaf(name); err != nil {
 		return false, err
 	}
-	defer func() { _ = f.Close() }()
+	switch got, err := d.Identify(name); {
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, err
+	case got.Inode != expect.Inode || got.Device != expect.Device:
+		return false, fmt.Errorf("%w: %s is not the file this caller owns", ErrMutated, name)
+	}
 
-	if err := unlinkat(int(d.f.Fd()), name); err != nil {
+	tomb := tempPrefixRemoval + nonce16()
+	if err := renameat(int(d.f.Fd()), name, int(d.f.Fd()), tomb); err != nil {
 		if errors.Is(err, syscall.ENOENT) {
 			return false, nil
 		}
-		return false, &os.PathError{Op: "unlinkat", Path: filepath.Join(d.root, name), Err: err}
+		return false, &os.PathError{Op: "renameat", Path: filepath.Join(d.root, name), Err: err}
 	}
-	var st unix.Stat_t
-	if ferr := unix.Fstat(int(f.Fd()), &st); ferr == nil && st.Nlink > 0 {
-		return false, fmt.Errorf("%w: %s was replaced between the identity check and the removal; a file this process does not own was removed",
+
+	// What actually moved. Anything but this caller's file goes back where it
+	// came from, unremoved.
+	moved, ierr := d.Identify(tomb)
+	if ierr != nil || moved.Inode != expect.Inode || moved.Device != expect.Device {
+		if rerr := renameat(int(d.f.Fd()), tomb, int(d.f.Fd()), name); rerr != nil {
+			return false, fmt.Errorf("%w: %s was replaced before it could be removed, and the replacement could not be put back (it is now %s): %v",
+				ErrMutated, name, tomb, rerr)
+		}
+		return false, fmt.Errorf("%w: %s was replaced before it could be removed; it was left alone",
 			ErrMutated, name)
+	}
+
+	if err := unlinkat(int(d.f.Fd()), tomb); err != nil {
+		// The caller's file is still there, under a name only this process
+		// knows. Say so rather than reporting a removal that did not happen.
+		return false, &os.PathError{Op: "unlinkat", Path: filepath.Join(d.root, tomb), Err: err}
 	}
 	return true, nil
 }
+
+// tempPrefixRemoval names the private entry a removal moves a file to before
+// unlinking it. It is a dotfile, like every other intermediate this package
+// creates in a watched directory.
+const tempPrefixRemoval = ".fn-rm-"
 
 // RemoveIfOurs removes an entry created by this process, tolerating a name that
 // is already gone. It is the cleanup counterpart of CreateExclusive.
 func (d *Dir) RemoveIfOurs(name string, expect Entry) error {
 	_, err := d.RemoveOwned(name, expect)
 	return err
+}
+
+// CreateFrom creates a new entry, copies an open file into it, flushes it, and
+// returns it open together with its identity and content digest.
+//
+// Everything a caller needs to decide whether the bytes are right comes back
+// from the descriptor this call holds, so nothing after it has to name the file
+// again to ask.
+func (d *Dir) CreateFrom(src *os.File, name string, perm os.FileMode) (*os.File, Entry, []byte, int64, error) {
+	if err := checkLeaf(name); err != nil {
+		return nil, Entry{}, nil, 0, err
+	}
+	fd, err := unix.Openat(int(d.f.Fd()), name,
+		unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm.Perm()))
+	if err != nil {
+		if errors.Is(err, syscall.EEXIST) {
+			return nil, Entry{}, nil, 0, fmt.Errorf("%w: %s", ErrDestinationExists, name)
+		}
+		return nil, Entry{}, nil, 0, &os.PathError{Op: "openat", Path: filepath.Join(d.root, name), Err: err}
+	}
+	f := os.NewFile(uintptr(fd), filepath.Join(d.root, name))
+
+	fail := func(e error) (*os.File, Entry, []byte, int64, error) {
+		_ = f.Close()
+		_ = unlinkat(int(d.f.Fd()), name)
+		return nil, Entry{}, nil, 0, e
+	}
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return fail(err)
+	}
+	buf := make([]byte, copyBufferSize)
+	if _, err := io.CopyBuffer(f, src, buf); err != nil {
+		return fail(err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fail(err)
+	}
+	sum, size, err := FingerprintFile(f)
+	if err != nil {
+		return fail(err)
+	}
+	got, err := identifyFile(f, name, d.root)
+	if err != nil {
+		return fail(err)
+	}
+	return f, got, sum, size, nil
+}
+
+// LinkAt promotes one name in this directory to another, never replacing an
+// existing entry. It reports whether the destination already existed.
+func (d *Dir) LinkAt(oldName, newName string) (existed bool, err error) {
+	if err := checkLeaf(oldName); err != nil {
+		return false, err
+	}
+	if err := checkLeaf(newName); err != nil {
+		return false, err
+	}
+	switch err := linkat(int(d.f.Fd()), oldName, int(d.f.Fd()), newName, 0); {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, syscall.EEXIST):
+		return true, nil
+	default:
+		return false, &os.PathError{Op: "linkat", Path: filepath.Join(d.root, newName), Err: err}
+	}
+}
+
+// OpenAndFingerprint opens an entry and hashes the descriptor it opened.
+func (d *Dir) OpenAndFingerprint(name string) (*os.File, Entry, []byte, int64, error) {
+	if err := checkLeaf(name); err != nil {
+		return nil, Entry{}, nil, 0, err
+	}
+	fd, err := unix.Openat(int(d.f.Fd()), name,
+		unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, Entry{}, nil, 0, &os.PathError{Op: "openat", Path: filepath.Join(d.root, name), Err: err}
+	}
+	f := os.NewFile(uintptr(fd), filepath.Join(d.root, name))
+	got, err := identifyFile(f, name, d.root)
+	if err != nil {
+		_ = f.Close()
+		return nil, Entry{}, nil, 0, err
+	}
+	sum, size, err := FingerprintFile(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, Entry{}, nil, 0, err
+	}
+	return f, got, sum, size, nil
 }
 
 // CopyInto streams an open file into a new entry in this directory.
@@ -976,6 +1106,19 @@ func linkat(oldDirFd int, oldPath string, newDirFd int, newPath string, flags in
 
 func unlinkat(dirfd int, name string) error {
 	return unix.Unlinkat(dirfd, name, 0)
+}
+
+func renameat(oldDirFd int, oldName string, newDirFd int, newName string) error {
+	return unix.Renameat(oldDirFd, oldName, newDirFd, newName)
+}
+
+// nonce16 is a short random suffix for a private intermediate name.
+func nonce16() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // identifyFile describes an open descriptor.

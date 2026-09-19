@@ -274,6 +274,7 @@ func (p *Pipeline) Process(ctx context.Context, job ledger.Job, attempt int) Out
 	if !ok {
 		return out
 	}
+	defer func() { _ = working.Close() }()
 
 	// --- reservation and publication --------------------------------------
 	return p.publish(ctx, job, res, working, attempt, log)
@@ -315,16 +316,37 @@ func (p *Pipeline) sourceMatchesRegistration(job ledger.Job, e storage.Entry) bo
 // verifies the winner's file and uses it if it is right, and keeps using its
 // own verified private copy if it cannot be. Nothing is ever unlinked out from
 // under another attempt.
-func (p *Pipeline) makeWorkingCopy(ctx context.Context, job ledger.Job, src *os.File, entry storage.Entry, attempt int, log *slog.Logger) (string, Outcome, bool) {
-	canonical := filepath.Join(p.cfg.Storage.Staging, job.JobID+".work")
+func (p *Pipeline) makeWorkingCopy(ctx context.Context, job ledger.Job, src *os.File, entry storage.Entry, attempt int, log *slog.Logger) (*os.File, Outcome, bool) {
+	// One verified staging directory for every operation below.
+	//
+	// This path used to work entirely in pathnames: it hashed the canonical
+	// copy by name, created the private copy by name, promoted it by name, and
+	// removed it by name -- all after a root validation that happened somewhere
+	// else, earlier. A staging root repointed in between redirected every one
+	// of those, which is the same gap that was closed on the consume side and
+	// was still open here.
+	dir, derr := storage.OpenDir(p.cfg.Storage.Staging)
+	if derr != nil {
+		cat := jobs.Category(storage.RejectionCategory(derr))
+		log.Error("the staging root could not be opened",
+			slog.String("event", "staging_root_unusable"),
+			slog.String("category", string(cat)))
+		out, _ := p.holdOr(ctx, job, cat, attempt, derr)
+		return nil, out, false
+	}
+	defer func() { _ = dir.Close() }()
 
-	// A canonical copy that already verifies is reusable as-is.
-	if sum, size, err := storage.Fingerprint(canonical); err == nil {
+	canonical := job.JobID + ".work"
+
+	// A canonical copy that already verifies is reusable as-is, and it is read
+	// through the descriptor that answered for it.
+	if f, _, sum, size, err := dir.OpenAndFingerprint(canonical); err == nil {
 		if job.Fingerprint == nil || bytes.Equal(sum, job.Fingerprint) {
 			log.Info("reusing the verified working copy from an earlier attempt",
 				slog.String("event", "working_copy_reused"), slog.Int64("size_bytes", size))
-			return canonical, Outcome{}, true
+			return f, Outcome{}, true
 		}
+		_ = f.Close()
 		// It does not verify. It is NOT removed: another attempt may be the
 		// one that created it, and destroying its bytes is exactly what this
 		// function must not do. This attempt makes its own copy instead.
@@ -332,61 +354,77 @@ func (p *Pipeline) makeWorkingCopy(ctx context.Context, job ledger.Job, src *os.
 			slog.String("event", "working_copy_unverified"))
 	}
 
-	private := filepath.Join(p.cfg.Storage.Staging, tempPrefix+job.JobID+"."+nonce()+".work")
-	copied, err := storage.CopyFrom(src, private)
+	privateName := tempPrefix + job.JobID + "." + nonce() + ".work"
+	pf, privateID, sum, _, err := dir.CreateFrom(src, privateName, 0o640)
 	if err != nil {
 		cat := jobs.Category(storage.RejectionCategory(err))
 		log.Error("could not make a working copy",
 			slog.String("event", "working_copy_failed"),
 			slog.String("category", string(cat)))
 		out, _ := p.holdOr(ctx, job, cat, attempt, err)
-		return "", out, false
+		return nil, out, false
+	}
+
+	discard := func() {
+		_ = pf.Close()
+		if _, rerr := dir.RemoveOwned(privateName, privateID); rerr != nil {
+			log.Warn("could not remove this attempt's private working copy",
+				slog.String("event", "working_copy_left_behind"),
+				slog.String("error_kind", storage.RejectionCategory(rerr)))
+		}
 	}
 
 	// The bytes that landed must be the bytes discovery fingerprinted.
-	if job.Fingerprint != nil && !bytes.Equal(copied.Fingerprint, job.Fingerprint) {
-		_ = os.Remove(private)
+	if job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint) {
+		discard()
 		log.Warn("the working copy does not match the registered fingerprint",
 			slog.String("event", "source_mutated"),
 			slog.String("category", string(jobs.CategorySourceMutated)))
-		return "", p.hold(ctx, job, jobs.CategorySourceMutated, attempt), false
+		return nil, p.hold(ctx, job, jobs.CategorySourceMutated, attempt), false
 	}
 	// The source must not have changed while it was being copied. The check is
 	// against the descriptor that was read, not against the pathname.
 	if after, serr := src.Stat(); serr != nil || after.Size() != entry.Size || !after.ModTime().Equal(entry.ModTime) {
-		_ = os.Remove(private)
+		discard()
 		log.Warn("the source changed while it was being copied",
 			slog.String("event", "source_mutated"),
 			slog.String("category", string(jobs.CategorySourceMutated)))
-		return "", p.hold(ctx, job, jobs.CategorySourceMutated, attempt), false
+		return nil, p.hold(ctx, job, jobs.CategorySourceMutated, attempt), false
 	}
 
 	// Promote to the canonical name, without ever replacing an existing file.
-	existed, lerr := storage.LinkExclusive(private, canonical)
+	existed, lerr := dir.LinkAt(privateName, canonical)
 	switch {
 	case lerr != nil:
 		log.Warn("could not promote the working copy; continuing with the attempt-private copy",
 			slog.String("event", "working_copy_not_promoted"),
 			slog.String("error_kind", storage.RejectionCategory(lerr)))
-		return private, Outcome{}, true
+		return pf, Outcome{}, true
 	case existed:
 		// Another attempt won. Use its copy if it verifies; otherwise keep
 		// this attempt's own verified bytes rather than touching theirs.
-		if sum, _, ferr := storage.Fingerprint(canonical); ferr == nil &&
-			(job.Fingerprint == nil || bytes.Equal(sum, job.Fingerprint)) {
-			_ = os.Remove(private)
-			return canonical, Outcome{}, true
+		if cf, _, csum, _, cerr := dir.OpenAndFingerprint(canonical); cerr == nil {
+			if job.Fingerprint == nil || bytes.Equal(csum, job.Fingerprint) {
+				discard()
+				return cf, Outcome{}, true
+			}
+			_ = cf.Close()
 		}
-		return private, Outcome{}, true
+		return pf, Outcome{}, true
 	default:
-		// This attempt owns the canonical copy; its private link is redundant.
-		_ = os.Remove(private)
-		return canonical, Outcome{}, true
+		// This attempt owns the canonical copy. Its private link is redundant;
+		// the descriptor stays open and now refers to the canonical inode.
+		if _, rerr := dir.RemoveOwned(privateName, privateID); rerr != nil {
+			log.Warn("could not remove this attempt's redundant private link",
+				slog.String("event", "working_copy_left_behind"),
+				slog.String("error_kind", storage.RejectionCategory(rerr)))
+		}
+		return pf, Outcome{}, true
 	}
 }
 
 // publish walks the collision sequence, reserving and linking.
-func (p *Pipeline) publish(ctx context.Context, job ledger.Job, res naming.Result, working string, attempt int, log *slog.Logger) Outcome {
+func (p *Pipeline) publish(ctx context.Context, job ledger.Job, res naming.Result, working *os.File, attempt int, log *slog.Logger) Outcome {
 	root := p.cfg.Storage.Consume
 
 	// One token for the whole ATTEMPT, not one per candidate name.
@@ -445,7 +483,7 @@ func (p *Pipeline) publish(ctx context.Context, job ledger.Job, res naming.Resul
 //
 // `token` identifies the ATTEMPT and is the same across every candidate this
 // attempt tries; see publish for why it cannot be per-candidate.
-func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, candidate, key, working string, attempt, seq int, token string, log *slog.Logger) (Outcome, bool) {
+func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, candidate, key string, working *os.File, attempt, seq int, token string, log *slog.Logger) (Outcome, bool) {
 	final := filepath.Join(root, candidate)
 	// Attempt-private: two attempts on one job must not stage over each other.
 	tmp := filepath.Join(root, tempPrefix+job.JobID+"."+nonce()+".tmp")
@@ -753,6 +791,31 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 		rctx, rcancel := durably(ctx)
 		defer rcancel()
 		if derr := p.led.RecordDelivered(rctx, receipt, false); derr != nil {
+			if errors.Is(derr, ledger.ErrOutcomeAlreadyRecorded) {
+				// The job was closed while this attempt was publishing. Its
+				// authority check passed before the link and stopped being
+				// true afterwards -- which no check placed before a link can
+				// prevent, because the answer is only ever a snapshot. What
+				// CAN be prevented is the consequence: this attempt has just
+				// put a document into the consumer's directory for a job whose
+				// durable record says it is finished, so it takes that document
+				// back out. It is identified by the inode this attempt linked a
+				// moment ago and removed only while that is still what the name
+				// resolves to.
+				removed, rerr := dir.RemoveOwned(candidate, staged)
+				if rerr != nil {
+					log.Error("could not withdraw a publication made into a closed job",
+						slog.String("event", "publication_not_withdrawn"),
+						slog.String("error_kind", storage.RejectionCategory(rerr)))
+				}
+				log.Warn("this job was closed while this attempt was publishing; withdrawing what it linked",
+					slog.String("event", "publication_superseded"),
+					slog.Bool("removed", removed))
+				if out, ok := p.settleAgainstPreserved(ctx, job.JobID, log); ok {
+					return out, true
+				}
+				return unsettled(derr), true
+			}
 			log.Error("published but could not record the receipt; the delivery will be retried and reconciled",
 				slog.String("event", "receipt_write_failed"),
 				slog.String("dependency", "postgres_primary"))
@@ -845,24 +908,6 @@ func categoryOfJob(j ledger.Job) string {
 		return ""
 	}
 	return *j.FailureCategory
-}
-
-// observedIsThisJobs reports whether an observed destination is consistent with
-// this job's document, for the case where its CONTENT can no longer be read.
-//
-// Identity alone does not settle it. A device/inode pair is reused by the
-// filesystem the moment the file it named is gone, so "the inode matches" and
-// "this is my document" are different statements once the file has been
-// removed. The size is the one property still visible in an observation taken
-// before the disappearance, and requiring it closes the case where a recycled
-// identity turns into a receipt for somebody else's file. When the job has no
-// recorded size there is nothing to compare and the answer is no: a receipt
-// invented from an unverifiable observation is worse than an uncertain job.
-func observedIsThisJobs(job ledger.Job, got storage.Entry) bool {
-	if job.SizeBytes == nil {
-		return false
-	}
-	return got.Size == *job.SizeBytes
 }
 
 // recordAbsentDelivery records a delivery whose file has already gone.
@@ -1110,21 +1155,14 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 
 	if ours {
 		sum, size, serr := fingerprintPublished(root, candidate, got)
-		if (errors.Is(serr, fs.ErrNotExist) || errors.Is(serr, storage.ErrMutated)) && !observedIsThisJobs(job, got) {
-			log.Error("the occupied destination carried this job's identity but not its size; not adopting it",
-				slog.String("event", "destination_identity_unconvincing"),
+		if errors.Is(serr, fs.ErrNotExist) || errors.Is(serr, storage.ErrMutated) {
+			// Same reasoning as the recovery path: a file that is gone cannot
+			// be shown to have been this job's, because its identity is free
+			// for the filesystem to hand to anybody.
+			log.Error("the occupied destination went before it could be read; not adopting it",
+				slog.String("event", "publication_uncertain"),
 				slog.String("category", string(jobs.CategoryPublicationUncertain)))
 			return p.uncertain(ctx, job, attempt), true
-		}
-		if errors.Is(serr, fs.ErrNotExist) || errors.Is(serr, storage.ErrMutated) {
-			// Taken, or replaced, between identifying it and reading it. This
-			// job's document was at that name and is this job's own, so the
-			// delivery stands and its file is absent -- reporting a missing
-			// SOURCE here was the same misdiagnosis the publication path used
-			// to make, one step further along.
-			log.Info("this job's document went while it was being reconciled; recording the delivery",
-				slog.String("event", "destination_consumed_during_recovery"))
-			return p.recordAbsentDelivery(ctx, job, root, candidate, attempt, log), true
 		}
 		if serr != nil {
 			out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)
@@ -1252,22 +1290,23 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 			// happened and the delivery stands; calling this a missing source
 			// would lose a completed delivery from the accounting.
 			//
-			// The content comparison every other branch makes cannot be made
-			// here, so the observation has to carry more weight than an inode
-			// alone: identity AND the size this job recorded. Without that, a
-			// reused inode at this job's reserved name becomes a receipt for a
-			// file nobody ever verified -- the one place the report of the
-			// previous pass was wrong when it said matching bytes were always
-			// required.
-			if !observedIsThisJobs(job, got) {
-				log.Error("the destination carried this job's identity but not its size; not recording a delivery",
-					slog.String("event", "destination_identity_unconvincing"),
-					slog.String("category", string(jobs.CategoryPublicationUncertain)))
-				return p.uncertain(ctx, job, attempt)
-			}
-			log.Info("this job's document went while it was being reconciled; recording the delivery",
-				slog.String("event", "destination_consumed_during_recovery"))
-			return p.recordAbsentDelivery(ctx, job, root, name, attempt, log)
+			// Identity alone cannot carry this, and neither can identity plus
+			// size. A device/inode pair is reused by the filesystem as soon as
+			// the file that held it is gone, so "the inode this job once
+			// linked" and "this job's document" stop being the same statement
+			// the moment the file disappears -- and this branch is reached
+			// precisely because it disappeared. A foreign file created later at
+			// this job's reserved name can carry the recycled identity, and any
+			// size agreement it happens to have proves nothing about it.
+			//
+			// So this attempt says what it actually knows: a publication may
+			// have happened and cannot be confirmed. That is what `uncertain`
+			// is for, and a person resolves it with the source, which is still
+			// in the incoming root.
+			log.Error("the destination went before it could be read; ownership cannot be established from a vanished file",
+				slog.String("event", "publication_uncertain"),
+				slog.String("category", string(jobs.CategoryPublicationUncertain)))
+			return p.uncertain(ctx, job, attempt)
 		}
 		if serr != nil {
 			out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)
@@ -1323,13 +1362,7 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 //
 // The working copy is opened once and both routes use that descriptor: a link
 // when the two roots share a filesystem, a copy when they do not.
-func (p *Pipeline) stageBesideDestination(dir *storage.Dir, working, tmpName string) error {
-	wf, _, err := storage.OpenAnyRegular(working)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = wf.Close() }()
-
+func (p *Pipeline) stageBesideDestination(dir *storage.Dir, wf *os.File, tmpName string) error {
 	if lerr := dir.LinkFromDescriptor(wf, tmpName); lerr == nil {
 		return nil
 	} else if errors.Is(lerr, storage.ErrDestinationExists) {

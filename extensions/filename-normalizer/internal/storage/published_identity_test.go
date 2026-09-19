@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -264,5 +265,102 @@ func TestPublicationFailsRatherThanPublishingASubstitute(t *testing.T) {
 	}
 	if _, serr := os.Stat(filepath.Join(root, "doc.pdf")); !os.IsNotExist(serr) {
 		t.Fatal("something was published at the destination")
+	}
+}
+
+// Removing one owned hard link is a removal, not a mishap.
+//
+// The staged temporary and the published document are hard links to ONE inode:
+// that is what publication does. Cleanup then removes the temporary and the
+// inode still has a link, which the previous implementation read as "a file
+// this process does not own was removed" -- so every successful publication
+// reported a failed cleanup. The count of links says nothing about whose file
+// it is.
+func TestRemovingOneOwnedLinkOfSeveralIsReportedAsRemoved(t *testing.T) {
+	ForgetRoots()
+	defer ForgetRoots()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "doc.pdf"), []byte("mine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(root, "doc.pdf"), filepath.Join(root, ".fn-tmp")); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := OpenDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	staged, err := dir.Identify(".fn-tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := dir.RemoveOwned(".fn-tmp", staged)
+	if err != nil || !removed {
+		t.Fatalf("removed=%v err=%v, want true/nil: one owned link of two was removed", removed, err)
+	}
+	if _, serr := os.Stat(filepath.Join(root, ".fn-tmp")); !os.IsNotExist(serr) {
+		t.Fatal("the temporary is still there")
+	}
+	if got, rerr := os.ReadFile(filepath.Join(root, "doc.pdf")); rerr != nil || string(got) != "mine" {
+		t.Fatalf("the published document did not survive: %q %v", got, rerr)
+	}
+}
+
+// A removal leaves no intermediate behind.
+func TestRemoveOwnedLeavesNoTombstone(t *testing.T) {
+	ForgetRoots()
+	defer ForgetRoots()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "doc.pdf"), []byte("mine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := OpenDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	mine, _ := dir.Identify("doc.pdf")
+	if removed, rerr := dir.RemoveOwned("doc.pdf", mine); !removed || rerr != nil {
+		t.Fatalf("removed=%v err=%v", removed, rerr)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), tempPrefixRemoval) {
+			t.Fatalf("a removal intermediate was left behind: %s", e.Name())
+		}
+	}
+	if len(entries) != 0 {
+		t.Fatalf("directory is not empty: %v", entries)
+	}
+}
+
+// A name that is already gone is not an error and not a removal.
+func TestRemoveOwnedOnAnAbsentNameIsNeitherErrorNorRemoval(t *testing.T) {
+	ForgetRoots()
+	defer ForgetRoots()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "doc.pdf"), []byte("mine"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := OpenDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	mine, _ := dir.Identify("doc.pdf")
+	if err := os.Remove(filepath.Join(root, "doc.pdf")); err != nil {
+		t.Fatal(err)
+	}
+	removed, rerr := dir.RemoveOwned("doc.pdf", mine)
+	if removed || rerr != nil {
+		t.Fatalf("removed=%v err=%v, want false/nil for a name that is already gone", removed, rerr)
 	}
 }
