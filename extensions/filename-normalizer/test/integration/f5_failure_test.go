@@ -368,24 +368,48 @@ func TestF5LedgerOutageDeliveryIsSettledAfterRecovery(t *testing.T) {
 		t.Fatalf("the delivery held through the outage was not settled after recovery: %v", derr)
 	}
 
+	// Two different facts, asserted separately.
+	//
+	// `delivery_settled` is written by the HANDLER, at the point it returns
+	// Ack. The acknowledgement itself happens afterwards, in the consumer, and
+	// it can fail -- the consumer logs `delivery_settlement_failed` when the
+	// broker never learned the decision, and the message is then redelivered.
+	// So the handler's record establishes that this job's duplicate was
+	// processed; it does not establish that the delivery was settled with the
+	// broker. The second is what "settled" claims, and it needs its own
+	// evidence.
 	outageStart := e.Since(t, "primary_down")
 	settlements := 0
 	settledBy := ""
+	settlementFailures := 0
 	for _, svc := range []string{"renamer-1", "renamer-2"} {
 		for _, r := range recordsSince(t, e, svc, outageStart) {
-			if r.String("event") != "delivery_settled" || r.String("job_id") != jobID {
-				continue
-			}
-			settlements++
-			if settledBy == "" {
-				settledBy = svc
+			switch r.String("event") {
+			case "delivery_settled":
+				if r.String("job_id") != jobID {
+					continue
+				}
+				settlements++
+				if settledBy == "" {
+					settledBy = svc
+				}
+			case "delivery_settlement_failed":
+				// Not job-scoped: the consumer logs it outside the handler's
+				// logger. Any failure in this window is enough to make the
+				// broker-level claim unsafe.
+				settlementFailures++
 			}
 		}
 	}
 	if settlements < 1 {
 		t.Errorf("no renamer logged delivery_settled for job %s after the outage began at %s; "+
-			"an empty work queue does not establish that the duplicate was settled rather "+
+			"an empty work queue does not establish that the duplicate was processed rather "+
 			"than still outstanding", jobID, outageStart.Format(time.RFC3339Nano))
+	}
+	if settlementFailures > 0 {
+		t.Errorf("%d acknowledgement(s) failed in this window, so a delivery the handler "+
+			"decided on was not settled with the broker and will be redelivered",
+			settlementFailures)
 	}
 
 	after, err := led.GetJob(ctx, jobID)
@@ -429,10 +453,14 @@ func TestF5LedgerOutageDeliveryIsSettledAfterRecovery(t *testing.T) {
 		after.State, before.DeliveryAttempts, after.DeliveryAttempts)
 	e.WriteEvidence(t, "f5-ledger-outage-recovery.txt", []byte(fmt.Sprintf(
 		"job_id=%s state_before=%s state_after=%s delivery_attempts=%d->%d work_queue_drained=true\n"+
-			"delivery_settled records for THIS job since the outage began: %d (first on %s)\n"+
-			"An empty queue is the timing precondition; the settlement record is the evidence.\n",
+			"handler decided (delivery_settled for THIS job since the outage): %d (first on %s)\n"+
+			"broker settlement failures in the same window (any job):        %d (expected 0)\n"+
+			"work queue drained: yes (timing precondition, not the evidence)\n\n"+
+			"The handler's record says this job's duplicate was processed. The absence of\n"+
+			"delivery_settlement_failed says the broker learned the decision. They are\n"+
+			"different facts and neither one alone is the claim.\n",
 		jobID, before.State, after.State, before.DeliveryAttempts, after.DeliveryAttempts,
-		settlements, settledBy)))
+		settlements, settledBy, settlementFailures)))
 }
 
 // TestF5PendingWorkIsNotStrandedByABrokerOutage asserts a job registered while
