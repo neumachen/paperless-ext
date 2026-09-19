@@ -1723,7 +1723,7 @@ func durably(ctx context.Context) (context.Context, context.CancelFunc) {
 func (p *Pipeline) hold(ctx context.Context, job ledger.Job, cat jobs.Category, attempt int) Outcome {
 	ctx, cancel := durably(ctx)
 	defer cancel()
-	err := p.led.RecordHold(ctx, job.JobID, cat, attempt)
+	err := p.led.RecordHold(ctx, job.JobID, cat, attempt, p.cfg.PublishTakeoverAfter)
 	switch {
 	case err == nil:
 		return settled("held", jobs.StateHeld, cat)

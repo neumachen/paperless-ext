@@ -905,8 +905,21 @@ func TestA3UnreadableDestinationIsHeldNotRetriedForever(t *testing.T) {
 		t.Errorf("state %q, expected held", job.State)
 	}
 	cat := derefCategory(job)
-	if cat != string(jobs.CategoryDestinationConflict) && cat != string(jobs.CategoryRetryExhausted) {
-		t.Errorf("category %q, expected a destination conflict or an exhausted budget", cat)
+	// `permission_denied` belongs here too, and is the more useful answer.
+	//
+	// The destination is occupied by a file this process cannot read. The
+	// implementation used to report that as a generic destination conflict;
+	// it now reports the errno it actually got, which tells an operator to
+	// look at permissions rather than at a name collision. What this test is
+	// about is unchanged and still asserted below: the job is HELD rather
+	// than retried forever, the planted file survives untouched, and the
+	// retry is bounded.
+	switch cat {
+	case string(jobs.CategoryDestinationConflict),
+		string(jobs.CategoryRetryExhausted),
+		string(jobs.CategoryPermissionDenied):
+	default:
+		t.Errorf("category %q, expected a destination conflict, a permission failure or an exhausted budget", cat)
 	}
 	// The planted file must be untouched.
 	if _, err := os.Stat(occupied); err != nil {
