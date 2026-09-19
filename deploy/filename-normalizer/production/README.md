@@ -66,8 +66,14 @@ silently adopt different arguments.
 | `failed` | renamer | you | Recoverable quarantine. |
 
 The containers run as uid/gid **65532**. Every bound directory must be
-writable by that account, and `consume` must be writable by 65532 **and**
-readable by whatever uid Paperless runs as.
+writable by that account.
+
+`consume` is shared with Paperless and needs more than read access on both
+sides: Paperless **removes** the file once it has ingested it, so it needs
+write and execute on the directory, not merely read on the file. Where the two
+run as different uids, give the directory a group both belong to, mode 2775
+(setgid so new files inherit the group). A consumer that cannot remove what it
+ingested will re-ingest it.
 
 ### The consume directory has two users
 
@@ -92,9 +98,15 @@ FN_SECRET_DB_PASSWORD=/path/outside/this/repo/fn_db_password
 FN_SECRET_AMQP_PASSWORD=/path/outside/this/repo/fn_amqp_password
 ```
 
-Keep them outside the repository, mode 0400 to a directory the deploying user
-owns. Nothing in this package contains a credential, and the configuration
-schema has no field that could hold one.
+Keep them outside the repository. **Mode 0400 owned by the deploying user does
+not work**: the containers run as uid 65532 and a bind-mounted file keeps its
+host ownership and mode, so 0400 owned by anyone else is unreadable to them.
+Either make the files readable by 65532 (`chown 65532` , mode 0400) or use
+mode 0440 with a group 65532 belongs to. Verify by starting one service and
+confirming it reaches the database rather than assuming.
+
+Nothing in this package contains a credential, and the configuration schema
+has no field that could hold one.
 
 `FN_DB_SSLMODE` defaults to `require` here. Lower it only for a database on the
 same host.
@@ -125,17 +137,22 @@ docker run --rm --env-file ./prod.env \
     -v "$FN_HOST_CONFIG:/etc/fn/normalizer.json:ro" \
     "$FN_WATCHER_IMAGE" check-config
 
-# 3. apply the schema, as one deliberate run. The services in this manifest
-#    have FN_DB_APPLY_MIGRATIONS=false, so none of them will migrate on
-#    startup; this is the only thing that does.
-docker run --rm --env-file ./prod.env \
-    -e FN_DB_APPLY_MIGRATIONS=true -e FN_STORAGE_REQUIRED=false \
-    -e FN_DB_PASSWORD_FILE=/run/secrets/db -e FN_AMQP_PASSWORD_FILE=/run/secrets/amqp \
-    -v "$FN_SECRET_DB_PASSWORD:/run/secrets/db:ro" \
-    -v "$FN_SECRET_AMQP_PASSWORD:/run/secrets/amqp:ro" \
-    "$FN_WATCHER_IMAGE" check-config
+# 3. apply the schema. Migrations are applied by the WATCHER'S STARTUP PATH
+#    when FN_DB_APPLY_MIGRATIONS is true; there is no subcommand that applies
+#    them and `check-config` does not -- it loads the configuration, prints
+#    the effective view, and returns without touching the database.
+#
+#    So the first start IS the migration: bring the watcher up with the flag
+#    on, wait for it to report ready, then stop it.
+FN_DB_APPLY_MIGRATIONS=true \
+  docker compose -f compose.prod.yml --env-file ./prod.env up -d watcher
+docker compose -f compose.prod.yml --env-file ./prod.env logs -f watcher   # wait for "schema ready"
+docker compose -f compose.prod.yml --env-file ./prod.env stop watcher
 
-# 4. start
+# 4. confirm the schema the applications expect is the schema installed
+curl -s localhost:8080/healthz | jq '{schemaInstalled, schemaExpected}'
+
+# 5. start everything, with migrations off (the manifest's default)
 docker compose -f compose.prod.yml --env-file ./prod.env up -d
 ```
 
@@ -154,7 +171,7 @@ Stop the watcher only. Discovery stops; renamers finish what is already
 dispatched, and the broker retains anything queued.
 
 ```sh
-docker compose -f compose.prod.yml stop watcher
+docker compose -f compose.prod.yml --env-file ./prod.env stop watcher
 ```
 
 Resume by starting it again. Nothing is lost: submissions stay in `incoming`.
@@ -164,18 +181,19 @@ Resume by starting it again. Nothing is lost: submissions stay in `incoming`.
 Rolling, one renamer at a time; the watcher last.
 
 ```sh
-# 1. apply any new migrations FIRST, explicitly, with the new image
-docker run --rm --env-file ./prod.env \
-    -e FN_DB_APPLY_MIGRATIONS=true -e FN_STORAGE_REQUIRED=false \
-    -e FN_DB_PASSWORD_FILE=/run/secrets/db -e FN_AMQP_PASSWORD_FILE=/run/secrets/amqp \
-    -v "$FN_SECRET_DB_PASSWORD:/run/secrets/db:ro" \
-    -v "$FN_SECRET_AMQP_PASSWORD:/run/secrets/amqp:ro" \
-    "$FN_NEW_WATCHER_IMAGE" check-config
+# 1. apply any new migrations FIRST: stop the watcher, bring it back with the
+#    new image and the flag on, wait for ready, then continue.
+docker compose -f compose.prod.yml --env-file ./prod.env stop watcher
+FN_WATCHER_IMAGE=$FN_NEW_WATCHER_IMAGE FN_DB_APPLY_MIGRATIONS=true \
+  docker compose -f compose.prod.yml --env-file ./prod.env up -d watcher
 # 2. replace renamers one at a time, waiting for health between them
-FN_RENAMER_IMAGE=$FN_NEW_RENAMER_IMAGE docker compose -f compose.prod.yml up -d --no-deps renamer-1
+FN_RENAMER_IMAGE=$FN_NEW_RENAMER_IMAGE \
+  docker compose -f compose.prod.yml --env-file ./prod.env up -d --no-deps renamer-1
 # ... wait for healthy, then renamer-2
 # 3. replace the watcher
-FN_RENAMER_IMAGE=$FN_NEW_RENAMER_IMAGE docker compose -f compose.prod.yml up -d --no-deps watcher
+# The WATCHER image variable, not the renamer's.
+FN_WATCHER_IMAGE=$FN_NEW_WATCHER_IMAGE \
+  docker compose -f compose.prod.yml --env-file ./prod.env up -d --no-deps watcher
 ```
 
 A renamer whose policy identity differs from a job's holds that job as
@@ -191,10 +209,11 @@ rollback is a restore (below), not an image change.
 
 ```sh
 # 1. stop intake
-docker compose -f compose.prod.yml stop watcher
+docker compose -f compose.prod.yml --env-file ./prod.env stop watcher
 # 2. let renamers drain (watch fn_deliveries_in_flight reach 0)
 # 3. put the previous image back, renamers first, then the watcher
-FN_WATCHER_IMAGE=$FN_PREV_WATCHER_IMAGE FN_RENAMER_IMAGE=$FN_PREV_RENAMER_IMAGE docker compose -f compose.prod.yml up -d
+FN_WATCHER_IMAGE=$FN_PREV_WATCHER_IMAGE FN_RENAMER_IMAGE=$FN_PREV_RENAMER_IMAGE \
+  docker compose -f compose.prod.yml --env-file ./prod.env up -d
 ```
 
 Files and durable state are preserved throughout: no procedure here deletes a
@@ -268,6 +287,7 @@ supplied. See the decision packet in the final report.
 
 | Item | Status |
 |---|---|
+| Proof that an intended share is mounted | **UNRESOLVED** — `FN_STORAGE_REQUIRED` checks that each root is present and usable, which a writable LOCAL mountpoint also satisfies. It does not prove the NAS is mounted there rather than the empty directory underneath it. Check the mount separately before starting |
 | Alert receivers | **UNRESOLVED** — no notification target supplied |
 | Storage capacity alerting | **UNRESOLVED** — the application exports no free-space metric; must come from node-level monitoring |
 | Production naming acceptance | **OWNER DECISION** — the policy is a documented candidate |

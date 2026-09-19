@@ -30,9 +30,15 @@ x-app-env: &app-env
   FN_DB_PASSWORD_FILE: /run/secrets/fn_db_password
   # TLS to the database is required wherever the database is not on this host.
   FN_DB_SSLMODE: ${FN_DB_SSLMODE:-require}
-  # Migrations are applied by an explicit operator step, never by a service
-  # coming up. See README, "Upgrades".
-  FN_DB_APPLY_MIGRATIONS: "false"
+  # Off by default, so no service silently migrates on an ordinary start.
+  #
+  # Substitutable, because the ONLY thing that applies migrations is the
+  # watcher's startup path -- there is no subcommand that does it, and
+  # `check-config` does not touch the database. Hardcoding this to "false"
+  # made the documented first-start procedure a no-op: the override was
+  # ignored, the schema was never applied, and the deployment came up healthy
+  # against an empty database. See README, "First start".
+  FN_DB_APPLY_MIGRATIONS: ${FN_DB_APPLY_MIGRATIONS:-false}
 
   FN_AMQP_HOST: ${FN_AMQP_HOST:?set the RabbitMQ host}
   FN_AMQP_PORT: ${FN_AMQP_PORT:-5672}
@@ -114,7 +120,11 @@ services:
     ports:
       - "127.0.0.1:${FN_WATCHER_HEALTH_PORT:-8080}:8080"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/fn-watcher", "probe", "--once", "http://127.0.0.1:8080"]
+      # `healthcheck` asks the RUNNING process over its own HTTP surface.
+      # `probe --once` was invented: probe takes no such flag, so every
+      # healthcheck in this file failed to parse and the services would never
+      # have become healthy.
+      test: ["CMD", "/usr/local/bin/fn-watcher", "healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 4
@@ -137,7 +147,7 @@ services:
     ports:
       - "127.0.0.1:${FN_RENAMER1_HEALTH_PORT:-8081}:8080"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/fn-renamer", "probe", "--once", "http://127.0.0.1:8080"]
+      test: ["CMD", "/usr/local/bin/fn-renamer", "healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 4
