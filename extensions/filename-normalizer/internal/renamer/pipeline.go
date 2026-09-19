@@ -805,6 +805,18 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 
 	switch {
 	case published:
+		// The document is visible NOW, and only now. `hold_after_link` pauses
+		// here so a real consumer has a genuine chance to take it before the
+		// read-back below -- which is what that fault point has always been
+		// for, and what makes "the destination was gone when we looked" an
+		// observation rather than a simulation. Before the reveal there was
+		// nothing for a consumer to take, so pausing there measured nothing.
+		//
+		// It pauses BEFORE the cleanup, so the window it opens is the one
+		// where a post-publication operation can be made to fail. Pausing
+		// after the cleanup left nothing after it to fail.
+		p.faults.Pause(config.FaultHoldAfterLink, log)
+
 		// Cleanup, on a document that is already published. A failure here is
 		// reported and changes nothing about the publication.
 		if _, rerr := dir.RemoveOwned(filepath.Base(tmp), staged); rerr != nil {
@@ -812,13 +824,6 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 				slog.String("event", "staged_link_left_behind"),
 				slog.String("error_kind", storage.RejectionCategory(rerr)))
 		}
-		// The document is visible NOW, and only now. `hold_after_link` pauses
-		// here so a real consumer has a genuine chance to take it before the
-		// read-back below -- which is what that fault point has always been
-		// for, and what makes "the destination was gone when we looked" an
-		// observation rather than a simulation. Before the reveal there was
-		// nothing for a consumer to take, so pausing there measured nothing.
-		p.faults.Pause(config.FaultHoldAfterLink, log)
 
 		size, fp := stagedSize, stagedSum
 		_ = fp
