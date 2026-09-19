@@ -94,6 +94,7 @@ restore() {
         exit 1
     fi
     report_keep
+    report_restored
     note "restored: ordinary renamers ready, fault services removed"
 }
 

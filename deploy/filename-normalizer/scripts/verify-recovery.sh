@@ -190,8 +190,20 @@ PLANTED_PATH=""
 PLANTED_INODE=""
 cleanup_planted() {
     if [ -z "$PLANTED_PATH" ]; then return 0; fi
-    _cp_now="$(in_storage "ls -i '$PLANTED_PATH' 2>/dev/null | awk '{print \$1}'")"
-    if [ -z "$_cp_now" ]; then
+    # Absence and "could not look" are different answers, and this treated them
+    # the same: an in_storage call that failed for any reason returned an empty
+    # string, which was read as "the file is already gone" and threw away the
+    # only record that this run had written a file into the real consume
+    # directory. The inspection reports which of the two it saw.
+    _cp_probe="$(in_storage "if [ -e '$PLANTED_PATH' ]; then ls -i '$PLANTED_PATH' | awk '{print \$1}'; else echo ABSENT; fi; echo OK")"
+    case "$_cp_probe" in
+        *OK) ;;
+        *)  echo "error: could not inspect $PLANTED_PATH; keeping its ownership record." >&2
+            printf '\nPLANTED FILE NOT INSPECTABLE: %s inode %s\n' "$PLANTED_PATH" "$PLANTED_INODE" >> "$OUT"
+            return 1 ;;
+    esac
+    _cp_now="${_cp_probe%OK}"
+    if [ "$_cp_now" = "ABSENT" ]; then
         PLANTED_PATH=""; PLANTED_INODE=""
         return 0
     fi
@@ -315,6 +327,7 @@ restore() {
         printf '\nRESTORATION FAILED — see the values above.\n' >> "$OUT"
         exit 1
     fi
+    report_restored
     note "restored: all application services on $NET and reporting themselves READY"
 }
 
@@ -440,6 +453,9 @@ emit "   after recovery:               $RECOVERED2   (expected uncertain: a publ
 # like. So the message is republished onto the real queue and the disposition
 # of that delivery is read out of the job's own history.
 DELIV_BEFORE2="$(psqlq "SELECT count(*) FROM job_events e WHERE e.job_id = '$JOB2' AND e.event_type = 'delivery_received';")"
+# Settlements this job has already had, before anything new is injected.
+SETTLED2_BEFORE="$(compose logs --since 10m renamer-1 renamer-2 2>/dev/null \
+    | grep "$JOB2" | grep -c 'delivery_settled' || true)"
 EVENTS_BEFORE2="$(psqlq "SELECT count(*) FROM job_events e WHERE e.job_id = '$JOB2';")"
 compose exec -T rabbitmq rabbitmqadmin \
     --vhost "${FN_AMQP_VHOST:-filename-normalizer}" \
@@ -468,8 +484,16 @@ NEWEVENTS2="$(psqlq "SELECT string_agg(event_type, ',' ORDER BY event_id) FROM (
 # it first -- so a pattern requiring the event BEFORE the id matched nothing
 # and reported "0 settlement lines" for deliveries that had settled perfectly
 # well. Both must be present; neither order is promised.
-SETTLED2="$(compose logs --since 5m renamer-1 renamer-2 2>/dev/null \
-    | grep "$JOB2" | grep -c 'delivery_settled' || true)"
+# Counted ACROSS the injection, not cumulatively.
+#
+# This job has already settled at least one delivery before the new one is
+# published -- the recovery that recorded `uncertain` settled its own. Counting
+# every settlement for the job therefore reports a number greater than zero
+# whether or not the injected delivery was ever acknowledged, which is the same
+# mistake as reading silence as acknowledgement, one step along. The count is
+# taken before the injection and compared after it.
+SETTLED2="$(( $(compose logs --since 10m renamer-1 renamer-2 2>/dev/null \
+    | grep "$JOB2" | grep -c 'delivery_settled' || true) - ${SETTLED2_BEFORE:-0} ))"
 PUBLISHED2B="$(in_storage "test -f '/srv/fn/consume/$NAME2' && echo yes || echo no")"
 
 emit "   a later delivery was published to the real queue: $REPUB2"
@@ -498,7 +522,7 @@ READY2="$(queue_field "${FN_AMQP_QUEUE:-filename_normalizer.jobs.v1}" messages_r
 # The settlement the handler logs FOR THIS JOB is the observation; the absence
 # of a redelivery is corroboration, not evidence.
 if [ "${SETTLED2:-0}" -ge 1 ]; then
-    DISPOSITION2="settled (the handler logged $SETTLED2 settlement(s) for this job)"
+    DISPOSITION2="settled (the handler logged $SETTLED2 NEW settlement(s) for this job,\n                                 on top of the ${SETTLED2_BEFORE:-0} it already had)"
 elif [ "${DELIV_SETTLE_B:-0}" -gt "${DELIV_SETTLE_A:-0}" ]; then
     DISPOSITION2="requeued (the delivery came back)"
 else
@@ -518,7 +542,7 @@ emit "   destination after it:         $PUBLISHED2B   (expected no: nothing was 
 [ "$STATE2B" = "uncertain" ] || bad "an uncertain job was reopened to '$STATE2B' by a later delivery"
 [ "$PUBLISHED2B" = "no" ] || bad "a later delivery of an uncertain job published a document"
 [ "${DELIV_SETTLE_B:-0}" = "${DELIV_SETTLE_A:-0}" ] || bad "the delivery came back ($DELIV_SETTLE_A -> $DELIV_SETTLE_B): it was requeued, not settled"
-[ "${SETTLED2:-0}" -ge 1 ] || bad "no settlement was observed for this job; acknowledgement is not established by the absence of a redelivery"
+[ "${SETTLED2:-0}" -ge 1 ] || bad "no NEW settlement was observed for the injected delivery; acknowledgement is not established by the absence of a redelivery, nor by an earlier delivery's settlement"
 case "${NEWEVENTS2:-}" in
     *reserved*|*publish_attempted*|*delivered*) bad "a later delivery of an uncertain job did real work: $NEWEVENTS2" ;;
 esac
@@ -1003,6 +1027,10 @@ esac
 [ "${TINY_SIZE7:-unknown}" != "unknown" ] || bad "the failing filesystem could not be inspected, so what it left behind is unobserved"
 [ "${TINY_SIZE7:-0}" -le 4096 ] 2>/dev/null || bad "the inspected filesystem is ${TINY_SIZE7} KiB, not the small one this scenario fills"
 [ "${NOSPACE7:-0}" -ge 1 ] || bad "no storage_full failure was logged; this run did not exercise ENOSPC"
+# Enforced, not merely printed. A partial .work file left in the filesystem that
+# ran out of space is the failure this scenario exists to catch; reporting the
+# number and asserting nothing about it made the whole accounting decorative.
+[ "${TINY_LEFT7:-1}" = "0" ] || bad "$TINY_LEFT7 partial .work file(s) were left in the filesystem that ran out of space"
 drop_fault renamer-tinyfs
 emit ""
 
@@ -1088,9 +1116,16 @@ PERM_BEFORE="$(in_storage "stat -c '%a:%u:%g' $PERM_ROOT 2>/dev/null || echo unk
 # what it restores to.
 PERM_TOUCHED=1
 PERM_TOUCHED_OK=0
-if [ "$PERM_BEFORE" = "unknown" ]; then
-    bad "the consume root's mode and owner could not be read; not revoking anything"
+# An unreadable baseline is a reason NOT to revoke, and the run used to say so
+# and then revoke anyway -- leaving the destination root-owned and 0555 with no
+# captured value to put back, which restoration then refused to guess at. It is
+# a hard stop for this scenario now; the rest of the run continues.
+PERM_SCENARIO_OK=1
+if [ "$PERM_BEFORE" = "unknown" ] || [ -z "$PERM_BEFORE" ]; then
+    bad "the consume root's mode and owner could not be read; refusing to revoke anything"
     PERM_BEFORE=""
+    PERM_TOUCHED=0
+    PERM_SCENARIO_OK=0
 fi
 
 submit "$DOC8" 4096
@@ -1110,9 +1145,12 @@ PAUSED8="$(compose --profile fault logs renamer-permdenied 2>/dev/null | grep -c
 [ -n "$HOLDER8" ] || bad "the attempt never reached the publication boundary, so nothing could be denied there"
 [ "${PAUSED8:-0}" -ge 1 ] || bad "the attempt never paused, so the mode change could not land inside its publication"
 
-# Revoke write, as root, on a directory the renamer does not own.
-compose run --rm --no-deps -T --user 0 --entrypoint sh storage-init \
-    -c "chown 0:0 $PERM_ROOT && chmod 0555 $PERM_ROOT" >/dev/null 2>&1 && PERM_TOUCHED_OK=1
+# Revoke write, as root, on a directory the renamer does not own -- but only if
+# there is a captured baseline to put back afterwards.
+if [ "${PERM_SCENARIO_OK:-1}" = "1" ]; then
+    compose run --rm --no-deps -T --user 0 --entrypoint sh storage-init \
+        -c "chown 0:0 $PERM_ROOT && chmod 0555 $PERM_ROOT" >/dev/null 2>&1 && PERM_TOUCHED_OK=1
+fi
 MODE_AFTER8="$(in_storage "stat -c '%a-uid%u' $PERM_ROOT 2>/dev/null || echo unknown")"
 
 STATE8="$(await_state "$DOC8" "delivered held uncertain" 240)"
@@ -1505,7 +1543,16 @@ while [ "$_i" -lt 90 ]; do
     sleep 2; _i=$((_i + 2))
 done
 REVOKED12=no
-if [ "$LINKED12" = "yes" ]; then
+if [ "$LINKED12" = "yes" ] && [ -n "$PERM_BEFORE" ]; then
+    # Rearm restoration tracking BEFORE revoking.
+    #
+    # Scenario 8's restore_perm clears PERM_TOUCHED on success, so by the time
+    # this scenario revokes the same directory the flag says "this run has not
+    # touched the permissions". A failure or an interruption between here and
+    # the inline restore below would then leave the destination root-owned and
+    # 0555 with restoration switched off. The flag is set first, and the
+    # captured baseline from scenario 8 is what both paths restore to.
+    PERM_TOUCHED=1
     compose run --rm --no-deps -T --user 0 --entrypoint sh storage-init \
         -c "chown 0:0 $PERM_ROOT && chmod 0555 $PERM_ROOT" >/dev/null 2>&1 && REVOKED12=yes
 fi
@@ -1516,9 +1563,9 @@ CAT12="$(psqlq "SELECT coalesce(failure_category,'-') FROM jobs WHERE source_nam
 PRESENT12="$(in_storage "test -f '/srv/fn/consume/$NAME12' && echo yes || echo no")"
 STRANDED12="$(compose --profile fault logs renamer-fault 2>/dev/null | grep -c 'staged_link_left_behind' || true)"
 
-# Give the permissions back before anything else runs.
-compose run --rm --no-deps -T --user 0 --entrypoint sh storage-init \
-    -c "chown ${PERM_BEFORE#*:} $PERM_ROOT; chmod ${PERM_BEFORE%%:*} $PERM_ROOT" >/dev/null 2>&1 || true
+# Give the permissions back through the same helper the restore trap uses, so
+# there is one implementation of "put it back and check that it went back".
+restore_perm || bad "the destination permissions could not be restored after the post-link failure"
 PERM_NOW12="$(in_storage "stat -c '%a:%u:%g' $PERM_ROOT 2>/dev/null || echo unknown")"
 
 emit "12. a real failure AFTER a successful link"

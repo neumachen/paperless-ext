@@ -203,6 +203,7 @@ restore() {
         printf '\nRESTORATION FAILED — see the values above.\n' >> "$OUT"
         exit 1
     fi
+    report_restored
     note "restored: config_file=$_r_cfg consume=$_r_consume policy=$_r_id"
 }
 

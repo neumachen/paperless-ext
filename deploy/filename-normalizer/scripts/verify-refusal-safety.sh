@@ -413,5 +413,7 @@ if [ "$FAILURES" -ne 0 ]; then
 fi
 
 report_success
+report_restored
+report_keep
 log "PASSED: refusals are non-mutating and cleanup respects ownership"
 note "evidence: $OUT"
