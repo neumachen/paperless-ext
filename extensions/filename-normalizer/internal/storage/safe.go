@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1043,32 +1044,40 @@ func (d *Dir) CreateFrom(src *os.File, name string, perm os.FileMode) (*os.File,
 	return f, got, sum, size, nil
 }
 
-// FindStagedFor returns the name of a staged temporary this job left in this
-// directory, or "" when there is none.
+// FindStagedFor returns every staged temporary this job left in this
+// directory, sorted, or an empty slice when there are none.
+//
+// Every one, not the first: staging happens before the publication claim, so a
+// job can legitimately have more than one -- an attempt that staged and then
+// died before claiming leaves one behind. Picking whichever the directory
+// listed first chose a file no attempt was authorised to publish, and said
+// nothing about its contents.
 //
 // Publication stages a dotfile named for the job and reveals it by renaming.
 // A process that dies between committing the receipt and revealing leaves that
 // dotfile behind: the document is present, authorised and invisible. Recovery
 // needs to find it to finish the publication, and the job id in the name is
 // what makes that possible without a second durable record.
-func (d *Dir) FindStagedFor(jobID string) (string, error) {
+func (d *Dir) FindStagedFor(jobID string) ([]string, error) {
 	if strings.ContainsAny(jobID, "/\x00") || jobID == "" {
-		return "", fmt.Errorf("%w: %q is not a job id", ErrUnsafeName, jobID)
+		return nil, fmt.Errorf("%w: %q is not a job id", ErrUnsafeName, jobID)
 	}
 	names, err := d.f.Readdirnames(-1)
 	if _, serr := d.f.Seek(0, io.SeekStart); serr != nil && err == nil {
 		err = serr
 	}
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	prefix := tempPrefixStaged + jobID + "."
+	var out []string
 	for _, n := range names {
 		if strings.HasPrefix(n, prefix) && strings.HasSuffix(n, ".tmp") {
-			return n, nil
+			out = append(out, n)
 		}
 	}
-	return "", nil
+	sort.Strings(out)
+	return out, nil
 }
 
 // tempPrefixStaged is the prefix the renamer gives a staged publication. It is
@@ -1077,53 +1086,49 @@ func (d *Dir) FindStagedFor(jobID string) (string, error) {
 // through the real path and then looks for the name here.
 const tempPrefixStaged = ".fn-"
 
-// RevealNoReplace makes an already-staged file visible under its final name,
-// atomically, and never over an existing entry.
+// RevealFromDescriptor makes the bytes behind an open, verified descriptor
+// visible under their final name, and reports whether that happened
+// separately from whether everything after it did.
 //
-// # Why publication is a rename now, and why it is last
+// # Why a descriptor and not a rename
 //
-// Publication used to be a link from the staged temporary to the final name,
-// followed by the durable receipt. That order put a real, consumable document
-// into the consumer's directory BEFORE this attempt had established it was
-// still allowed to publish, and Paperless polls that directory every second.
-// When the receipt was then refused -- because a sibling had closed the job
-// while this attempt was slow -- the document was removed again, but removal
-// is an apology: the consumer may already have taken it.
+// The first version of this renamed the staged pathname. That re-resolved a
+// name: whatever the staged name pointed at AT THE MOMENT OF THE RENAME became
+// the published document, so replacing that entry after its contents were
+// verified published different bytes -- or a symlink -- while the receipt
+// described the file that had been checked. Linking from the descriptor
+// publishes the inode those bytes were read from, by construction, and there
+// is no second resolution to lose a race in.
 //
-// The order is inverted. The staged temporary is a dotfile in the destination
-// directory, hard-linked to the verified bytes, and the consumer ignores
-// dotfiles; it is a publication that is not yet visible. The receipt is
-// committed first, and only then is this called to make the document visible
-// under its real name.
+// # Why `published` is not an errno
 //
-// That gives one invariant, which the recovery path depends on: a consumer-
-// visible file at a job's reserved name implies a committed receipt for that
-// job. It does NOT claim that the filesystem and the database change together
-// -- they cannot, and every failure between them is handled by leaving the
-// document hidden rather than by pretending otherwise.
+// The rename version also returned one error for two opposite facts. A
+// directory sync failing AFTER a successful rename looked identical to a
+// refusal BEFORE it, and the caller -- reading `err != nil` as "nothing was
+// published" -- could withdraw the receipt for a document that was already
+// visible, and possibly already consumed. The link either created the
+// directory entry or it did not, and only this function knows which.
 //
-// RENAME_NOREPLACE because the destination must never be overwritten, and
-// because a check followed by a rename is two operations with a gap.
-func (d *Dir) RevealNoReplace(fromName, toName string) error {
-	if err := checkLeaf(fromName); err != nil {
-		return err
+// The staged temporary is NOT removed here. Removing it is cleanup, it happens
+// to a document that is already published, and its failure must never be
+// mistaken for a failed publication.
+func (d *Dir) RevealFromDescriptor(src *os.File, toName string) (published bool, err error) {
+	if src == nil {
+		return false, errors.New("reveal: no verified descriptor")
 	}
 	if err := checkLeaf(toName); err != nil {
-		return err
+		return false, err
 	}
-	switch err := renameatNoReplace(int(d.f.Fd()), fromName, int(d.f.Fd()), toName); {
-	case err == nil:
-	case errors.Is(err, syscall.EEXIST):
-		return fmt.Errorf("%w: %s", ErrDestinationExists, toName)
-	default:
-		return &os.PathError{Op: "renameat2", Path: filepath.Join(d.root, toName), Err: err}
+	if lerr := d.LinkFromDescriptor(src, toName); lerr != nil {
+		// ErrDestinationExists included: nothing was created.
+		return false, lerr
 	}
-	// The directory entry is what the consumer sees, so it is what has to
-	// reach the disk. A failure here does not unpublish anything.
-	if err := d.f.Sync(); err != nil {
-		return fmt.Errorf("sync destination directory after publication: %w", err)
+	// From here the document IS visible. Everything below is reported, never
+	// reclassified as a failure to publish.
+	if serr := d.f.Sync(); serr != nil {
+		return true, fmt.Errorf("sync destination directory after publication: %w", serr)
 	}
-	return nil
+	return true, nil
 }
 
 // LinkAt promotes one name in this directory to another, never replacing an

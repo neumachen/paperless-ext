@@ -807,6 +807,56 @@ func (l *Ledger) WithdrawPublicationReceipt(ctx context.Context, jobID string, d
 	})
 }
 
+// RecordUncertainWithReceipt records uncertainty for a job whose publication
+// was AUTHORISED but cannot be confirmed.
+//
+// RecordUncertain refuses a job that holds a receipt, which was right when a
+// receipt meant the document had been published. The receipt is committed
+// before the reveal now, so "a receipt exists and the document cannot be
+// found" is a real state and it is exactly an uncertain one: it may have been
+// revealed and taken, or never revealed at all, and nothing on the filesystem
+// distinguishes those.
+//
+// The receipt is kept deliberately. It records that a publication was
+// authorised and which file it was about, and a person resolving this by hand
+// needs both.
+func (l *Ledger) RecordUncertainWithReceipt(ctx context.Context, jobID string, category jobs.Category, attempt int) error {
+	return l.tx(ctx, func(tx pgx.Tx) error {
+		ct, err := tx.Exec(ctx, `
+			UPDATE jobs
+			   SET state = 'uncertain',
+			       failure_category = $2,
+			       terminal_at = COALESCE(terminal_at, now()),
+			       publish_claimed_by = NULL,
+			       updated_at = now()
+			 WHERE job_id = $1
+			   AND state = 'publishing'
+			   AND EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = $1)`,
+			jobID, string(category))
+		if err != nil {
+			return err
+		}
+		if ct.RowsAffected() == 0 {
+			var state string
+			if qerr := tx.QueryRow(ctx, `SELECT state FROM jobs WHERE job_id = $1`, jobID).Scan(&state); qerr != nil {
+				if errors.Is(qerr, pgx.ErrNoRows) {
+					return ErrNotFound
+				}
+				return qerr
+			}
+			return fmt.Errorf("%w: job is %s", ErrOutcomeAlreadyRecorded, state)
+		}
+		return l.appendEvent(ctx, tx, eventInput{
+			JobID:     jobID,
+			EventType: jobs.EventUncertain,
+			ToState:   ptr(string(jobs.StateUncertain)),
+			Category:  ptr(string(category)),
+			Attempt:   ptr(attempt),
+			Detail:    map[string]any{"receipt_retained": true},
+		})
+	})
+}
+
 // RecordUncertain marks a job whose publication could not be established.
 //
 // This is a terminal state without intervention, and deliberately so. The

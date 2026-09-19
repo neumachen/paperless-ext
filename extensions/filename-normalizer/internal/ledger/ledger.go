@@ -530,11 +530,19 @@ func (l *Ledger) BeginDelivery(ctx context.Context, jobID string, attempt int, r
 // exists. A consumer acknowledgement is issued only after this commit returns.
 func (l *Ledger) RecordHold(ctx context.Context, jobID string, category jobs.Category, attempt int) error {
 	err := l.tx(ctx, func(tx pgx.Tx) error {
-		// A stale attempt must not demote a newer outcome. Without the state
-		// guard, an attempt that failed slowly could overwrite `delivered`
-		// with `held` after another attempt had already published the
-		// document and written its receipt, leaving the state and the receipt
-		// contradicting each other.
+		// A stale attempt must not demote a newer outcome, and it must not
+		// close a publication that is already authorised.
+		//
+		// The state guard alone was not enough once the receipt began to
+		// precede the reveal. A redelivered sibling -- a policy mismatch, a
+		// late failure -- could take a job from `publishing` to `held` while
+		// the original publisher was paused between its committed receipt and
+		// its reveal. The publisher then resumed, made the document visible,
+		// and was refused its final state: a document in the consumer's
+		// directory for a job recorded `held`.
+		//
+		// A committed receipt therefore blocks a hold outright. The caller
+		// settles against what actually stands instead.
 		tag, err := tx.Exec(ctx, `
 			UPDATE jobs
 			   SET state = 'held',
@@ -542,7 +550,9 @@ func (l *Ledger) RecordHold(ctx context.Context, jobID string, category jobs.Cat
 			       terminal_at = COALESCE(terminal_at, now()),
 			       updated_at = now()
 			 WHERE job_id = $1
-			   AND state NOT IN ('delivered','uncertain')`, jobID, string(category))
+			   AND state NOT IN ('delivered','uncertain')
+			   AND NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.job_id = $1)`,
+			jobID, string(category))
 		if err != nil {
 			return err
 		}
