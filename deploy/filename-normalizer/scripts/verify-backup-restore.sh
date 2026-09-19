@@ -129,16 +129,23 @@ compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" post
     </dev/null > "$EVIDENCE_DIR/.fn-backup-$$.dump" 2>/dev/null && DUMP_OK=yes
 DUMP_BYTES="$(wc -c < "$EVIDENCE_DIR/.fn-backup-$$.dump" 2>/dev/null | tr -d ' ')"
 
-TAR_OK=no
-docker run --rm -v "${PROJECT}_fn-consume:/consume:ro" -v "$BACKUP_VOL:/backup" \
-    "$UTIL_IMAGE" sh -c 'tar -cf /backup/consume.tar -C /consume . && echo ok' >/dev/null 2>&1 && TAR_OK=yes
+# Every storage role, not just consume. A backup that omits incoming, staging
+# and failed cannot restore the system: the sources are in incoming, the
+# quarantined work is in failed, and an interrupted publication's temporary is
+# in staging.
+TAR_OK=yes
+for _role in consume incoming staging failed; do
+    docker run --rm -v "${PROJECT}_fn-${_role}:/role:ro" -v "$BACKUP_VOL:/backup" \
+        "$UTIL_IMAGE" sh -c "tar -cf /backup/${_role}.tar -C /role ." >/dev/null 2>&1 \
+        || TAR_OK=no
+done
 TAR_BYTES="$(docker run --rm -v "$BACKUP_VOL:/backup" "$UTIL_IMAGE" \
-    sh -c 'wc -c < /backup/consume.tar' 2>/dev/null | tr -d ' \r\n')"
+    sh -c 'cat /backup/*.tar | wc -c' 2>/dev/null | tr -d ' \r\n')"
 
 emit ""
 emit "2. the backup"
 emit "   database dump written:        $DUMP_OK   (${DUMP_BYTES:-0} bytes)"
-emit "   document archive written:     $TAR_OK   (${TAR_BYTES:-0} bytes)"
+emit "   role archives written:        $TAR_OK   (consume, incoming, staging, failed; ${TAR_BYTES:-0} bytes)"
 [ "$DUMP_OK" = "yes" ] || bad "the database dump failed"
 [ "$TAR_OK" = "yes" ] || bad "the document archive failed"
 
@@ -170,7 +177,11 @@ else
 fi
 RESTORE_FS_OK=no
 docker run --rm -v "$BACKUP_VOL:/backup:ro" -v "$RESTORE_VOL:/restored" \
-    "$UTIL_IMAGE" sh -c 'tar -xf /backup/consume.tar -C /restored && echo ok' >/dev/null 2>&1 && RESTORE_FS_OK=yes
+    "$UTIL_IMAGE" sh -c 'mkdir -p /restored/consume /restored/incoming /restored/staging /restored/failed &&
+        tar -xf /backup/consume.tar  -C /restored/consume  &&
+        tar -xf /backup/incoming.tar -C /restored/incoming &&
+        tar -xf /backup/staging.tar  -C /restored/staging  &&
+        tar -xf /backup/failed.tar   -C /restored/failed' >/dev/null 2>&1 && RESTORE_FS_OK=yes
 
 emit ""
 emit "3. the restore, into a target this run created"
@@ -187,17 +198,34 @@ R_JOBS="$(psqlq "SELECT count(*) FROM jobs;" "$RESTORE_DB")"
 R_RECEIPTS="$(psqlq "SELECT count(*) FROM delivery_receipts;" "$RESTORE_DB")"
 R_UNCERTAIN="$(psqlq "SELECT count(*) FROM jobs WHERE state = 'uncertain';" "$RESTORE_DB")"
 R_CONSUME="$(docker run --rm -v "$RESTORE_VOL:/restored:ro" "$UTIL_IMAGE" \
-    sh -c 'ls -1 /restored 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r\n')"
-R_SAMPLE_SUM="$(docker run --rm -v "$RESTORE_VOL:/restored:ro" -e FN_S="/restored/$SAMPLE" "$UTIL_IMAGE" \
+    sh -c 'ls -1 /restored/consume 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r\n')"
+R_SAMPLE_SUM="$(docker run --rm -v "$RESTORE_VOL:/restored:ro" -e FN_S="/restored/consume/$SAMPLE" "$UTIL_IMAGE" \
     sh -c 'if [ -e "$FN_S" ]; then sha256sum "$FN_S" | cut -d" " -f1; else echo absent; fi' 2>/dev/null | tr -d ' \r\n')"
 # The reconciliation that matters: every receipt in the restored ledger whose
 # document should be present has it, in the restored filesystem.
-docker run --rm -v "$RESTORE_VOL:/restored:ro" "$UTIL_IMAGE" sh -c 'ls -1 /restored' 2>/dev/null \
+docker run --rm -v "$RESTORE_VOL:/restored:ro" "$UTIL_IMAGE" sh -c 'ls -1 /restored/consume' 2>/dev/null \
     | tr -d '\r' | sort > "$EVIDENCE_DIR/.restored-names-$$"
 psqlq "SELECT delivered_name FROM delivery_receipts;" "$RESTORE_DB" | sed '/^$/d' | sort \
     > "$EVIDENCE_DIR/.restored-receipts-$$"
 MISSING="$(comm -23 "$EVIDENCE_DIR/.restored-receipts-$$" "$EVIDENCE_DIR/.restored-names-$$" | wc -l | tr -d ' ')"
-rm -f "$EVIDENCE_DIR/.restored-names-$$" "$EVIDENCE_DIR/.restored-receipts-$$"
+
+# Which absences the ledger EXPLAINS.
+#
+# Printing a number and passing established nothing: 94 receipts had no
+# document and the run reported success. An absence is legitimate when the
+# ledger says the file was observed gone -- a consumer took it, which is the
+# ordinary case and is recorded as absent_observed_at. An absence the ledger
+# cannot explain is missing state, and that is what this has to catch.
+comm -23 "$EVIDENCE_DIR/.restored-receipts-$$" "$EVIDENCE_DIR/.restored-names-$$" \
+    > "$EVIDENCE_DIR/.restored-missing-$$"
+UNEXPLAINED=0
+if [ -s "$EVIDENCE_DIR/.restored-missing-$$" ]; then
+    _explained="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE absent_observed_at IS NOT NULL;" "$RESTORE_DB")"
+    _all_missing="$(wc -l < "$EVIDENCE_DIR/.restored-missing-$$" | tr -d ' ')"
+    UNEXPLAINED=$((_all_missing - ${_explained:-0}))
+    [ "$UNEXPLAINED" -lt 0 ] && UNEXPLAINED=0
+fi
+rm -f "$EVIDENCE_DIR/.restored-names-$$" "$EVIDENCE_DIR/.restored-receipts-$$" "$EVIDENCE_DIR/.restored-missing-$$"
 
 emit ""
 emit "4. the restored halves, reconciled against each other"
@@ -207,8 +235,31 @@ emit "   uncertain jobs:               $R_UNCERTAIN   (live: $LIVE_UNCERTAIN)"
 emit "   entries in consume:           $R_CONSUME   (live: $LIVE_CONSUME)"
 emit "   sample document sha256:       ${R_SAMPLE_SUM:-none}"
 emit "   receipts whose document is missing from the restored filesystem: $MISSING"
-emit "     (some are expected: a consumer legitimately takes delivered files,"
-emit "      and this compares a ledger and a directory captured moments apart)"
+emit "     of those, EXPLAINED by the ledger (absent_observed_at set):      $((MISSING - UNEXPLAINED))"
+emit "     UNEXPLAINED (missing state, not consumption):                    $UNEXPLAINED"
+# Baselined, not asserted at zero.
+#
+# This stack has carried months of exercises, several of which deliberately
+# remove a delivered document out-of-band -- a consumer taking it, a planted
+# intruder being cleared, a scenario named CONSUMED. Those removals are real
+# and the ledger has no reason to have noticed them, so demanding zero here
+# would fail forever on history rather than on anything happening now.
+#
+# What matters is that the number does not GROW. The first run records it; any
+# later run that finds more unexplained absences has found missing state.
+UNEXPLAINED_BASELINE="$EVIDENCE_DIR/unexplained-absences-baseline.txt"
+if [ ! -f "$UNEXPLAINED_BASELINE" ]; then
+    printf '%s\n' "$UNEXPLAINED" > "$UNEXPLAINED_BASELINE"
+    emit "     baseline recorded on this run:                                  $UNEXPLAINED"
+    emit "     (no preservation claim follows from this run; it establishes the baseline)"
+else
+    _base="$(tr -d ' \r\n' < "$UNEXPLAINED_BASELINE")"
+    emit "     baseline from an earlier run:                                   ${_base:-unknown}"
+    case "$_base" in
+        ''|*[!0-9]*) bad "the unexplained-absence baseline is unreadable, so nothing is established" ;;
+        *) [ "$UNEXPLAINED" -le "$_base" ] || bad "unexplained absences rose from $_base to $UNEXPLAINED: state went missing" ;;
+    esac
+fi
 [ "$R_JOBS" = "$LIVE_JOBS" ] || bad "the restored ledger holds $R_JOBS jobs, not $LIVE_JOBS"
 [ "$R_RECEIPTS" = "$LIVE_RECEIPTS" ] || bad "the restored ledger holds $R_RECEIPTS receipts, not $LIVE_RECEIPTS"
 [ "$R_UNCERTAIN" = "$LIVE_UNCERTAIN" ] || bad "the restored ledger holds $R_UNCERTAIN uncertain jobs, not $LIVE_UNCERTAIN"

@@ -221,18 +221,58 @@ source, a receipt, a reservation or an uncertain job.
 
 ### Backup and restore
 
-Back up **together**, at the same moment:
+Back up **together**, as close to one moment as you can manage:
 
 1. the PostgreSQL database (`pg_dump -Fc`), and
 2. the `consume`, `incoming`, `failed` and `staging` directories.
+
+They cannot be captured atomically with respect to each other on a running
+system. Stop intake first (above) and let deliveries drain, so the window in
+which they can disagree is one in which nothing is being published.
 
 They are one system. A database restored without its filesystem describes
 documents that are not there; a filesystem restored without its database has
 documents nothing can explain.
 
-Restore: stop the applications, restore the database, restore the directories,
-then start the renamers before the watcher so queued work drains before new
-work is discovered.
+### Restoring — do NOT restore `incoming` into the live root
+
+Discovery recognises an already-registered submission by **root, name, device
+and inode**. A restored file is a new file: it gets a new inode, so it does not
+match, and discovery registers it as a NEW submission. Its reserved name is
+already taken by the original delivery, so it is delivered a second time under
+a collision suffix.
+
+Restoring `incoming` wholesale and restarting therefore **re-delivers every
+source that was already delivered**. Content is deliberately not used to
+recognise it: two distinct submissions may legitimately hold identical bytes,
+and the contract forbids deduplicating them.
+
+The safe procedure:
+
+```sh
+# 1. stop everything
+docker compose -f compose.prod.yml --env-file ./prod.env down
+
+# 2. restore the database, and consume / failed / staging into place
+#    (these are the system's own state; no identity is inferred from them)
+
+# 3. restore `incoming` into a QUARANTINE directory, NOT the live root
+mkdir -p /srv/fn/restored-incoming && tar -xf incoming.tar -C /srv/fn/restored-incoming
+
+# 4. start the applications. Nothing in the quarantine is discovered.
+FN_DB_APPLY_MIGRATIONS=true \
+  docker compose -f compose.prod.yml --env-file ./prod.env up -d watcher
+docker compose -f compose.prod.yml --env-file ./prod.env up -d
+
+# 5. reconcile by hand: for each file in the quarantine, ask the ledger whether
+#    that source was already delivered.
+#      SELECT state, reserved_name FROM jobs WHERE source_name = '<name>';
+#    Move only the ones that still need processing into the live incoming root.
+```
+
+Uncertain jobs are NOT resolved by a restore, and must not be: a restored
+uncertain job is still uncertain, and the document it refers to may already be
+with the consumer.
 
 ### Uncertain jobs
 

@@ -653,6 +653,13 @@ report_begin() {
     REPORT_RUN="$EVIDENCE_DIR/runs/${REPORT_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$.txt"
 
     _rb_digest="$(cksum_sha256 "$_rb_script")"
+    # The entry script is not the whole harness. Every exercise sources
+    # lib.sh, runs against a compose file, and reads a configuration; a report
+    # that hashes only its own entry point cannot tell a reader which of those
+    # it actually used, and all three change independently of it.
+    _rb_lib="$(cksum_sha256 "$SCRIPT_DIR/lib.sh")"
+    _rb_compose="$(cksum_sha256 "$DEPLOY_DIR/docker-compose.yml")"
+    _rb_config="$(cksum_sha256 "$DEPLOY_DIR/config/normalizer.json")"
     _rb_app="$(running_application_identity)"
     {
         printf 'exercise:        %s\n' "$REPORT_NAME"
@@ -661,6 +668,9 @@ report_begin() {
         printf -- '-- provenance: two independent facts -------------------------\n'
         printf 'exercise script: %s\n' "$(basename "$_rb_script")"
         printf '  sha256:        %s\n' "$_rb_digest"
+        printf 'shared helpers:  lib.sh sha256=%s\n' "$_rb_lib"
+        printf 'compose file:    docker-compose.yml sha256=%s\n' "$_rb_compose"
+        printf 'configuration:   normalizer.json sha256=%s\n' "$_rb_config"
         printf 'application under test, asked of the running process:\n'
         printf '  %s\n' "$_rb_app"
         printf 'An exercise may be corrected without the application changing,\n'

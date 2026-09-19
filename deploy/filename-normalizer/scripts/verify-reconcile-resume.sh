@@ -228,6 +228,11 @@ emit "   the receipt names inode:      $RECEIPT_INODE   (expected $INODE_A: A's 
 emit "   reconciliation events:        $RECON_EVENTS   (expected 1)"
 [ "${RECONCILED:-0}" = "1" ] || bad "the sibling did not reconcile A's file; the sequence was not exercised"
 [ "$RECEIPT_INODE" = "$INODE_A" ] || bad "the receipt names inode $RECEIPT_INODE, not A's $INODE_A"
+# These two were printed and not asserted, so a run could report the wrong
+# state or no reconciliation at all and still pass. The sibling finishing A's
+# committed publication is the property this exercise exists for.
+[ "$STATE_MID" = "delivered" ] || bad "after the sibling acted the job is '$STATE_MID', not delivered"
+[ "${RECON_EVENTS:-0}" -ge 1 ] || bad "no reconciliation event was recorded, so the sibling did not finish A's publication"
 
 # Now A wakes up and decides what to do about a receipt it did not write.
 _i=0
