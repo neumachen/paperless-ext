@@ -275,3 +275,136 @@ func TestFingerprintRefusesASymlinkedDestination(t *testing.T) {
 		t.Errorf("Fingerprint followed a symlinked destination (err=%v)", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// FN-R5-02 (R7): cleanup must not delete or overwrite a foreign entry, and the
+// rollback of a failed write must remove the FILE it created, not the NAME it
+// used.
+// ---------------------------------------------------------------------------
+
+// A failed CreateFrom takes its own file away again.
+func TestCreateFromRollbackRemovesItsOwnFile(t *testing.T) {
+	root := t.TempDir()
+	dir, err := OpenDir(root)
+	if err != nil {
+		t.Fatalf("open dir: %v", err)
+	}
+	defer dir.Close()
+
+	// A closed source fails at the first Seek, after the entry has been
+	// created exclusively -- which is the rollback path under test.
+	srcPath := filepath.Join(t.TempDir(), "src")
+	writeFile(t, srcPath, "hello")
+	src, err := os.Open(srcPath)
+	if err != nil {
+		t.Fatalf("open src: %v", err)
+	}
+	_ = src.Close()
+
+	if _, _, _, _, err := dir.CreateFrom(src, "target", 0o640); err == nil {
+		t.Fatal("CreateFrom must fail with a closed source")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "target")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the rolled-back file is still there: %v", err)
+	}
+}
+
+// A rollback whose name now resolves to somebody else's file leaves it alone.
+//
+// The interval this closes is between the exclusive create and the failure, so
+// the replacement is staged directly: what is asserted is the rule the rollback
+// applies -- remove only while the name is still this file -- not the timing.
+func TestCreateFromRollbackLeavesAReplacementAlone(t *testing.T) {
+	root := t.TempDir()
+	dir, err := OpenDir(root)
+	if err != nil {
+		t.Fatalf("open dir: %v", err)
+	}
+	defer dir.Close()
+
+	writeFile(t, filepath.Join(root, "occupied"), "a stranger's bytes")
+	stranger, err := dir.Identify("occupied")
+	if err != nil {
+		t.Fatalf("identify: %v", err)
+	}
+
+	// Some other file's identity, standing in for the one CreateFrom recorded
+	// before the entry was swapped.
+	writeFile(t, filepath.Join(root, "ours"), "ours")
+	ours, err := dir.Identify("ours")
+	if err != nil {
+		t.Fatalf("identify: %v", err)
+	}
+
+	removed, err := dir.RemoveOwned("occupied", ours)
+	if removed {
+		t.Error("a file this caller does not own was reported as removed")
+	}
+	if !errors.Is(err, ErrMutated) {
+		t.Errorf("expected ErrMutated, got %v", err)
+	}
+	got, err := dir.Identify("occupied")
+	if err != nil {
+		t.Fatalf("the stranger's file is gone: %v", err)
+	}
+	if got.Inode != stranger.Inode || got.Device != stranger.Device {
+		t.Error("the stranger's file was replaced")
+	}
+	body, err := os.ReadFile(filepath.Join(root, "occupied"))
+	if err != nil || string(body) != "a stranger's bytes" {
+		t.Errorf("the stranger's bytes changed: %q %v", body, err)
+	}
+}
+
+// The ordinary case still works and still reports accurately: one owned hard
+// link removed while other legitimate links to the same inode remain.
+func TestRemoveOwnedStillReportsAnOrdinaryOwnedLinkRemoval(t *testing.T) {
+	root := t.TempDir()
+	dir, err := OpenDir(root)
+	if err != nil {
+		t.Fatalf("open dir: %v", err)
+	}
+	defer dir.Close()
+
+	writeFile(t, filepath.Join(root, "published"), "one document")
+	if err := os.Link(filepath.Join(root, "published"), filepath.Join(root, ".fn-staged")); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	staged, err := dir.Identify(".fn-staged")
+	if err != nil {
+		t.Fatalf("identify: %v", err)
+	}
+
+	removed, err := dir.RemoveOwned(".fn-staged", staged)
+	if err != nil {
+		t.Fatalf("removing an owned link failed: %v", err)
+	}
+	if !removed {
+		t.Error("an owned link that was removed must be reported as removed")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "published")); err != nil {
+		t.Errorf("the published document was removed with its staged link: %v", err)
+	}
+}
+
+// renameatNoReplace refuses rather than destroying an occupant.
+func TestRenameNoReplaceRefusesAnOccupiedName(t *testing.T) {
+	root := t.TempDir()
+	dir, err := OpenDir(root)
+	if err != nil {
+		t.Fatalf("open dir: %v", err)
+	}
+	defer dir.Close()
+
+	writeFile(t, filepath.Join(root, "from"), "moving")
+	writeFile(t, filepath.Join(root, "to"), "already here")
+
+	err = renameatNoReplace(int(dir.f.Fd()), "from", int(dir.f.Fd()), "to")
+	if !errors.Is(err, syscall.EEXIST) {
+		t.Fatalf("expected EEXIST, got %v", err)
+	}
+	body, rerr := os.ReadFile(filepath.Join(root, "to"))
+	if rerr != nil || string(body) != "already here" {
+		t.Errorf("the occupant was overwritten: %q %v", body, rerr)
+	}
+}

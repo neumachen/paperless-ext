@@ -917,8 +917,11 @@ func (d *Dir) RemoveOwned(name string, expect Entry) (bool, error) {
 		return false, fmt.Errorf("%w: %s is not the file this caller owns", ErrMutated, name)
 	}
 
+	// A name nothing else knows -- but "nothing else knows it" is an argument,
+	// not a guarantee, and this directory is writable by others. NOREPLACE
+	// turns the argument into a checked fact at no cost.
 	tomb := tempPrefixRemoval + nonce16()
-	if err := renameat(int(d.f.Fd()), name, int(d.f.Fd()), tomb); err != nil {
+	if err := renameatNoReplace(int(d.f.Fd()), name, int(d.f.Fd()), tomb); err != nil {
 		if errors.Is(err, syscall.ENOENT) {
 			return false, nil
 		}
@@ -929,12 +932,25 @@ func (d *Dir) RemoveOwned(name string, expect Entry) (bool, error) {
 	// came from, unremoved.
 	moved, ierr := d.Identify(tomb)
 	if ierr != nil || moved.Inode != expect.Inode || moved.Device != expect.Device {
-		if rerr := renameat(int(d.f.Fd()), tomb, int(d.f.Fd()), name); rerr != nil {
+		// Put it back WITHOUT replacing. The original name was free when this
+		// call moved the entry away from it, and it need not still be: a plain
+		// rename back would destroy whoever took it in between -- a second
+		// foreign file lost by the cleanup that was trying not to lose the
+		// first one. If the name is occupied the stranger stays under the
+		// private name, which is recoverable, and the error says exactly where
+		// it is.
+		rerr := renameatNoReplace(int(d.f.Fd()), tomb, int(d.f.Fd()), name)
+		switch {
+		case rerr == nil:
+			return false, fmt.Errorf("%w: %s was replaced before it could be removed; it was left alone",
+				ErrMutated, name)
+		case errors.Is(rerr, syscall.EEXIST):
+			return false, fmt.Errorf("%w: %s was replaced before it could be removed, and the name was taken again before the replacement could be put back; it is intact under %s",
+				ErrMutated, name, tomb)
+		default:
 			return false, fmt.Errorf("%w: %s was replaced before it could be removed, and the replacement could not be put back (it is now %s): %v",
 				ErrMutated, name, tomb, rerr)
 		}
-		return false, fmt.Errorf("%w: %s was replaced before it could be removed; it was left alone",
-			ErrMutated, name)
 	}
 
 	if err := unlinkat(int(d.f.Fd()), tomb); err != nil {
@@ -977,9 +993,30 @@ func (d *Dir) CreateFrom(src *os.File, name string, perm os.FileMode) (*os.File,
 	}
 	f := os.NewFile(uintptr(fd), filepath.Join(d.root, name))
 
-	fail := func(e error) (*os.File, Entry, []byte, int64, error) {
+	// Identify what was just created, so a rollback can remove that FILE
+	// rather than that NAME.
+	//
+	// The rollback below used to be an unconditional `unlinkat(name)`. Between
+	// the exclusive create and a copy, flush or verification failure, another
+	// process can unlink this entry and create its own at the same name -- and
+	// the error path would then delete the stranger's file while reporting a
+	// failed write of ours. It is the same defect `RemoveOwned` exists to
+	// avoid, on the path that runs precisely when something has already gone
+	// wrong.
+	created, cerr := identifyFile(f, name, d.root)
+	if cerr != nil {
 		_ = f.Close()
 		_ = unlinkat(int(d.f.Fd()), name)
+		return nil, Entry{}, nil, 0, cerr
+	}
+
+	fail := func(e error) (*os.File, Entry, []byte, int64, error) {
+		_ = f.Close()
+		// Only this file, and only while the name still resolves to it. A
+		// failure to roll back leaves our own file behind under a name we
+		// created, which is visible and harmless; deleting somebody else's is
+		// neither.
+		_, _ = d.RemoveOwned(name, created)
 		return nil, Entry{}, nil, 0, e
 	}
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
@@ -1110,6 +1147,19 @@ func unlinkat(dirfd int, name string) error {
 
 func renameat(oldDirFd int, oldName string, newDirFd int, newName string) error {
 	return unix.Renameat(oldDirFd, oldName, newDirFd, newName)
+}
+
+// renameatNoReplace renames without ever replacing an existing destination.
+//
+// Plain rename(2) silently destroys whatever is at the destination, which is
+// the wrong default everywhere in this package: every name here lives in a
+// directory other processes can write to, and a name that was free a moment
+// ago may not be free now. RENAME_NOREPLACE makes the check and the move one
+// atomic operation, so there is no interval to lose a race in. EEXIST means
+// somebody is there, and the caller has to decide what that means rather than
+// having already overwritten them.
+func renameatNoReplace(oldDirFd int, oldName string, newDirFd int, newName string) error {
+	return unix.Renameat2(oldDirFd, oldName, newDirFd, newName, unix.RENAME_NOREPLACE)
 }
 
 // nonce16 is a short random suffix for a private intermediate name.
