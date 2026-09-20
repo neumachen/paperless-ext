@@ -341,6 +341,44 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 	if notHeld != 0 {
 		t.Errorf("%d of %d load jobs did not reach %q", notHeld, len(allIDs), jobs.StateHeld)
 	}
+
+	// The REAL drain documents, by identity.
+	//
+	// The synthetic load is only half of this phase's work; the real
+	// publishable documents are the half that reaches the injected hold. They
+	// were covered only by the state scan, and a scan cannot see a job that
+	// moves between the snapshot and the per-state listing -- it is in neither
+	// read. Each one is asked for its own outcome instead.
+	realIDs := splitIDs(e.LoadState(t, "drain-real-ids"))
+	if len(realIDs) == 0 {
+		t.Fatalf("no real drain fixture ids were recorded; this phase cannot account for them")
+	}
+	realStates := map[jobs.State]int{}
+	realNonTerminal := 0
+	realUnreadable := 0
+	for _, id := range realIDs {
+		j, gerr := led.GetJob(ctx, id)
+		if gerr != nil {
+			realUnreadable++
+			continue
+		}
+		realStates[j.State]++
+		if !jobs.IsTerminal(j.State) {
+			realNonTerminal++
+			if realNonTerminal <= 5 {
+				t.Errorf("real drain fixture %s is in non-terminal state %q", id, j.State)
+			}
+		}
+	}
+	if realUnreadable != 0 {
+		t.Errorf("%d of %d real drain fixtures could not be read; unknown is not a durable outcome",
+			realUnreadable, len(realIDs))
+	}
+	if realNonTerminal != 0 {
+		t.Errorf("%d of %d real drain fixtures did not reach a durable outcome",
+			realNonTerminal, len(realIDs))
+	}
+	t.Logf("real drain fixtures: %d, by outcome: %v", len(realIDs), realStates)
 	// There used to be a whole-ledger assertion here that no job is ever
 	// delivered or uncertain. Both states are reachable now, and the
 	// normalization phase legitimately produces deliveries, so that check
@@ -460,12 +498,23 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 	}
 
 	report := fmt.Sprintf(
-		"registered_during_load=%d all_reached_durable_outcome=true stranded_in_processing=%d\n"+
+		// `all_reached_durable_outcome=true` used to be a literal in this
+		// string: it said "true" whatever the assertions above had found.
+		// It is computed now, and the whole-ledger processing count is
+		// labelled as what it is -- context, not this phase's result.
+		"registered_during_load=%d this_phase_reached_durable_outcome=%t\n"+
+			"ledger_wide_processing=%d (context only; not this phase's, not asserted)\n"+
+			"load_jobs_held=%d/%d real_fixtures_terminal=%d/%d\n"+
 			"injected_holds_entered=%d\n"+
 			"in_flight_at_readiness_withdrawal=%d consumer_draining_peak=%d deliveries_settled_during_shutdown=%d\n"+
 			"consumer_draining_logged=%t shutdown_complete=%t shutdown_timeout=%t\n"+
 			"exit_code=%s stop_duration_seconds=%s\n",
-		registered, snap.ByState[jobs.StateProcessing], faultPaused,
+		registered,
+		notHeld == 0 && unreadable == 0 && realNonTerminal == 0 && realUnreadable == 0,
+		snap.ByState[jobs.StateProcessing],
+		len(allIDs)-notHeld-unreadable, len(allIDs),
+		len(realIDs)-realNonTerminal-realUnreadable, len(realIDs),
+		faultPaused,
 		inFlightAtDrain, drainingCount, settledAfter,
 		sawDraining, sawComplete, sawTimeout, exit, stopSecs)
 	t.Logf("%s", report)

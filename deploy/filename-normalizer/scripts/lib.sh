@@ -559,7 +559,18 @@ backup_once() {
 # already running would destroy somebody else's work.
 own_service() {
     _os_svc="$1"
-    if [ -n "$(compose --profile fault ps -aq "$_os_svc" 2>/dev/null)" ]; then
+    # A FAILED enumeration is not an empty one.
+    #
+    # This used to read `[ -n "$(compose ... 2>/dev/null)" ]`, so a compose
+    # invocation that could not run produced an empty string and the service
+    # was declared available. The caller then created it, took ownership, and
+    # its cleanup removed whatever was actually there. Unknown must refuse.
+    if ! _os_out="$(compose --profile fault ps -aq "$_os_svc" 2>/dev/null)"; then
+        echo "error: could not determine whether service '$_os_svc' exists." >&2
+        echo "       Refusing rather than assuming it is available." >&2
+        return 1
+    fi
+    if [ -n "$_os_out" ]; then
         echo "error: service '$_os_svc' already exists." >&2
         echo "       This invocation did not create it and will not remove it." >&2
         return 1

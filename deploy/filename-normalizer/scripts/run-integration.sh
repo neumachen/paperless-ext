@@ -95,6 +95,15 @@ on_signal() {
 trap 'restore_drain_overrides' EXIT
 trap 'on_signal' INT TERM
 
+# Multiple rows, one per line. `psql_scalar` strips newlines, which would
+# concatenate ids into one unusable string.
+psql_rows() {
+    compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+        postgres-primary psql -U "${FN_DB_USER:-fn_app}" \
+        -d "${FN_DB_NAME:-filename_normalizer}" -tA -c "$1" \
+        </dev/null 2>/dev/null | tr -d ' \r' | sed '/^$/d'
+}
+
 psql_scalar() {
     compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
         postgres-primary psql -U "${FN_DB_USER:-fn_app}" \
@@ -400,6 +409,21 @@ while [ "$_dq_i" -lt 120 ]; do
     sleep 2; _dq_i=$((_dq_i + 2))
 done
 save_state drain-real-prefix "$DRAIN_REAL_PREFIX"
+
+# The real fixtures' job ids, so the drained phase can require a terminal
+# outcome for EACH of them by identity. Scanning states cannot do that: a
+# fixture moving between two separate reads -- the snapshot and the per-state
+# listing -- is in neither, and the synthetic load's ids covered only the
+# synthetic half of this phase's work.
+_dq_ids="$(psql_rows "SELECT job_id FROM jobs WHERE source_name LIKE '$DRAIN_REAL_PREFIX-%' ORDER BY source_name;" | tr '\n' ',')"
+_dq_n="$(printf '%s' "$_dq_ids" | tr ',' '\n' | grep -c . || true)"
+if [ "${_dq_n:-0}" != "$_dq_want" ]; then
+    echo "error: resolved $_dq_n job id(s) for $_dq_want real drain documents;" >&2
+    echo "       the phase could not account for each fixture individually." >&2
+    exit 1
+fi
+save_state drain-real-ids "$_dq_ids"
+note "recorded $_dq_n real drain fixture ids"
 note "registered $_dq_have of $_dq_want real drain documents"
 if [ "${_dq_have:-0}" != "$_dq_want" ]; then
     echo "error: only $_dq_have of $_dq_want real drain documents were registered;" >&2
