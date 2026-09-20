@@ -150,9 +150,31 @@ emit "   its ignore list names:        $(printf '%s' "$IGNORED_JSON" | docker ru
 
 # --- an arrival the ignore list cannot cover -------------------------------
 log "2/3: a delivery that arrives AFTER the ignore list was taken"
-compose run --rm --no-deps -T --entrypoint sh storage-init -c \
-    "printf '%%PDF-1.4 isolation probe\n' > /srv/fn/incoming/.wip-$LOWER && \
-     mv /srv/fn/incoming/.wip-$LOWER '/srv/fn/incoming/$DOC'" >/dev/null 2>&1
+# A REAL PDF, built by pikepdf inside the consumer's own image -- the same
+# way verify-consumer.sh makes its fixture.
+#
+# This used to write `printf '%%PDF-1.4 isolation probe'`, which has the PDF
+# magic bytes and nothing else. Paperless dispatches on that magic, hands the
+# file to ocrmypdf, and ocrmypdf rejects it:
+#
+#   ocrmypdf.exceptions.InputFileError
+#   ConsumerError: isolation-probe-...pdf: Error occurred while consuming
+#
+# A failed consumption leaves the file in the consume directory and puts
+# nothing in the library, so the exercise reported "the consumer never took
+# the fixture" -- true, but not for the reason the message implied. The
+# consumer took it and could not parse it.
+compose run --rm --no-deps -T \
+    -v "${PROJECT}_fn-incoming:/incoming" \
+    --entrypoint python3 paperless -c "
+import os, pikepdf
+wip = '/incoming/.wip-$LOWER'
+pdf = pikepdf.new()
+pdf.add_blank_page(page_size=(612, 792))
+pdf.save(wip)
+os.chmod(wip, 0o644)
+os.rename(wip, '/incoming/$DOC')
+" >/dev/null 2>&1
 JOB=""; _i=0
 while [ "$_i" -lt 150 ]; do
     [ -n "$JOB" ] || JOB="$(psqln "SELECT job_id FROM jobs WHERE source_name = '$DOC';")"
