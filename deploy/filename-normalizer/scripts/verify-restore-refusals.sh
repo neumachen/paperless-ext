@@ -82,22 +82,38 @@ cleanup() {
     fi
     if [ "$MADE_VOL" = "1" ]; then
         docker volume rm "$CTL_VOL" >/dev/null 2>&1 || true
-        if [ -n "$(docker volume ls -q --filter "name=^${CTL_VOL}$" 2>/dev/null)" ]; then
-            echo "error: control volume $CTL_VOL remains" >&2; RESTORE_OK=0
+        if _cv="$(docker volume ls -q --filter "name=^${CTL_VOL}$" 2>/dev/null)"; then
+            [ -z "$_cv" ] || { echo "error: control volume $CTL_VOL remains" >&2; RESTORE_OK=0; }
+        else
+            echo "error: could not list volumes; removal of $CTL_VOL unconfirmed" >&2
+            RESTORE_OK=0
         fi
     fi
     if [ "$MADE_HOLD" = "1" ]; then
         compose --profile fault stop -t 15 renamer-hold >/dev/null 2>&1 || true
         compose --profile fault rm -f renamer-hold >/dev/null 2>&1 || true
-        if [ -n "$(compose --profile fault ps -aq renamer-hold 2>/dev/null)" ]; then
-            echo "error: control fault service renamer-hold remains" >&2; RESTORE_OK=0
+        if _ch="$(compose --profile fault ps -aq renamer-hold 2>/dev/null)"; then
+            [ -z "$_ch" ] || { echo "error: control fault service renamer-hold remains" >&2; RESTORE_OK=0; }
+        else
+            echo "error: could not query renamer-hold; removal unconfirmed" >&2
+            RESTORE_OK=0
         fi
     fi
     # Only if this control actually disturbed them. The exercise it drives
     # refuses in its pre-flight, before touching the live applications, so on
     # the ordinary path there is nothing here to put back.
+    # Restoring the shared applications is itself a mutation, so it happens
+    # only while holding the lock. Case 6 releases the lock for the child it
+    # interrupts; a failure in that window used to reach here and recreate the
+    # renamers and watcher with no lock held at all.
     if [ "$LIVE_TOUCHED" = "1" ]; then
-        recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
+        if [ "$DRIVER_LOCK" = "1" ] || take_lock; then
+            recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
+        else
+            echo "error: the exercise lock is held elsewhere; the live applications" >&2
+            echo "       were NOT restored by this control. They may still be stopped." >&2
+            RESTORE_OK=0
+        fi
     fi
     drop_lock
     return 0
@@ -121,11 +137,38 @@ take_lock() {
     DRIVER_LOCK=1
     return 0
 }
+# Releases ONLY a lock this process owns.
+#
+# `exercise_unlock` is an unconditional `rm -rf`. Combined with a stale
+# DRIVER_LOCK -- which is what a failed reacquisition inside a command
+# substitution leaves behind, since the subshell's assignment never reaches
+# the parent -- it would delete a lock another exercise had legitimately
+# taken. The owner file records this pid, so it is checked first.
 drop_lock() {
     [ "$DRIVER_LOCK" = "1" ] || return 0
-    exercise_unlock
+    _dl_owner="$(cat "$EVIDENCE_DIR/.exercise.lock/owner" 2>/dev/null || true)"
+    case "$_dl_owner" in
+        *"pid=$$ "*|*"pid=$$") exercise_unlock ;;
+        *) echo "warning: the exercise lock is not this process's; leaving it in place." >&2 ;;
+    esac
     DRIVER_LOCK=0
     return 0
+}
+# The lock handoff around a child run, performed by the PARENT.
+#
+# It used to live inside run_case, which every caller invokes through `$( )`.
+# A command substitution is a subshell: `DRIVER_LOCK=0` and the later `=1`
+# were set in a process that then exited, so the parent's view never changed,
+# and `exit 1` on a failed reacquisition ended only the subshell. The parent
+# carried on believing it held a lock it did not.
+release_for_child() { drop_lock; }
+reacquire_after_child() {
+    take_lock || {
+        echo "error: could not retake the exercise lock after the child ran." >&2
+        echo "       Another exercise now holds it; stopping without touching it." >&2
+        DRIVER_LOCK=0
+        exit 1
+    }
 }
 take_lock || { echo "error: another exercise holds the lock; nothing was changed." >&2; exit 1; }
 
@@ -143,10 +186,8 @@ run_case() {
     # produce -- which is how the first run of this file ended after printing
     # one heading, while the refusal underneath it had worked correctly.
     _rc_exit=0
-    drop_lock
     ( for _kv in "$@"; do export "$_kv"; done
       sh "$SCRIPT" ) > "$_rc_log" 2>&1 || _rc_exit=$?
-    take_lock || { echo "error: could not retake the exercise lock after the child ran." >&2; exit 1; }
     # The INTENDED refusal, not merely some refusal. An unrelated failure with
     # the fixture left untouched would otherwise count as having exercised
     # this boundary.
@@ -171,7 +212,9 @@ case "$CTL_PLANT" in
     *)        bad "could not establish whether $CTL_DOC exists (read '$CTL_PLANT'); case 1 not exercised" ;;
 esac
 DOC_SHA_BEFORE="$(live_sha "/srv/fn/consume/$CTL_DOC")"
+release_for_child
 R1="$(run_case destination "already occupies /srv/fn/consume/$CTL_DOC" "FN_HU_HELD_NAME=$CTL_DOC")"
+reacquire_after_child
 DOC_SHA_AFTER="$(live_sha "/srv/fn/consume/$CTL_DOC")"
 emit "1. a pre-existing document occupies the destination"
 emit "   exercise exit / REFUSED lines: $(echo "$R1" | cut -d'|' -f1) / $(echo "$R1" | cut -d'|' -f2)   (expected non-zero / >= 1)"
@@ -201,7 +244,9 @@ else
     bad "could not determine whether renamer-hold exists; case 2 not exercised"
 fi
 HOLD_ID_BEFORE="$(compose --profile fault ps -q renamer-hold 2>/dev/null | head -1)"
+release_for_child
 R2="$(run_case service "fault service 'renamer-hold' already exists")"
+reacquire_after_child
 HOLD_ID_AFTER="$(compose --profile fault ps -q renamer-hold 2>/dev/null | head -1)"
 emit ""
 emit "2. a fault service exists that this invocation did not create"
@@ -235,7 +280,9 @@ else
     bad "could not create the control database; case 3 not exercised"
 fi
 DB_ROWS_BEFORE="$(psqln "SELECT count(*) FROM keepme;" "$CTL_DB")"
+release_for_child
 R3="$(run_case database "database $CTL_DB already exists" "FN_HU_RESTORE_DB=$CTL_DB")"
+reacquire_after_child
 DB_EXISTS_AFTER="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)"
 DB_ROWS_AFTER="$(psqln "SELECT count(*) FROM keepme;" "$CTL_DB")"
 emit ""
@@ -271,7 +318,9 @@ if [ "$MADE_VOL" = "1" ]; then
     VOL_SHA_BEFORE="$(vol_sha "$CTL_VOL")"
     case "$VOL_SHA_BEFORE" in ABSENT|"") bad "could not seed the control volume; case 4 not exercised" ;; esac
 fi
+release_for_child
 R4="$(run_case volume "volume $CTL_VOL already exists" "FN_HU_BACKUP_VOL=$CTL_VOL")"
+reacquire_after_child
 VOL_PRESENT_AFTER="$(docker volume ls -q --filter "name=^${CTL_VOL}$" 2>/dev/null | wc -l | tr -d ' ')"
 VOL_SHA_AFTER="$(vol_sha "$CTL_VOL")"
 emit ""
@@ -315,7 +364,7 @@ emit "                                   an active exercise's applications)"
 log "6/6: interrupting the exercise once it has started changing things"
 LIVE_TOUCHED=1
 INT_LOG="$EVIDENCE_DIR/.refusal-interrupt-$$.log"
-drop_lock
+release_for_child
 sh "$SCRIPT" > "$INT_LOG" 2>&1 &
 INT_PID=$!
 # Wait for an actual MUTATION, not for the heading that precedes one. The
@@ -349,7 +398,13 @@ else
 fi
 sleep 10
 INT_STOPPED="$(grep -ac 'interrupted; cleaning up and stopping' "$INT_LOG" || true)"
-INT_FAULTS="$(compose --profile fault ps -aq renamer-hold renamer-fault 2>/dev/null | wc -l | tr -d ' ')"
+# A failed enumeration piped into `wc -l` is 0, and 0 is the answer that says
+# nothing was left behind.
+if _if="$(compose --profile fault ps -aq renamer-hold renamer-fault 2>/dev/null)"; then
+    INT_FAULTS="$(printf '%s' "$_if" | grep -c . || true)"
+else
+    INT_FAULTS=unreadable
+fi
 INT_LOCK="$([ -d "$EVIDENCE_DIR/.exercise.lock" ] && echo held || echo released)"
 # Exactly what the evidence excludes: every step after the one interrupted.
 # The child was signalled while step 1 held the fault service, so none of
@@ -363,7 +418,7 @@ for _st in '2/8: producing an uncertain' '3/8: backing up' '4/8: restoring into'
     _n="$(grep -ac -- "$_st" "$INT_LOG" || true)"
     INT_PAST=$((INT_PAST + ${_n:-0}))
 done
-take_lock || { echo "error: could not retake the exercise lock after the interrupted child." >&2; exit 1; }
+reacquire_after_child
 recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
 emit ""
 emit "6. a catchable interruption (SIGTERM) part-way through"
@@ -379,7 +434,7 @@ emit "                                   the redelivery, the quarantine and the"
 emit "                                   live-system checks -- none ran after the signal"
 [ "$INT_EXIT" != "0" ] || bad "an interrupted exercise reported success"
 [ "${INT_STOPPED:-0}" -ge 1 ] || bad "the exercise did not report stopping on the signal"
-[ "${INT_FAULTS:-1}" = "0" ] || bad "$INT_FAULTS fault service(s) survived the interruption"
+[ "${INT_FAULTS:-1}" = "0" ] || bad "fault services after the interruption: $INT_FAULTS (expected 0; 'unreadable' is not absence)"
 [ "$INT_LOCK" = "released" ] || bad "the exercise lock was not released after the interruption"
 [ "${INT_PAST:-1}" = "0" ] || bad "the exercise resumed mutating after the signal"
 
