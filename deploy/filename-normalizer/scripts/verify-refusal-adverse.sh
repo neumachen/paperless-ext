@@ -42,10 +42,14 @@ F_VOL="fn-refusal-vol-advf-$LOWER"
 F_TAG="adverse-case-f-$STAMP"
 MADE_F_DB=0
 MADE_F_VOL=0
-# Case G's disposable vhost.
-G_VHOST="fn-adverse-vhost-$LOWER"
-G_TAG_A="adverse-G-original-$STAMP"
-G_TAG_B="adverse-G-imposter-$STAMP"
+# Case G's disposable vhost. Name and marker carry the pid as well as the
+# stamp, like CTL_TAG in the driver and HU_RUN_TAG in the exercise: a
+# second-resolution timestamp alone is not a per-invocation identity, and two
+# invocations starting in the same second would have shared both the vhost and
+# the tag that is supposed to tell them apart.
+G_VHOST="fn-adverse-vhost-$LOWER-$$"
+G_TAG_A="adverse-G-original-$STAMP-$$"
+G_TAG_B="adverse-G-imposter-$STAMP-$$"
 MADE_G_VHOST=0
 # Exact resources the driver (this control's child) reported it retained.
 # Parsed from its own report, never guessed from a prefix.
@@ -160,23 +164,44 @@ cleanup() {
             RESTORE_OK=0
         fi
     fi
-    # Case G's vhost, removed only because its description proves this control
-    # created it. Deleting a vhost takes every queue in it, so an unproven one
-    # is retained and named.
-    if [ "$MADE_G_VHOST" = "1" ]; then
-        echo "error: broker vhost $G_VHOST is AMBIGUOUS; it is RETAINED, not deleted by name." >&2
-        RESTORE_OK=0
-    fi
-    if [ "$MADE_G_VHOST" = "2" ]; then
-        compose exec -T rabbitmq rabbitmqctl delete_vhost "$G_VHOST" >/dev/null 2>&1 || true
-        if _gv="$(compose exec -T rabbitmq rabbitmqctl list_vhosts --no-table-headers name 2>/dev/null)"; then
-            if printf '%s\n' "$_gv" | grep -qx "$G_VHOST"; then
-                echo "error: case G vhost $G_VHOST remains" >&2; RESTORE_OK=0
-            else
-                MADE_G_VHOST=0
+    # Case G's vhost. Deleting a vhost takes every queue in it with it, so the
+    # marker is re-read HERE rather than acted on from a flag set earlier, and
+    # only this invocation's own tags authorise the removal. It happens under
+    # the lock, like every other removal in this function; it used to be the
+    # one that did not.
+    if [ "$MADE_G_VHOST" != "0" ]; then
+        if adv_holds_lock || adv_take_lock; then
+            _gcd=__UNREADABLE__
+            if _gcl="$(compose exec -T rabbitmq rabbitmqctl list_vhosts --no-table-headers name description 2>/dev/null)"; then
+                _gcd="$(printf '%s\n' "$_gcl" | awk -F'\t' -v v="$G_VHOST" \
+                    'BEGIN{f=0} $1==v{print $2; f=1} END{if(!f) print "__ABSENT__"}' | head -1)"
             fi
+            case "$_gcd" in
+                "$G_TAG_A"|"$G_TAG_B")
+                    compose exec -T rabbitmq rabbitmqctl delete_vhost "$G_VHOST" >/dev/null 2>&1 || true
+                    if _gv="$(compose exec -T rabbitmq rabbitmqctl list_vhosts --no-table-headers name 2>/dev/null)"; then
+                        if printf '%s\n' "$_gv" | grep -qx "$G_VHOST"; then
+                            echo "error: case G vhost $G_VHOST remains" >&2; RESTORE_OK=0
+                        else
+                            MADE_G_VHOST=0
+                        fi
+                    else
+                        echo "error: could not list vhosts; removal of $G_VHOST is UNCONFIRMED" >&2
+                        RESTORE_OK=0
+                    fi ;;
+                __ABSENT__)
+                    MADE_G_VHOST=0 ;;
+                __UNREADABLE__)
+                    echo "error: vhost $G_VHOST's description is unreadable; ownership is" >&2
+                    echo "       AMBIGUOUS, it is RETAINED and not deleted by name." >&2
+                    RESTORE_OK=0 ;;
+                *)
+                    echo "error: vhost $G_VHOST carries description '$_gcd', not this" >&2
+                    echo "       invocation's; it is RETAINED and left untouched." >&2
+                    RESTORE_OK=0 ;;
+            esac
         else
-            echo "error: could not list vhosts; removal of $G_VHOST is UNCONFIRMED" >&2
+            echo "error: the exercise lock is held elsewhere; $G_VHOST was NOT removed" >&2
             RESTORE_OK=0
         fi
     fi

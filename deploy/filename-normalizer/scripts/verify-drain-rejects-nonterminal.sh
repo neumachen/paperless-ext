@@ -326,7 +326,21 @@ log "2/3: running the real drained assertion with that job as its real-fixture s
 # disposable directory of this control's own making -- never the retained
 # evidence -- it is shown to (a) accept a whole set, (b) reject a set with a
 # file missing, and (c) FAIL, rather than silently shorten, when a path cannot
-# be hashed. (c) is the case the old helper masked with `exit 0`.
+# be hashed.
+#
+# What (c) does and does not show. The fixture is a path containing a newline.
+# The line-reading loop in recovery_digests cannot consume it, so sha256sum is
+# handed two paths that do not exist, the loop exits 4 and the run ends
+# non-zero. That is a real hashing error, really propagated, by THIS
+# implementation.
+#
+# It is NOT a reproduction of the previous implementation's defect. Measured on
+# this same fixture, the previous `find "$d" -type f -exec sha256sum {} +`
+# hashed the file successfully and exited 0 -- `-exec` passes the name as one
+# argument, so a newline in it is harmless there. That implementation's actual
+# defect was an unconditional `exit 0` inside the container and a
+# sort-terminated pipeline, which discarded both statuses; it is a property of
+# that code, and no fixture in this step exercises it.
 SELFTEST="$EVIDENCE_DIR/.drain-selftest-$$"
 rm -rf "$SELFTEST" 2>/dev/null || true
 mkdir -p "$SELFTEST/logs" "$SELFTEST/drained"
@@ -343,8 +357,8 @@ rm -f "$SELFTEST/drained/selftest.txt"
 ST_SHORT=0
 recovery_digests "$SELFTEST" > "$SELFTEST/.m2" 2>/dev/null || true
 if ! manifest_complete "$SELFTEST/.m2" "$ST_EXPECTED"; then ST_SHORT=1; fi
-# A path the hashing loop cannot consume. `find -type f` lists it, sha256sum
-# cannot read either half of it, and the run must end non-zero.
+# A path the hashing loop cannot consume: `find -type f` lists it, the loop
+# splits it at the newline, and sha256sum cannot read either half.
 printf 'selftest\n' > "$SELFTEST/drained/selftest.txt"
 touch "$SELFTEST/drained/broken
 name" 2>/dev/null || true
@@ -355,9 +369,15 @@ emit ""
 emit "0. the completeness check, measured on a disposable set before borrowing"
 emit "   accepts a whole set ($ST_EXPECTED files): $ST_WHOLE   (expected 1)"
 emit "   rejects a set with one file missing:      $ST_SHORT   (expected 1)"
-emit "   FAILS when a path cannot be hashed:       $ST_FAILS   (expected 1: the"
-emit "                                 previous helper exited 0 here and returned a"
-emit "                                 short manifest that looked complete)"
+emit "   FAILS when a path cannot be hashed:       $ST_FAILS   (expected 1)"
+emit "     what this shows: the fixture is a path containing a newline, which this"
+emit "     implementation's line-reading loop cannot consume, so it is a REAL hashing"
+emit "     error that really ends the run non-zero."
+emit "     what it does NOT show: the previous implementation failing. Measured on"
+emit "     this same fixture, its 'find -exec sha256sum {} +' hashed the file and"
+emit "     exited 0. That implementation's defect -- an unconditional 'exit 0' and a"
+emit "     sort-terminated pipeline discarding both statuses -- is a property of the"
+emit "     code, not something this fixture reproduces."
 [ "$ST_WHOLE" = "1" ] || bad "the completeness check rejected a whole set; it cannot be trusted"
 [ "$ST_SHORT" = "1" ] || bad "the completeness check accepted a set with a file missing"
 [ "$ST_FAILS" = "1" ] || bad "a path that cannot be hashed did not fail the manifest"
