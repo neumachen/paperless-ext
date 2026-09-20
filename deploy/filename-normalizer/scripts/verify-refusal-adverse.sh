@@ -30,11 +30,51 @@ FAILURES=0
 RESTORE_OK=1
 STOLE_LOCK=0
 ADV_CHILD=""
+# Exact resources THIS control created, cleared by name and nothing else.
+C_FOREIGN_VOL="fn-adverse-foreign-$LOWER"
+MADE_FOREIGN_VOL=0
+# Exact resources the driver (this control's child) reported it retained.
+# Parsed from its own report, never guessed from a prefix.
+RETAINED_DOCS=""
+RETAINED_DBS=""
+RETAINED_VOLS=""
+RETAINED_SVCS=""
+RETAINED_LIVE=0
 
 report_begin refusal-adverse "$OUT" "$0"
 
 emit() { printf '%s\n' "$*" >> "$OUT"; printf '%s\n' "$*"; }
 bad() { printf '    MISMATCH: %s\n' "$*" >&2; emit "    MISMATCH: $*"; FAILURES=$((FAILURES + 1)); }
+
+# Does this control hold the lock RIGHT NOW? Re-read, never cached: the flag
+# records what was true when it was set, not who owns the directory now.
+adv_holds_lock() {
+    [ "$STOLE_LOCK" = "1" ] || return 1
+    _ah="$(cat "$EVIDENCE_DIR/.exercise.lock/owner" 2>/dev/null)" || return 1
+    case "$_ah" in *"adverse-control pid=$$"*) return 0 ;; esac
+    return 1
+}
+# Take the lock the same atomic way lib.sh does.
+adv_take_lock() {
+    if mkdir "$EVIDENCE_DIR/.exercise.lock" 2>/dev/null; then
+        printf 'adverse-control pid=%s at=%s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "$EVIDENCE_DIR/.exercise.lock/owner"
+        STOLE_LOCK=1
+        return 0
+    fi
+    return 1
+}
+# Release ONLY a lock whose owner file still names this process.
+adv_drop_lock() {
+    [ "$STOLE_LOCK" = "1" ] || return 0
+    if adv_holds_lock; then
+        rm -rf "$EVIDENCE_DIR/.exercise.lock" 2>/dev/null || true
+    else
+        echo "warning: the lock is no longer this control's; leaving it in place." >&2
+    fi
+    STOLE_LOCK=0
+    return 0
+}
 
 cleanup() {
     if [ -n "$ADV_CHILD" ] && kill -0 "$ADV_CHILD" 2>/dev/null; then
@@ -46,15 +86,26 @@ cleanup() {
         wait "$ADV_CHILD" 2>/dev/null || true
     fi
     ADV_CHILD=""
-    # Only a lock this control itself took.
-    if [ "$STOLE_LOCK" = "1" ]; then
-        _o="$(cat "$EVIDENCE_DIR/.exercise.lock/owner" 2>/dev/null || true)"
-        case "$_o" in
-            *"adverse-control pid=$$"*) rm -rf "$EVIDENCE_DIR/.exercise.lock" 2>/dev/null || true ;;
-            *) echo "warning: the stolen lock is no longer this control's; leaving it." >&2 ;;
-        esac
-        STOLE_LOCK=0
+    # This control's own disposable volume, by exact name, under authority.
+    if [ "$MADE_FOREIGN_VOL" != "0" ]; then
+        if adv_holds_lock || adv_take_lock; then
+            docker volume rm "$C_FOREIGN_VOL" >/dev/null 2>&1 || true
+            if _fv="$(docker volume ls -q --filter "name=^${C_FOREIGN_VOL}$" 2>/dev/null)"; then
+                if [ -z "$_fv" ]; then
+                    MADE_FOREIGN_VOL=0
+                else
+                    echo "error: $C_FOREIGN_VOL remains" >&2; RESTORE_OK=0
+                fi
+            else
+                echo "error: could not list volumes; removal of $C_FOREIGN_VOL is UNCONFIRMED" >&2
+                RESTORE_OK=0
+            fi
+        else
+            echo "error: the exercise lock is held elsewhere; $C_FOREIGN_VOL was NOT removed" >&2
+            RESTORE_OK=0
+        fi
     fi
+    adv_drop_lock
     return 0
 }
 on_signal() { echo "error: interrupted; cleaning up and stopping." >&2; cleanup; exit 130; }
@@ -108,26 +159,82 @@ emit "   backup volumes it left:       $B_STRAY   (expected 0: it never got that
 [ "${B_STRAY:-1}" = "0" ] || bad "$B_STRAY backup volume(s) were left behind"
 
 # ---------------------------------------------------------------------------
-# C. Created, then gone before the confirming read: responsibility is kept.
+# C. A positively foreign resource survives a rejected invocation.
+#
+# This used to create a volume, remove it, inspect it and then narrate what
+# the driver's rule "would" be. None of the code under review ran: the case
+# proved that `docker volume inspect` fails on a volume that is not there,
+# which nobody doubted. It also swallowed its own creation failure with
+# `|| true`, so if the volume was never created the case still "passed".
+#
+# Now the real exercise runs against a volume this control created and
+# labelled as somebody else's. Its ownership machinery is what decides the
+# outcome, and the assertions below are about what that machinery did.
 # ---------------------------------------------------------------------------
-log "3/5: a resource created, then absent when the confirmation reads it"
-C_VOL="fn-adverse-vol-$LOWER"
-C_TAG="adverse-$STAMP-$$"
-docker volume create --label "fn.owner=$C_TAG" "$C_VOL" >/dev/null 2>&1 || true
-# Removed out of band, exactly as a competing cleanup would: the confirming
-# read below then answers truthfully that it is not there.
-docker volume rm "$C_VOL" >/dev/null 2>&1 || true
-C_READ="$( { docker volume inspect -f '{{index .Labels "fn.owner"}}' "$C_VOL" 2>/dev/null || echo unreadable; } | tr -d ' \r\n')"
-C_LEFT="$(docker volume ls -q --filter "name=^${C_VOL}$" 2>/dev/null | grep -c . || true)"
+log "3/5: a foreign resource put in the exercise's path"
+C_FOREIGN_TAG="not-this-run-$STAMP"
+C_LOG="$EVIDENCE_DIR/.adverse-foreign-$$.log"
+# The prerequisite is ASSERTED, not assumed: a case built on a resource that
+# was never created proves nothing about preserving it.
+C_MADE=0
+if docker volume create --label "fn.owner=$C_FOREIGN_TAG" "$C_FOREIGN_VOL" >/dev/null 2>&1; then
+    MADE_FOREIGN_VOL=1
+    C_MADE=1
+else
+    bad "could not create the foreign volume; case C was NOT exercised"
+fi
+C_LABEL_BEFORE=unreadable
+C_SHA_BEFORE=ABSENT
+if [ "$C_MADE" = "1" ]; then
+    C_LABEL_BEFORE="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$C_FOREIGN_VOL" 2>/dev/null || echo unreadable)"
+    docker run --rm -v "$C_FOREIGN_VOL:/v" "$UTIL_IMAGE" \
+        sh -c 'printf "belongs to somebody else\n" > /v/canary.txt' >/dev/null 2>&1 || true
+    C_SHA_BEFORE="$(docker run --rm -v "$C_FOREIGN_VOL:/v:ro" "$UTIL_IMAGE" \
+        sh -c 'if [ -f /v/canary.txt ]; then sha256sum /v/canary.txt | cut -d" " -f1; else echo ABSENT; fi' \
+        2>/dev/null | tr -d ' \r\n')"
+    if [ "$C_LABEL_BEFORE" != "$C_FOREIGN_TAG" ]; then
+        bad "the foreign volume does not carry its foreign label; case C was NOT exercised"
+        C_MADE=0
+    fi
+    case "$C_SHA_BEFORE" in ABSENT|"") bad "could not seed the foreign volume; case C was NOT exercised"; C_MADE=0 ;; esac
+fi
+C_EXIT=0
+C_VOLS_MADE=0
+if [ "$C_MADE" = "1" ]; then
+    FN_HU_BACKUP_VOL="$C_FOREIGN_VOL" sh "$EXERCISE" > "$C_LOG" 2>&1 || C_EXIT=$?
+    C_VOLS_MADE="$(docker volume ls -q 2>/dev/null | grep -c '^fn-hu-backup-' || true)"
+fi
+C_LABEL_AFTER="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$C_FOREIGN_VOL" 2>/dev/null || echo unreadable)"
+C_SHA_AFTER="$(docker run --rm -v "$C_FOREIGN_VOL:/v:ro" "$UTIL_IMAGE" \
+    sh -c 'if [ -f /v/canary.txt ]; then sha256sum /v/canary.txt | cut -d" " -f1; else echo ABSENT; fi' \
+    2>/dev/null | tr -d ' \r\n')"
+C_PRESENT="$(docker volume ls -q --filter "name=^${C_FOREIGN_VOL}$" 2>/dev/null | grep -c . || true)"
+C_NAMED="$(grep -ac "volume $C_FOREIGN_VOL already exists" "$C_LOG" 2>/dev/null || true)"
+C_BOUNDARY="$(grep -ac 'ownership pre-flight' "$C_LOG" 2>/dev/null || true)"
 emit ""
-emit "C. a volume created by this control and removed before its confirmation"
-emit "   confirming read:              $C_READ   (expected unreadable: it is genuinely gone)"
-emit "   volumes left with that name:  $C_LEFT   (expected 0)"
-emit "   the driver's rule: a creation that was ISSUED keeps responsibility even"
-emit "   when the confirming read fails, so cleanup still attempts removal and an"
-emit "   unreadable confirmation is reported rather than certifying cleanup."
-[ "$C_READ" = "unreadable" ] || bad "the confirming read did not fail as this case requires"
-[ "${C_LEFT:-1}" = "0" ] || bad "the control volume was not actually removed"
+emit "C. a positively foreign volume in the exercise's path"
+emit "   the volume this control created: $C_FOREIGN_VOL"
+emit "   its label, before:            $C_LABEL_BEFORE   (expected $C_FOREIGN_TAG:"
+emit "                                 the prerequisite is asserted, not assumed)"
+emit "   exercise exit status:         $C_EXIT   (expected non-zero)"
+emit "   it reached the ownership boundary: $C_BOUNDARY line(s)   (expected >= 1)"
+emit "   it named the volume:          $C_NAMED line(s)   (expected >= 1)"
+emit "   the volume still exists:      $C_PRESENT   (expected 1: a rejected"
+emit "                                 invocation must not delete a stranger's resource)"
+emit "   its label, after:             $C_LABEL_AFTER   (expected unchanged)"
+emit "   its contents:                 $([ "$C_SHA_AFTER" = "$C_SHA_BEFORE" ] && echo unchanged || echo "CHANGED ($C_SHA_AFTER)")"
+emit "   backup volumes it created:    $C_VOLS_MADE   (expected 0: it mutated nothing)"
+if [ "$C_MADE" != "1" ]; then
+    bad "the foreign volume was not established; case C was NOT exercised"
+else
+    [ "$C_EXIT" != "0" ] || bad "the exercise succeeded against a foreign volume"
+    [ "${C_BOUNDARY:-0}" -ge 1 ] || bad "the exercise never reached its ownership boundary"
+    [ "${C_NAMED:-0}" -ge 1 ] || bad "the exercise did not name the volume it refused"
+    [ "${C_PRESENT:-0}" = "1" ] || bad "the foreign volume was removed by an invocation that refused it"
+    [ "$C_LABEL_AFTER" = "$C_LABEL_BEFORE" ] || bad "the foreign volume's ownership label changed"
+    [ "$C_SHA_AFTER" = "$C_SHA_BEFORE" ] || bad "the foreign volume's contents changed"
+    [ "${C_VOLS_MADE:-1}" = "0" ] || bad "$C_VOLS_MADE backup volume(s) were created by a rejected invocation"
+fi
 
 # ---------------------------------------------------------------------------
 # D. The lock changes hands during a handoff.
@@ -202,30 +309,91 @@ else
         *) bad "the driver removed or replaced another holder's lock (owner now '${D_OWNER:-gone}')" ;;
     esac
 fi
-# Anything the driver reported as retained is this control's to clear now.
-D_RETAINED="$(grep -a -A6 'cleaned up NOTHING' "$D_LOG" | grep -aE 'document|database|volume|fault service' | sed 's/^ *//' | tr '\n' ';')"
+# Anything the driver reported as retained is this control's to clear -- and
+# ONLY that.
+#
+# This used to release the lock first and then delete by prefix: every volume
+# matching `fn-refusal-vol-`, every database matching `fn_refusal_db_%`, every
+# document matching `hu-held-refusal-*.pdf`, the shared `renamer-hold`, and a
+# recreate of renamer-1, renamer-2 and watcher -- all with no lock held. A
+# concurrent exercise that had just taken the lock would have had its
+# resources destroyed underneath it by the very control that exists to prove
+# resources are not destroyed. The driver names what it retained, by exact
+# name, so those exact names are what get cleared, under authority held for
+# the whole of it.
+D_REPORT="$(grep -a -A8 'cleaned up NOTHING' "$D_LOG" 2>/dev/null | sed 's/^ *//' || true)"
+RETAINED_DOCS="$(printf '%s\n' "$D_REPORT" | sed -n 's|^document /srv/fn/consume/||p')"
+RETAINED_DBS="$(printf '%s\n' "$D_REPORT" | sed -n 's|^database ||p')"
+RETAINED_VOLS="$(printf '%s\n' "$D_REPORT" | sed -n 's|^volume ||p')"
+RETAINED_SVCS="$(printf '%s\n' "$D_REPORT" | sed -n 's|^fault service ||p')"
+if printf '%s\n' "$D_REPORT" | grep -q 'live applications may still be stopped'; then
+    RETAINED_LIVE=1
+fi
+D_RETAINED="$(printf '%s\n' "$D_REPORT" | grep -aE '^(document|database|volume|fault service) ' | tr '\n' ';')"
 emit "   the driver named as retained: ${D_RETAINED:-none}"
-cleanup   # releases this control's stolen lock before the retained items are cleared
-for _v in $(docker volume ls -q 2>/dev/null | grep '^fn-refusal-vol-' || true); do
-    docker volume rm "$_v" >/dev/null 2>&1 || true
-done
-for _d in $(compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
-        postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d postgres -tA \
-        -c "SELECT datname FROM pg_database WHERE datname LIKE 'fn_refusal_db_%';" </dev/null 2>/dev/null | tr -d ' \r'); do
-    compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
-        postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d postgres \
-        -c "DROP DATABASE IF EXISTS $_d;" </dev/null >/dev/null 2>&1 || true
-done
-compose run --rm --no-deps -T --entrypoint sh storage-init \
-    -c 'rm -f /srv/fn/consume/hu-held-refusal-*.pdf' >/dev/null 2>&1 </dev/null || true
-compose --profile fault stop -t 15 renamer-hold >/dev/null 2>&1 || true
-compose --profile fault rm -f renamer-hold >/dev/null 2>&1 || true
-recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
-CLEARED_VOL="$(docker volume ls -q 2>/dev/null | grep -c '^fn-refusal-vol-' || true)"
-CLEARED_SVC="$(compose --profile fault ps -aq renamer-hold 2>/dev/null | grep -c . || true)"
-emit "   this control then cleared them: volumes left $CLEARED_VOL, fault services left $CLEARED_SVC"
-[ "${CLEARED_VOL:-1}" = "0" ] || bad "$CLEARED_VOL retained volume(s) could not be cleared"
-[ "${CLEARED_SVC:-1}" = "0" ] || bad "$CLEARED_SVC retained fault service(s) could not be cleared"
+
+# Authority FIRST, and kept until the clearing is finished. The stolen lock is
+# still this control's at this point; if it is not, nothing is touched.
+D_CLEAR_OK=1
+D_LEFT=0
+if adv_holds_lock || adv_take_lock; then
+    for _doc in $RETAINED_DOCS; do
+        compose run --rm --no-deps -T -e FN_T="/srv/fn/consume/$_doc" --entrypoint sh storage-init \
+            -c 'rm -f "$FN_T"' >/dev/null 2>&1 </dev/null || true
+        case "$(probe_exists "/srv/fn/consume/$_doc")" in
+            no) : ;;
+            *)  echo "error: retained document $_doc could not be confirmed removed" >&2
+                D_CLEAR_OK=0; D_LEFT=$((D_LEFT + 1)) ;;
+        esac
+    done
+    for _db in $RETAINED_DBS; do
+        compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+            postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d postgres \
+            -c "DROP DATABASE IF EXISTS $_db;" </dev/null >/dev/null 2>&1 || true
+        _dbn="$(compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+            postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d postgres -tA \
+            -c "SELECT count(*) FROM pg_database WHERE datname='$_db';" </dev/null 2>/dev/null | tr -d ' \r\n')"
+        case "$_dbn" in
+            0) : ;;
+            *) echo "error: retained database $_db remains (read '$_dbn')" >&2
+               D_CLEAR_OK=0; D_LEFT=$((D_LEFT + 1)) ;;
+        esac
+    done
+    for _vol in $RETAINED_VOLS; do
+        docker volume rm "$_vol" >/dev/null 2>&1 || true
+        if _vn="$(docker volume ls -q --filter "name=^${_vol}$" 2>/dev/null)"; then
+            [ -z "$_vn" ] || { echo "error: retained volume $_vol remains" >&2
+                               D_CLEAR_OK=0; D_LEFT=$((D_LEFT + 1)); }
+        else
+            echo "error: could not list volumes; removal of $_vol is UNCONFIRMED" >&2
+            D_CLEAR_OK=0; D_LEFT=$((D_LEFT + 1))
+        fi
+    done
+    for _svc in $RETAINED_SVCS; do
+        compose --profile fault stop -t 15 "$_svc" >/dev/null 2>&1 || true
+        compose --profile fault rm -f "$_svc" >/dev/null 2>&1 || true
+        if _sn="$(compose --profile fault ps -aq "$_svc" 2>/dev/null)"; then
+            [ -z "$_sn" ] || { echo "error: retained fault service $_svc remains" >&2
+                               D_CLEAR_OK=0; D_LEFT=$((D_LEFT + 1)); }
+        else
+            echo "error: could not query $_svc; removal is UNCONFIRMED" >&2
+            D_CLEAR_OK=0; D_LEFT=$((D_LEFT + 1))
+        fi
+    done
+    # Only if the driver said it had left them stopped.
+    if [ "$RETAINED_LIVE" = "1" ]; then
+        recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
+    fi
+    D_CLEARED=yes
+else
+    D_CLEARED=NO
+    D_CLEAR_OK=0
+    echo "error: the exercise lock is held elsewhere; the retained resources were NOT cleared." >&2
+fi
+adv_drop_lock
+emit "   this control then cleared them: $D_CLEARED   (exact names only, under the lock;"
+emit "                                 unconfirmed or remaining: $D_LEFT)"
+[ "$D_CLEAR_OK" = "1" ] || bad "$D_LEFT retained resource(s) could not be confirmed cleared"
 
 # ---------------------------------------------------------------------------
 # E. The parent is interrupted while its child owns the lock.
@@ -290,22 +458,39 @@ else
     [ "$E_LOCK" = "released" ] || bad "the lock was left held after the interruption"
     [ "${E_FAULTS:-1}" = "0" ] || bad "$E_FAULTS fault service(s) survived the interruption"
 fi
-recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
+# Recreating shared services is a mutation like any other, so it happens under
+# the lock or not at all. The interrupted driver's own cleanup has already
+# restored what it stopped; this is the backstop, and a backstop that runs
+# without authority is just another way to disrupt whoever holds it now.
+if adv_holds_lock || adv_take_lock; then
+    recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
+    adv_drop_lock
+else
+    echo "warning: the exercise lock is held elsewhere; services were left as the driver restored them." >&2
+fi
 
-emit ""
-emit "mismatches: $FAILURES"
+# Cleanup runs BEFORE the count is emitted. It can discover that a resource
+# could not be removed or confirmed, and a "mismatches: 0" printed beforehand
+# would be contradicted by the exit status rather than agreeing with it.
 cleanup
 trap - EXIT INT TERM
+[ "$RESTORE_OK" = "1" ] || bad "restoration was incomplete or could not be confirmed"
 L1="$(compose ps --format '{{.Health}}' renamer-1 2>/dev/null | head -1)"
 L2="$(compose ps --format '{{.Health}}' renamer-2 2>/dev/null | head -1)"
 LW="$(compose ps --format '{{.Health}}' watcher 2>/dev/null | head -1)"
+FOREIGN_LEFT="$(docker volume ls -q --filter "name=^${C_FOREIGN_VOL}$" 2>/dev/null | grep -c . || true)"
 emit ""
 emit "restoration (read back from the running stack):"
 emit "   renamer-1 / renamer-2 / watcher: $L1 / $L2 / $LW   (expected healthy x3)"
 emit "   exercise lock:                   $([ -d "$EVIDENCE_DIR/.exercise.lock" ] && echo HELD || echo released)"
+emit "   this control's own volume:       $([ "${FOREIGN_LEFT:-1}" = "0" ] && echo removed || echo "LEFT BEHIND")   (expected removed)"
 { [ "$L1" = "healthy" ] && [ "$L2" = "healthy" ] && [ "$LW" = "healthy" ]; } \
     || bad "the live stack is not healthy after this control ($L1/$L2/$LW)"
 if [ -d "$EVIDENCE_DIR/.exercise.lock" ]; then bad "the exercise lock was left held"; fi
+[ "${FOREIGN_LEFT:-1}" = "0" ] || bad "this control's own volume $C_FOREIGN_VOL was left behind"
+
+emit ""
+emit "mismatches: $FAILURES"
 
 if [ "$FAILURES" = "0" ]; then
     report_restored

@@ -39,8 +39,21 @@ UTIL_IMAGE="${FN_UTIL_IMAGE:-alpine:3}"
 PROD="$DEPLOY_DIR/production"
 FAILURES=0
 
-# Ownership flags. Each is set ONLY after this invocation established the
-# resource, and cleanup consults them rather than a name.
+# Ownership flags. Three-valued, because "might have created it" and "did not
+# create it" are different answers and only one of them authorises a delete:
+#
+#   0  not this invocation's -- never attempted, or POSITIVELY foreign
+#   1  ATTEMPTED             -- creation was issued; disposition unconfirmed
+#   2  confirmed             -- creation was issued and verified
+#
+# Responsibility is taken before the creation command so a resource that WAS
+# made but could not be confirmed still gets cleaned up. It is dropped back to
+# 0 only when an inspection proves the resource belongs to somebody else --
+# retaining responsibility for an attempt must never become permission to
+# delete a stranger's resource. An inspection that fails to answer is not such
+# a proof: it stays 1, cleanup still tries, and restoration is reported
+# incomplete rather than clean.
+owned() { [ "$1" = "1" ] || [ "$1" = "2" ]; }
 OWNS_LOCK=0
 OWNS_HOLD_SVC=0
 OWNS_FAULT_SVC=0
@@ -175,7 +188,7 @@ cleanup() {
             RESTORE_OK=0
         fi
     fi
-    if [ "$OWNS_RESTORE_VHOST" = "1" ]; then
+    if owned "$OWNS_RESTORE_VHOST"; then
         compose exec -T rabbitmq rabbitmqctl delete_vhost "$RESTORE_VHOST" >/dev/null 2>&1 || true
         if _vh="$(compose exec -T rabbitmq rabbitmqctl list_vhosts 2>/dev/null)"; then
             printf '%s\n' "$_vh" | grep -qx "$RESTORE_VHOST" && {
@@ -185,7 +198,7 @@ cleanup() {
             RESTORE_OK=0
         fi
     fi
-    if [ "$OWNS_RESTORE_DB" = "1" ]; then
+    if owned "$OWNS_RESTORE_DB"; then
         psqlq "DROP DATABASE IF EXISTS $RESTORE_DB;" postgres >/dev/null 2>&1 || true
         _db="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$RESTORE_DB';" postgres)"
         case "$_db" in
@@ -193,7 +206,7 @@ cleanup() {
             *) echo "error: database $RESTORE_DB remains (read '$_db')" >&2; RESTORE_OK=0 ;;
         esac
     fi
-    if [ "$OWNS_BACKUP_VOL" = "1" ]; then
+    if owned "$OWNS_BACKUP_VOL"; then
         docker volume rm "$BACKUP_VOL" >/dev/null 2>&1 || true
         if _vl="$(docker volume ls -q --filter "name=^${BACKUP_VOL}$" 2>/dev/null)"; then
             [ -z "$_vl" ] || { echo "error: volume $BACKUP_VOL remains" >&2; RESTORE_OK=0; }
@@ -235,7 +248,15 @@ cleanup() {
     if [ "$LIVE_TOUCHED" = "1" ]; then
         recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
     fi
-    exercise_unlock
+    # `exercise_unlock` is an unconditional `rm -rf`, so the owner file is
+    # checked first. A lock that has changed hands belongs to somebody else
+    # and removing it would hand this stack to a third invocation.
+    _xu="$(cat "$EVIDENCE_DIR/.exercise.lock/owner" 2>/dev/null || true)"
+    case "$_xu" in
+        *"pid=$$ "*|*"pid=$$") exercise_unlock ;;
+        *) echo "warning: the exercise lock is not this process's; leaving it in place." >&2 ;;
+    esac
+    OWNS_LOCK=0
     return 0
 }
 # On a catchable interruption the exercise ENDS after cleanup, unsuccessfully.
@@ -465,6 +486,18 @@ log "3/8: backing up the ledger and the document roots"
 # about who created it. The label does: if it comes back, this invocation
 # created the volume; if it does not, something else owns it and it is left
 # alone.
+# Checked again here, at the moment of creation. The 0/8 pre-flight proves
+# the name was free minutes ago; this proves it is free NOW, and that window
+# is the whole risk -- responsibility is taken on the next line, and a volume
+# that appeared in between would be a stranger's that this run's cleanup then
+# deleted. A failed or unreadable answer stops the creation rather than being
+# noted and stepped over.
+if _bv_pre="$(docker volume ls -q --filter "name=^${BACKUP_VOL}$" 2>/dev/null)"; then
+    [ -z "$_bv_pre" ] \
+        || fatal "volume $BACKUP_VOL already exists; this invocation did not create it, and nothing has been changed"
+else
+    fatal "could not establish whether volume $BACKUP_VOL exists; refusing to create over an unknown, and nothing has been changed"
+fi
 # Responsibility BEFORE the creation. Taking it only after the confirming read
 # meant a volume that WAS created but whose label could not be read was left
 # with nobody responsible for removing it.
@@ -473,9 +506,13 @@ docker volume create --label "fn.owner=$HU_RUN_TAG" "$BACKUP_VOL" >/dev/null 2>&
     || fatal "could not create the backup volume"
 _bv_owner="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$BACKUP_VOL" 2>/dev/null || echo unreadable)"
 case "$_bv_owner" in
-    "$HU_RUN_TAG") : ;;
-    unreadable)    fatal "could not read the backup volume's ownership label; cleanup will still try to remove it" ;;
-    *)             fatal "volume $BACKUP_VOL carries owner '$_bv_owner'; cleanup will report rather than assume" ;;
+    "$HU_RUN_TAG") OWNS_BACKUP_VOL=2 ;;
+    unreadable)    fatal "could not read the backup volume's ownership label; responsibility is retained, cleanup will still try to remove it, and restoration is reported unconfirmed" ;;
+    # Positively somebody else's. `docker volume create` is idempotent and
+    # applies no labels to an existing volume, so this is the reading that
+    # says the volume pre-dated this invocation. Hands off it.
+    *)             OWNS_BACKUP_VOL=0
+                   fatal "volume $BACKUP_VOL carries owner '$_bv_owner'; it is not this invocation's and will NOT be removed" ;;
 esac
 compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
     pg_dump -U "${FN_DB_USER:-fn_app}" -d "${FN_DB_NAME:-filename_normalizer}" -Fc \
@@ -494,6 +531,16 @@ emit "   ledger dump and four role archives written"
 # 4. Restore into a throwaway ledger and a host tree the restored stack mounts.
 # ---------------------------------------------------------------------------
 log "4/8: restoring into a throwaway ledger and filesystem"
+# Re-checked at the moment of creation, for the same reason as the volume
+# above: the pre-flight's answer is minutes old. CREATE DATABASE on a name
+# already taken fails, and responsibility taken beforehand meant cleanup
+# dropped a database this invocation had never created.
+_rdb_pre="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$RESTORE_DB';" postgres)"
+case "$_rdb_pre" in
+    0)  ;;
+    "") fatal "could not establish whether database $RESTORE_DB exists; refusing to create over an unknown, and nothing has been changed" ;;
+    *)  fatal "database $RESTORE_DB already exists; this invocation did not create it, and nothing has been changed" ;;
+esac
 OWNS_RESTORE_DB=1
 compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
     psql -U "${FN_DB_USER:-fn_app}" -d postgres -c "CREATE DATABASE $RESTORE_DB;" >/dev/null 2>&1 </dev/null \
@@ -543,6 +590,21 @@ emit "   foreign occupant bytes:       $([ "$R_FOREIGN_SHA" = "$FOREIGN_SHA" ] &
 # 5. Start REAL applications on the restored ledger and filesystem.
 # ---------------------------------------------------------------------------
 log "5/8: starting real applications against the restored system"
+# Same rule for the broker, re-checked at the moment of creation.
+# `rabbitmqctl add_vhost` on an existing vhost fails, and the old order left
+# cleanup deleting a vhost -- and every queue in it -- that belonged to
+# whoever really made it.
+#
+# The listing is tested inside `if`, not as `... | grep -qx X && fatal ...`:
+# under `set -e` that list aborts the script when grep finds nothing, which is
+# the ordinary case this check exists for.
+if _vh_pre="$(compose exec -T rabbitmq rabbitmqctl list_vhosts 2>/dev/null)"; then
+    if printf '%s\n' "$_vh_pre" | grep -qx "$RESTORE_VHOST"; then
+        fatal "broker vhost $RESTORE_VHOST already exists; this invocation did not create it, and nothing has been changed"
+    fi
+else
+    fatal "could not list broker vhosts; refusing to create $RESTORE_VHOST over an unknown, and nothing has been changed"
+fi
 OWNS_RESTORE_VHOST=1
 compose exec -T rabbitmq rabbitmqctl add_vhost "$RESTORE_VHOST" >/dev/null 2>&1 \
     || fatal "could not create the restored stack's broker vhost"
