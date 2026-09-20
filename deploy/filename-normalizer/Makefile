@@ -131,7 +131,16 @@ down-clean: ## Stop the stack and delete only this project's volumes
 # ---------------------------------------------------------------------------
 
 .PHONY: test
-test: ## Run the full phased integration suite (F1-F6) in containers
+# Depends on `build` so the suite cannot run a STALE image.
+#
+# `run_phase` starts the assertions with `compose run`, which reuses an
+# existing image and never rebuilds it on a source change. A run of this
+# target executed a test binary from before the working tree's edits and
+# reported 21/21: the phase log printed its report from f5_drain_test.go:325
+# while the file on disk had moved that line to 361, and the assertions added
+# in between never ran at all. Docker layer caching makes this cheap when
+# nothing changed.
+test: build ## Run the full phased integration suite (F1-F6) in containers
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/run-integration.sh
 
@@ -222,6 +231,16 @@ test-reconcile-resume: ## Prove a reconciled receipt does not make the published
 test-post-commit-interval: ## Prove the interval between a committed receipt and a visible document holds
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-post-commit-interval.sh
+
+.PHONY: test-restore-refusals
+test-restore-refusals: ## Prove each restore refusal stops dependent work and preserves what it refused
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-restore-refusals.sh
+
+.PHONY: test-restore-held-uncertain
+test-restore-held-uncertain: ## Prove a restore preserves held and uncertain outcomes and reopens neither
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-restore-held-uncertain.sh
 
 .PHONY: test-restore-replay
 test-restore-replay: ## Prove the documented restore quarantine prevents the replay a live-root restore causes

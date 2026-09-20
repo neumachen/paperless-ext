@@ -416,6 +416,26 @@ services:
       FN_INSTANCE: renamer-2
       FN_DB_APPLY_MIGRATIONS: "false"
       FN_RENAMER_CONCURRENCY: ${FN_RENAMER_CONCURRENCY:-2}
+      # Qualification-only, and inert unless the drain phase sets them:
+      # LoadFaultPoints returns (nil, nil) for an empty FN_FAULT_POINTS, so in
+      # every other phase this instance is an ordinary renamer. These keys
+      # exist in THIS development compose file only; production/compose.prod.yml
+      # has no fault plumbing and verify-deployment-package.sh asserts that.
+      #
+      # The drain phase needs an instance that is provably still handling a
+      # delivery when SIGTERM arrives. Without a hold that window is one or two
+      # durable writes wide and the phase terminated an idle instance while
+      # still reporting green.
+      FN_FAULT_POINTS: ${FN_RENAMER2_FAULT_POINTS:-}
+      FN_FAULT_HOLD: ${FN_RENAMER2_FAULT_HOLD:-0s}
+      # The handler budget IS the shutdown timeout (processor.go sets
+      # HandlerBudget: cfg.ShutdownTimeout), so a held delivery must be able to
+      # finish inside it or the drain would record shutdown_timeout instead of
+      # a clean drain.
+      FN_SHUTDOWN_TIMEOUT: ${FN_RENAMER2_SHUTDOWN_TIMEOUT:-20s}
+      # Pinned so raising the budget above does not silently move the
+      # claim-staleness threshold, which defaults to the shutdown timeout.
+      FN_PUBLISH_TAKEOVER_AFTER: ${FN_RENAMER2_TAKEOVER_AFTER:-20s}
     ports:
       - "${FN_RENAMER2_PORT:-18082}:8080"
 

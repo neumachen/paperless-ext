@@ -182,9 +182,35 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 	// instance; what is not allowed is a job left without an outcome. The
 	// check is aggregate because the load is thousands of rows: no job may
 	// remain in any non-terminal state.
-	nonTerminal := []jobs.State{
-		jobs.StatePendingDispatch, jobs.StateDispatching,
-		jobs.StateDispatched, jobs.StateProcessing,
+	//
+	// DERIVED from jobs.IsTerminal rather than listed. The list here named
+	// four states and omitted `publishing`, so a fixture stopped between its
+	// claim and its link -- exactly where this phase's injected hold puts one
+	// -- counted as having reached a durable outcome. Deriving it means a
+	// state added to the model cannot be forgotten here.
+	var nonTerminal []jobs.State
+	for _, st := range jobs.States() {
+		if !jobs.IsTerminal(st) {
+			nonTerminal = append(nonTerminal, st)
+		}
+	}
+	// Scoped to THIS phase's work, not to the whole table.
+	//
+	// The aggregate snapshot counts every row the ledger has ever held. A job
+	// left `publishing` by an unrelated exercise twenty-one hours earlier --
+	// one this pass is explicitly not allowed to resolve -- therefore failed
+	// the drain, reporting `publishing=1` about work the drain never touched.
+	// The question is whether the terminated instance stranded ITS work.
+	//
+	// This phase's jobs are the synthetic load, whose source names carry the
+	// run id, and the real drain documents, whose prefix the orchestrator
+	// records alongside them.
+	realPrefix := strings.TrimSpace(e.LoadState(t, "drain-real-prefix"))
+	mine := func(sourceName string) bool {
+		if strings.Contains(sourceName, e.RunID) {
+			return true
+		}
+		return realPrefix != "" && strings.HasPrefix(sourceName, realPrefix)
 	}
 	var snap ledger.Counts
 	werr := waitForErr(6*time.Minute, func() error {
@@ -195,17 +221,45 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 		}
 		var outstanding []string
 		for _, st := range nonTerminal {
-			if n := snap.ByState[st]; n > 0 {
+			if snap.ByState[st] == 0 {
+				continue
+			}
+			rows, lerr := led.JobsInState(ctx, st, 5000)
+			if lerr != nil {
+				// An inspection that could not run is unknown, and unknown is
+				// not "none outstanding".
+				return fmt.Errorf("listing jobs in state %s: %w", st, lerr)
+			}
+			n := 0
+			for _, j := range rows {
+				if mine(j.SourceName) {
+					n++
+				}
+			}
+			if n > 0 {
 				outstanding = append(outstanding, fmt.Sprintf("%s=%d", st, n))
 			}
 		}
 		if len(outstanding) > 0 {
-			return fmt.Errorf("jobs are still outstanding: %s", strings.Join(outstanding, " "))
+			return fmt.Errorf("jobs from this phase are still outstanding: %s",
+				strings.Join(outstanding, " "))
 		}
 		return nil
 	})
 	if werr != nil {
 		t.Fatalf("jobs were left without a durable outcome after a renamer was terminated under load: %v", werr)
+	}
+	// Unrelated outstanding work is reported, never asserted on: it belongs to
+	// whatever produced it, and this phase may not resolve it.
+	var foreignOutstanding []string
+	for _, st := range nonTerminal {
+		if n := snap.ByState[st]; n > 0 {
+			foreignOutstanding = append(foreignOutstanding, fmt.Sprintf("%s=%d", st, n))
+		}
+	}
+	if len(foreignOutstanding) > 0 {
+		t.Logf("outstanding jobs elsewhere in the ledger, not this phase's and not asserted on: %s",
+			strings.Join(foreignOutstanding, " "))
 	}
 
 	// A spot check on individually recorded identities, so the aggregate is
@@ -253,6 +307,7 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 		sawComplete     bool
 		sawTimeout      bool
 		inFlightAtDrain int
+		faultPaused     int
 	)
 	for _, r := range records {
 		ts, perr := time.Parse(time.RFC3339Nano, r.String("time"))
@@ -260,6 +315,13 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 			continue
 		}
 		switch r.String("event") {
+		case "fault_point_paused":
+			// The instance actually ENTERED the injected hold. Being armed is
+			// not evidence of that: a run armed with hold_after_claim took
+			// 5213 deliveries and paused none, because the synthetic drain
+			// load is rejected at source validation and never reaches the
+			// publication path where every fault point lives.
+			faultPaused++
 		case "shutdown_started":
 			if shutdownAt.IsZero() {
 				shutdownAt = ts
@@ -299,11 +361,32 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 	if sawTimeout {
 		t.Errorf("renamer-2 logged shutdown_timeout: a worker did not finish within the budget")
 	}
-	// The whole point of the phase: deliveries were in flight at shutdown.
-	if settledAfter < 1 && drainingCount < 1 && inFlightAtDrain < 1 {
-		t.Errorf("no evidence that any delivery was in flight when shutdown began "+
-			"(settled_after_shutdown=%d consumer_draining_peak=%d in_flight_at_withdrawal=%d); "+
-			"this phase did not exercise a drain", settledAfter, drainingCount, inFlightAtDrain)
+	// The whole point of the phase, asserted as separate necessary facts
+	// rather than as "any one of three looked non-zero".
+	//
+	// The old disjunction passed whenever the phase happened to catch a single
+	// delivery, which it did on three runs out of four, twice with identical
+	// evidence. A property proven by whichever way a race falls is not proven.
+	//
+	// 1. The fixture reached the interruption point.
+	if faultPaused < 1 {
+		t.Errorf("renamer-2 never entered its injected hold (fault_point_paused=%d): "+
+			"the termination did not land on work in progress, so this run did not "+
+			"exercise a drain however the counters below read", faultPaused)
+	}
+	// 2. Work was genuinely active when shutdown began and reached its durable
+	//    outcome DURING the shutdown. This is the drain itself.
+	if settledAfter < 1 {
+		t.Errorf("no delivery settled at or after shutdown_started "+
+			"(settled_after_shutdown=%d): nothing drained", settledAfter)
+	}
+	// 3. Readiness was withdrawn while work was still held. Either the
+	//    instance reported draining, or it recorded the in-flight count at
+	//    withdrawal; both are its own observation of the same moment.
+	if drainingCount < 1 && inFlightAtDrain < 1 {
+		t.Errorf("readiness withdrawal recorded no work in hand "+
+			"(consumer_draining_peak=%d in_flight_at_withdrawal=%d): the instance "+
+			"withdrew while idle", drainingCount, inFlightAtDrain)
 	}
 
 	exit := strings.TrimSpace(e.LoadState(t, "renamer2-exit-code"))
@@ -311,16 +394,23 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 		t.Errorf("renamer-2 exited with code %q after SIGTERM, expected 0", exit)
 	}
 	stopSecs := strings.TrimSpace(e.LoadState(t, "renamer2-stop-seconds"))
-	if d, derr := time.ParseDuration(stopSecs + "s"); derr == nil && d >= 40*time.Second {
+	// Bounded, not timed. The orchestrator stops this instance with a 90s
+	// grace while it holds a delivery, so what has to be true is that it exits
+	// inside that budget without being killed -- not that it takes any
+	// particular number of seconds. Asserting a duration would turn an
+	// injected hold into a product requirement.
+	if d, derr := time.ParseDuration(stopSecs + "s"); derr == nil && d >= 90*time.Second {
 		t.Errorf("renamer-2 took %s to terminate, at or beyond its grace period: exit is not bounded", d)
 	}
 
 	report := fmt.Sprintf(
 		"registered_during_load=%d all_reached_durable_outcome=true stranded_in_processing=%d\n"+
+			"injected_holds_entered=%d\n"+
 			"in_flight_at_readiness_withdrawal=%d consumer_draining_peak=%d deliveries_settled_during_shutdown=%d\n"+
 			"consumer_draining_logged=%t shutdown_complete=%t shutdown_timeout=%t\n"+
 			"exit_code=%s stop_duration_seconds=%s\n",
-		registered, snap.ByState[jobs.StateProcessing], inFlightAtDrain, drainingCount, settledAfter,
+		registered, snap.ByState[jobs.StateProcessing], faultPaused,
+		inFlightAtDrain, drainingCount, settledAfter,
 		sawDraining, sawComplete, sawTimeout, exit, stopSecs)
 	t.Logf("%s", report)
 	e.WriteEvidence(t, "f5-drain-under-load.txt", []byte(report))

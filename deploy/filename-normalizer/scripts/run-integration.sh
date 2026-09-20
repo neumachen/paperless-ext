@@ -11,6 +11,74 @@
 . "$(dirname "$0")/lib.sh"
 
 RUN_ID="${FN_TEST_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+
+# A single scalar out of the ledger. Only the drain phase needs one, to wait
+# for discovery to register its real documents before the termination.
+# `tr -d ' '` is applied to the RESULT of a count, never to a name: deleting
+# spaces from data corrupted a timestamp in an earlier exercise.
+# renamer-2 carries a qualification-only override during the drain phase, and
+# it must come off on EVERY exit path.
+#
+# It used to be undone only after `run_phase drained` returned, so a run that
+# stopped earlier -- the drain guard refusing to terminate an instance holding
+# nothing, an interrupt, any `exit 1` above -- left renamer-2 armed with
+# hold_after_claim and a 45s budget. That was observed: a later exercise on
+# this stack then ran against an instance that pauses on every claim.
+DRAIN_OVERRIDE_ACTIVE=0
+RESTORE_FAILED=0
+
+restore_drain_overrides() {
+    [ "$DRAIN_OVERRIDE_ACTIVE" = "1" ] || return 0
+    DRAIN_OVERRIDE_ACTIVE=0
+    log "restoring renamer-2 to its ordinary configuration"
+    # Recreated, not restarted: a restart keeps the environment the container
+    # was created with, so the override would survive it.
+    recreate_service renamer-2 || true
+
+    # Verified from the RUNNING service, not assumed from the compose file.
+    _rd_ready="$(compose ps --format '{{.Health}}' renamer-2 2>/dev/null | head -1)"
+    [ -n "$_rd_ready" ] || _rd_ready=unreadable
+
+    # A failed inspection and a zero count are different answers. `grep -c`
+    # exits non-zero on no matches, so `|| true` turned "docker inspect could
+    # not run" and "the variable is absent" into the same 0 -- and 0 is the
+    # value that says restoration succeeded.
+    if _rd_envout="$(docker inspect "$(compose ps -q renamer-2 2>/dev/null)" \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)"; then
+        _rd_env="$(printf '%s\n' "$_rd_envout" | grep -c '^FN_FAULT_POINTS=hold_after_claim' || true)"
+    else
+        _rd_env=unreadable
+    fi
+    if _rd_logout="$(compose logs renamer-2 2>/dev/null)"; then
+        _rd_armed="$(printf '%s\n' "$_rd_logout" | grep -c 'fault_points_armed' || true)"
+    else
+        _rd_armed=unreadable
+    fi
+    _rd_takeover="$(effective_value renamer-2 "d['processing']['publish_takeover_ms']")"
+
+    note "renamer-2 readiness:            ${_rd_ready:-unknown}"
+    note "renamer-2 fault env present:    ${_rd_env:-unknown} (expected 0)"
+    note "renamer-2 armed since recreate: ${_rd_armed:-unknown} (expected 0)"
+    note "renamer-2 publish_takeover_ms:  ${_rd_takeover:-unreadable} (expected 20000)"
+
+    # An inspection that could not run is UNKNOWN, and unknown is not restored.
+    if [ "$_rd_ready" != "healthy" ] \
+       || [ "${_rd_env:-1}" != "0" ] \
+       || [ "${_rd_armed:-1}" != "0" ] \
+       || [ "${_rd_takeover:-unreadable}" != "20000" ]; then
+        echo "error: renamer-2 was NOT restored to its ordinary configuration." >&2
+        echo "       It may still carry the drain phase's injected hold." >&2
+        RESTORE_FAILED=1
+    fi
+}
+trap 'restore_drain_overrides' EXIT INT TERM
+
+psql_scalar() {
+    compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+        postgres-primary psql -U "${FN_DB_USER:-fn_app}" \
+        -d "${FN_DB_NAME:-filename_normalizer}" -tA -c "$1" \
+        </dev/null 2>/dev/null | tr -d ' \r\n'
+}
 PHASE_FAILURES=0
 export RUN_ID
 
@@ -238,6 +306,39 @@ compose --profile fault rm -f renamer-no-schema >/dev/null 2>&1 || true
 # message straight to one of them, so no depth accumulates however fast the
 # publisher runs — an earlier attempt published 1200 messages over 75 seconds
 # and the queue never exceeded zero.
+# renamer-2 is rebuilt HERE, before the consumers are stopped, so it holds
+# each delivery it later claims and the drain below is deterministic.
+#
+# Without a hold the window is one or two durable writes wide, and the phase
+# terminated an idle instance while still reporting green: `drained` passed on
+# three of four runs by catching a single delivery by chance, twice with
+# byte-identical evidence (stop_duration_seconds=0). That is not a property
+# being asserted, it is a coin flip.
+#
+# Arming must happen before the stop below, not after the restart: recreating
+# a container and waiting for health takes tens of seconds, and renamer-1
+# drains the backlog in less than that, so an instance armed afterwards sits
+# armed and idle -- observed as `fault_points_armed` twice and
+# `fault_point_paused` never.
+#
+# Qualification only. These variables exist in this development compose file;
+# production/compose.prod.yml has no fault plumbing.
+# Armed BEFORE the command that mutates, not after it. `compose up
+# --force-recreate` can remove the old container and fail while creating the
+# new one; arming afterwards meant that partial change was never undone.
+DRAIN_OVERRIDE_ACTIVE=1
+(
+    export FN_RENAMER2_FAULT_POINTS=hold_after_claim
+    export FN_RENAMER2_FAULT_HOLD=15s
+    # The handler budget is the shutdown timeout, so a held delivery must be
+    # able to finish inside it; otherwise the drain records shutdown_timeout.
+    export FN_RENAMER2_SHUTDOWN_TIMEOUT=45s
+    # Pinned, so raising the budget does not move the claim-staleness rule.
+    export FN_RENAMER2_TAKEOVER_AFTER=20s
+    compose up -d --force-recreate renamer-2
+)
+wait_healthy renamer-2 180
+
 log "stopping both renamers so the work queue can accumulate"
 compose stop -t 30 renamer-1 renamer-2
 wait_stopped renamer-1
@@ -245,6 +346,43 @@ wait_stopped renamer-2
 
 log "filling the work queue"
 run_phase drain_under_load "" || true
+
+# The synthetic batch above registers ledger rows for files that DO NOT EXIST
+# and builds depth by republishing their references. Those deliveries are
+# rejected at source validation and held, so they never reach the publication
+# path -- and every injected fault point lives inside it. An instance armed
+# with hold_after_claim took 5213 of them and paused zero times.
+#
+# So the drain also needs work that genuinely publishes. These are real files
+# in the incoming root: the watcher registers them, the renamers claim them,
+# and renamer-2 pauses in the claim it is armed to hold.
+log "submitting real documents so the drain has publishable work"
+_dq_stamp="$(date -u +%Y%m%dT%H%M%SZ | tr 'A-Z' 'a-z')"
+DRAIN_REAL_PREFIX="drainq-$_dq_stamp"
+_dq=1
+while [ "$_dq" -le "${FN_DRAIN_REAL_DOCS:-24}" ]; do
+    compose run --rm --no-deps -T --entrypoint sh storage-init -c \
+        "printf '%%PDF-1.4 drain fixture $_dq\n' > /srv/fn/incoming/.wip-$DRAIN_REAL_PREFIX-$_dq && \
+         mv /srv/fn/incoming/.wip-$DRAIN_REAL_PREFIX-$_dq /srv/fn/incoming/$DRAIN_REAL_PREFIX-$_dq.pdf" \
+        >/dev/null 2>&1
+    _dq=$((_dq + 1))
+done
+# Discovery is asynchronous: wait for the watcher rather than sampling once.
+_dq_want="${FN_DRAIN_REAL_DOCS:-24}"
+_dq_i=0
+_dq_have=0
+while [ "$_dq_i" -lt 120 ]; do
+    _dq_have="$(psql_scalar "SELECT count(*) FROM jobs WHERE source_name LIKE '$DRAIN_REAL_PREFIX-%';")"
+    [ "${_dq_have:-0}" = "$_dq_want" ] && break
+    sleep 2; _dq_i=$((_dq_i + 2))
+done
+save_state drain-real-prefix "$DRAIN_REAL_PREFIX"
+note "registered $_dq_have of $_dq_want real drain documents"
+if [ "${_dq_have:-0}" != "$_dq_want" ]; then
+    echo "error: only $_dq_have of $_dq_want real drain documents were registered;" >&2
+    echo "       the drain would run without publishable work." >&2
+    exit 1
+fi
 
 log "starting the renamers again"
 compose start renamer-1 renamer-2
@@ -281,7 +419,36 @@ if ! wait_for_instance_in_flight renamer-2 1 120; then
     echo "error: renamer-2 is holding no delivery; terminating it now would exercise an idle exit, not a drain" >&2
     exit 1
 fi
-stop_timed renamer-2 40 renamer2
+# ...and then wait until the injected hold has actually FIRED, and stop it
+# there. An armed fault is not evidence that it fired: the run that proved
+# that was armed, took 5213 deliveries and paused none of them.
+#
+# `in_flight >= 1` is necessary and not sufficient. Every step between the
+# restart and the stop costs seconds and the reading can go stale, which is
+# how runs reached this line with the last delivery already settled and
+# terminated an idle instance. A `fault_point_paused` line younger than this
+# poll window says renamer-2 is holding work right now, with most of the 15s
+# hold still ahead of the signal.
+_held=0
+_hi=0
+while [ "$_hi" -lt 150 ]; do
+    if compose logs --since 4s renamer-2 2>/dev/null | grep -q 'fault_point_paused'; then
+        _held=1
+        break
+    fi
+    sleep 1; _hi=$((_hi + 1))
+done
+if [ "$_held" != "1" ]; then
+    echo "error: renamer-2 never entered its injected hold within 150s." >&2
+    echo "       Terminating now would exercise an idle exit, not a drain." >&2
+    echo "       Check that the arming recreate applied FN_FAULT_POINTS to this" >&2
+    echo "       instance, and that the real drain documents above were published." >&2
+    exit 1
+fi
+note "renamer-2 is inside an injected hold; terminating it there"
+# Grace exceeds the 15s hold plus the 45s budget's worst case, so a bounded
+# exit is what is asserted -- not a particular duration.
+stop_timed renamer-2 90 renamer2
 # Keep sampling past the termination so the endpoint's disappearance is
 # recorded rather than inferred.
 sleep 6
@@ -290,7 +457,9 @@ stop_readiness_watch
 run_phase drained "" || true
 
 log "restarting renamer-2"
-compose start renamer-2
+# The same verified restoration the trap performs, so the successful path and
+# every failure path undo the override identically.
+restore_drain_overrides
 wait_healthy renamer-2 180
 sleep 6
 
@@ -310,6 +479,11 @@ printf 'finished=%s\nphase_failures=%s\n' \
 log "phase results"
 cat "$EVIDENCE_DIR/phase-results.txt"
 
+if [ "${RESTORE_FAILED:-0}" -ne 0 ]; then
+    echo
+    echo "renamer-2 was not restored to its ordinary configuration; see above." >&2
+    exit 1
+fi
 if [ "$PHASE_FAILURES" -ne 0 ]; then
     echo
     echo "$PHASE_FAILURES phase(s) failed. Evidence is under $EVIDENCE_DIR" >&2
