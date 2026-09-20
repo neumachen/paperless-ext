@@ -1,6 +1,8 @@
 #!/bin/sh
 # The adverse paths of the refusal driver and the exercise it drives:
-# a stolen lock, an interrupted parent, and inspections that genuinely fail.
+# inspections that genuinely fail, a resource that appears after a pre-flight
+# has passed, a stolen lock, an interrupted parent, and the driver's
+# prerequisite guards driven against names that are really occupied.
 #
 # # Why these are separate from verify-restore-refusals.sh
 #
@@ -33,6 +35,12 @@ ADV_CHILD=""
 # Exact resources THIS control created, cleared by name and nothing else.
 C_FOREIGN_VOL="fn-adverse-foreign-$LOWER"
 MADE_FOREIGN_VOL=0
+# Case F's occupied names, put in front of the driver's prerequisite guards.
+F_DB="fn_refusal_db_advf$LOWER"
+F_VOL="fn-refusal-vol-advf-$LOWER"
+F_TAG="adverse-case-f-$STAMP"
+MADE_F_DB=0
+MADE_F_VOL=0
 # Exact resources the driver (this control's child) reported it retained.
 # Parsed from its own report, never guessed from a prefix.
 RETAINED_DOCS=""
@@ -86,8 +94,15 @@ cleanup() {
         wait "$ADV_CHILD" 2>/dev/null || true
     fi
     ADV_CHILD=""
-    # This control's own disposable volume, by exact name, under authority.
-    if [ "$MADE_FOREIGN_VOL" != "0" ]; then
+    # This control's own disposable volume, by exact name, under authority --
+    # and only when the label proved this control created it. Ambiguous
+    # ownership is retained and reported, never deleted by name.
+    if [ "$MADE_FOREIGN_VOL" = "1" ]; then
+        echo "error: volume $C_FOREIGN_VOL is AMBIGUOUS -- this control may or may not" >&2
+        echo "       have created it. It is RETAINED, not removed by name." >&2
+        RESTORE_OK=0
+    fi
+    if [ "$MADE_FOREIGN_VOL" = "2" ]; then
         if adv_holds_lock || adv_take_lock; then
             docker volume rm "$C_FOREIGN_VOL" >/dev/null 2>&1 || true
             if _fv="$(docker volume ls -q --filter "name=^${C_FOREIGN_VOL}$" 2>/dev/null)"; then
@@ -105,6 +120,40 @@ cleanup() {
             RESTORE_OK=0
         fi
     fi
+    # Case F's occupied names, same rules: only what this control provably
+    # created, by exact name, under authority, each removal confirmed.
+    if [ "$MADE_F_DB" = "1" ] || [ "$MADE_F_VOL" = "1" ]; then
+        echo "error: case F resources are AMBIGUOUS; they are RETAINED, not removed by name." >&2
+        RESTORE_OK=0
+    fi
+    if [ "$MADE_F_DB" = "2" ] || [ "$MADE_F_VOL" = "2" ]; then
+        if adv_holds_lock || adv_take_lock; then
+            if [ "$MADE_F_DB" = "2" ]; then
+                compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+                    postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d postgres \
+                    -c "DROP DATABASE IF EXISTS $F_DB;" </dev/null >/dev/null 2>&1 || true
+                case "$(compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+                        postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d postgres -tA \
+                        -c "SELECT count(*) FROM pg_database WHERE datname='$F_DB';" </dev/null 2>/dev/null | tr -d ' \r\n')" in
+                    0) MADE_F_DB=0 ;;
+                    *) echo "error: case F database $F_DB remains" >&2; RESTORE_OK=0 ;;
+                esac
+            fi
+            if [ "$MADE_F_VOL" = "2" ]; then
+                docker volume rm "$F_VOL" >/dev/null 2>&1 || true
+                if _fvv="$(docker volume ls -q --filter "name=^${F_VOL}$" 2>/dev/null)"; then
+                    if [ -z "$_fvv" ]; then MADE_F_VOL=0
+                    else echo "error: case F volume $F_VOL remains" >&2; RESTORE_OK=0; fi
+                else
+                    echo "error: could not list volumes; removal of $F_VOL is UNCONFIRMED" >&2
+                    RESTORE_OK=0
+                fi
+            fi
+        else
+            echo "error: the exercise lock is held elsewhere; case F resources were NOT removed" >&2
+            RESTORE_OK=0
+        fi
+    fi
     adv_drop_lock
     return 0
 }
@@ -112,7 +161,9 @@ on_signal() { echo "error: interrupted; cleaning up and stopping." >&2; cleanup;
 trap 'cleanup' EXIT
 trap 'on_signal' INT TERM
 
-emit "The adverse paths: a stolen lock, an interrupted parent, failing inspections"
+emit "The adverse paths: failing inspections, a resource that appears mid-run, a"
+emit "stolen lock, an interrupted parent, and prerequisite guards against real"
+emit "occupied names"
 emit ""
 emit "The failing inspections are pointed at $DEAD_SOCK,"
 emit "which does not exist, so the real docker client genuinely cannot connect."
@@ -121,7 +172,7 @@ emit ""
 # ---------------------------------------------------------------------------
 # A. A failed enumeration must not authorise ownership.
 # ---------------------------------------------------------------------------
-log "1/5: own_service on a genuinely failing enumeration"
+log "1/6: own_service on a genuinely failing enumeration"
 # lib.sh runs under `set -eu` and this call is REQUIRED to fail, so its
 # status is captured with `||` rather than read from `$?` afterwards. Without
 # that the control dies on the very refusal it exists to record -- which is
@@ -141,7 +192,7 @@ fi
 # ---------------------------------------------------------------------------
 # B. The exercise refuses end to end, mutating nothing.
 # ---------------------------------------------------------------------------
-log "2/5: the whole exercise against a dead docker endpoint"
+log "2/6: the whole exercise against a dead docker endpoint"
 B_LOCK_BEFORE="$([ -d "$EVIDENCE_DIR/.exercise.lock" ] && echo held || echo free)"
 B_LOG="$EVIDENCE_DIR/.adverse-deadhost-$$.log"
 B_EXIT=0
@@ -171,75 +222,122 @@ emit "   backup volumes it left:       $B_STRAY   (expected 0: it never got that
 # labelled as somebody else's. Its ownership machinery is what decides the
 # outcome, and the assertions below are about what that machinery did.
 # ---------------------------------------------------------------------------
-log "3/5: a foreign resource put in the exercise's path"
+log "3/6: a volume that appears after the pre-flight has passed"
 C_FOREIGN_TAG="not-this-run-$STAMP"
 C_LOG="$EVIDENCE_DIR/.adverse-foreign-$$.log"
-# The prerequisite is ASSERTED, not assumed: a case built on a resource that
-# was never created proves nothing about preserving it.
+
+# The exercise runs FIRST, and the volume appears while it is busy producing
+# its fixtures -- after 0/8 said the name was free, before 3/8 creates it.
+#
+# The previous version created the volume up front, so the exercise refused at
+# 0/8 and the evidence reached "0/8: ownership pre-flight" and stopped. The
+# branch under review is the one AFTER the creation, where `docker volume
+# create` is a no-op on an existing volume and the label read back is somebody
+# else's. That branch was never entered, and a refusal at 0/8 is not evidence
+# for it.
+FN_HU_BACKUP_VOL="$C_FOREIGN_VOL" sh "$EXERCISE" > "$C_LOG" 2>&1 &
+ADV_CHILD=$!
+C_PID="$ADV_CHILD"
+# 1/8 is logged only once the 0/8 pre-flight has passed, so the volume is
+# planted strictly inside the window the branch exists for. The window is the
+# two fixture steps -- minutes -- so this is a plain ordering, not a race.
+_c=0
+C_PASSED_PREFLIGHT=0
+while [ "$_c" -lt 900 ]; do
+    if grep -aq '1/8: producing a held fixture' "$C_LOG" 2>/dev/null; then
+        C_PASSED_PREFLIGHT=1; break
+    fi
+    kill -0 "$C_PID" 2>/dev/null || break
+    sleep 1; _c=$((_c + 1))
+done
+
 C_MADE=0
-if docker volume create --label "fn.owner=$C_FOREIGN_TAG" "$C_FOREIGN_VOL" >/dev/null 2>&1; then
-    MADE_FOREIGN_VOL=1
-    C_MADE=1
-else
-    bad "could not create the foreign volume; case C was NOT exercised"
-fi
 C_LABEL_BEFORE=unreadable
 C_SHA_BEFORE=ABSENT
+if [ "$C_PASSED_PREFLIGHT" = "1" ]; then
+    # Ownership is established BEFORE anything is written into this volume or
+    # recorded as removable.
+    #
+    # `docker volume create` is idempotent: it returns 0 on a volume that
+    # already exists and applies no labels to it. Recording ownership from
+    # that exit status -- which is what this did -- claimed any volume that
+    # happened to carry this name, wrote a canary into it before the label was
+    # ever checked, and on a foreign label cleared only the local case flag
+    # while the cleanup flag stayed set. A stranger's volume would have been
+    # written to and then deleted, by the control that exists to show neither
+    # happening. The label asked for here comes back only if this create is
+    # what made the volume.
+    _c_exit=0
+    docker volume create --label "fn.owner=$C_FOREIGN_TAG" "$C_FOREIGN_VOL" >/dev/null 2>&1 || _c_exit=$?
+    if [ "$_c_exit" != "0" ]; then
+        bad "could not plant the volume; case C was NOT exercised and nothing was written"
+    else
+        C_LABEL_BEFORE="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$C_FOREIGN_VOL" 2>/dev/null || echo unreadable)"
+        case "$C_LABEL_BEFORE" in
+            "$C_FOREIGN_TAG") MADE_FOREIGN_VOL=2; C_MADE=1 ;;
+            unreadable)       MADE_FOREIGN_VOL=1
+                              bad "could not read $C_FOREIGN_VOL's label; ownership is AMBIGUOUS, nothing was written to it and it will NOT be removed by name" ;;
+            *)                MADE_FOREIGN_VOL=0
+                              bad "$C_FOREIGN_VOL already existed carrying owner '$C_LABEL_BEFORE'; it is not this control's, nothing was written to it and it will NOT be removed" ;;
+        esac
+    fi
+fi
 if [ "$C_MADE" = "1" ]; then
-    C_LABEL_BEFORE="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$C_FOREIGN_VOL" 2>/dev/null || echo unreadable)"
     docker run --rm -v "$C_FOREIGN_VOL:/v" "$UTIL_IMAGE" \
         sh -c 'printf "belongs to somebody else\n" > /v/canary.txt' >/dev/null 2>&1 || true
     C_SHA_BEFORE="$(docker run --rm -v "$C_FOREIGN_VOL:/v:ro" "$UTIL_IMAGE" \
         sh -c 'if [ -f /v/canary.txt ]; then sha256sum /v/canary.txt | cut -d" " -f1; else echo ABSENT; fi' \
         2>/dev/null | tr -d ' \r\n')"
-    if [ "$C_LABEL_BEFORE" != "$C_FOREIGN_TAG" ]; then
-        bad "the foreign volume does not carry its foreign label; case C was NOT exercised"
-        C_MADE=0
-    fi
-    case "$C_SHA_BEFORE" in ABSENT|"") bad "could not seed the foreign volume; case C was NOT exercised"; C_MADE=0 ;; esac
+    case "$C_SHA_BEFORE" in ABSENT|"") bad "could not seed the planted volume; case C was NOT exercised"; C_MADE=0 ;; esac
 fi
 C_EXIT=0
-C_VOLS_MADE=0
-if [ "$C_MADE" = "1" ]; then
-    FN_HU_BACKUP_VOL="$C_FOREIGN_VOL" sh "$EXERCISE" > "$C_LOG" 2>&1 || C_EXIT=$?
-    C_VOLS_MADE="$(docker volume ls -q 2>/dev/null | grep -c '^fn-hu-backup-' || true)"
-fi
+wait "$C_PID" 2>/dev/null || C_EXIT=$?
+ADV_CHILD=""
+C_VOLS_MADE="$(docker volume ls -q 2>/dev/null | grep -c '^fn-hu-backup-' || true)"
 C_LABEL_AFTER="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$C_FOREIGN_VOL" 2>/dev/null || echo unreadable)"
 C_SHA_AFTER="$(docker run --rm -v "$C_FOREIGN_VOL:/v:ro" "$UTIL_IMAGE" \
     sh -c 'if [ -f /v/canary.txt ]; then sha256sum /v/canary.txt | cut -d" " -f1; else echo ABSENT; fi' \
     2>/dev/null | tr -d ' \r\n')"
 C_PRESENT="$(docker volume ls -q --filter "name=^${C_FOREIGN_VOL}$" 2>/dev/null | grep -c . || true)"
-C_NAMED="$(grep -ac "volume $C_FOREIGN_VOL already exists" "$C_LOG" 2>/dev/null || true)"
-C_BOUNDARY="$(grep -ac 'ownership pre-flight' "$C_LOG" 2>/dev/null || true)"
+# The boundary that had to be reached: the creation site at 3/8, not the
+# pre-flight at 0/8.
+C_REACHED="$(grep -ac '3/8: backing up the ledger' "$C_LOG" 2>/dev/null || true)"
+# The branch itself, quoted from the exercise's own refusal.
+C_BRANCH="$(grep -a "carries owner '$C_FOREIGN_TAG'" "$C_LOG" 2>/dev/null | head -1 | sed 's/^ *//')"
+C_PREFLIGHT_REFUSAL="$(grep -ac "volume $C_FOREIGN_VOL already exists" "$C_LOG" 2>/dev/null || true)"
 emit ""
-emit "C. a positively foreign volume in the exercise's path"
-emit "   the volume this control created: $C_FOREIGN_VOL"
+emit "C. a volume that appears after the pre-flight, refused at the creation site"
+emit "   the volume this control planted: $C_FOREIGN_VOL"
+emit "   planted only after:           the exercise logged 1/8, i.e. 0/8 had"
+emit "                                 already found the name free ($C_PASSED_PREFLIGHT)"
 emit "   its label, before:            $C_LABEL_BEFORE   (expected $C_FOREIGN_TAG:"
-emit "                                 the prerequisite is asserted, not assumed)"
+emit "                                 ownership proved before anything was written)"
 emit "   exercise exit status:         $C_EXIT   (expected non-zero)"
-emit "   it reached the ownership boundary: $C_BOUNDARY line(s)   (expected >= 1)"
-emit "   it named the volume:          $C_NAMED line(s)   (expected >= 1)"
-emit "   the volume still exists:      $C_PRESENT   (expected 1: a rejected"
-emit "                                 invocation must not delete a stranger's resource)"
+emit "   it reached the creation site: $C_REACHED line(s) of '3/8'   (expected >= 1:"
+emit "                                 0/8 alone would be the pre-flight, not this branch)"
+emit "   refusals at the 0/8 pre-flight: $C_PREFLIGHT_REFUSAL   (expected 0)"
+emit "   the branch it took:           ${C_BRANCH:-<not the foreign-label branch>}"
+emit "   the volume still exists:      $C_PRESENT   (expected 1)"
 emit "   its label, after:             $C_LABEL_AFTER   (expected unchanged)"
 emit "   its contents:                 $([ "$C_SHA_AFTER" = "$C_SHA_BEFORE" ] && echo unchanged || echo "CHANGED ($C_SHA_AFTER)")"
-emit "   backup volumes it created:    $C_VOLS_MADE   (expected 0: it mutated nothing)"
+emit "   backup volumes it created:    $C_VOLS_MADE   (expected 0)"
 if [ "$C_MADE" != "1" ]; then
-    bad "the foreign volume was not established; case C was NOT exercised"
+    bad "the volume was not planted under proven ownership; case C was NOT exercised"
 else
     [ "$C_EXIT" != "0" ] || bad "the exercise succeeded against a foreign volume"
-    [ "${C_BOUNDARY:-0}" -ge 1 ] || bad "the exercise never reached its ownership boundary"
-    [ "${C_NAMED:-0}" -ge 1 ] || bad "the exercise did not name the volume it refused"
-    [ "${C_PRESENT:-0}" = "1" ] || bad "the foreign volume was removed by an invocation that refused it"
-    [ "$C_LABEL_AFTER" = "$C_LABEL_BEFORE" ] || bad "the foreign volume's ownership label changed"
-    [ "$C_SHA_AFTER" = "$C_SHA_BEFORE" ] || bad "the foreign volume's contents changed"
+    [ "${C_REACHED:-0}" -ge 1 ] || bad "the exercise never reached the 3/8 creation site; the post-creation branch was NOT exercised"
+    [ "${C_PREFLIGHT_REFUSAL:-0}" = "0" ] || bad "the exercise refused at the 0/8 pre-flight; the post-creation branch was NOT exercised"
+    [ -n "$C_BRANCH" ] || bad "the exercise did not take the post-creation foreign-label branch"
+    [ "${C_PRESENT:-0}" = "1" ] || bad "the planted volume was removed by an invocation that refused it"
+    [ "$C_LABEL_AFTER" = "$C_LABEL_BEFORE" ] || bad "the planted volume's ownership label changed"
+    [ "$C_SHA_AFTER" = "$C_SHA_BEFORE" ] || bad "the planted volume's contents changed"
     [ "${C_VOLS_MADE:-1}" = "0" ] || bad "$C_VOLS_MADE backup volume(s) were created by a rejected invocation"
 fi
 
 # ---------------------------------------------------------------------------
 # D. The lock changes hands during a handoff.
 # ---------------------------------------------------------------------------
-log "4/5: stealing the lock while the driver has released it for a child"
+log "4/6: stealing the lock while the driver has released it for a child"
 D_LOG="$EVIDENCE_DIR/.adverse-steal-$$.log"
 sh "$DRIVER" > "$D_LOG" 2>&1 &
 ADV_CHILD=$!
@@ -398,7 +496,7 @@ emit "                                 unconfirmed or remaining: $D_LEFT)"
 # ---------------------------------------------------------------------------
 # E. The parent is interrupted while its child owns the lock.
 # ---------------------------------------------------------------------------
-log "5/5: interrupting the driver while a child exercise owns the lock"
+log "5/6: interrupting the driver while a child exercise owns the lock"
 CLEANED=0
 E_LOG="$EVIDENCE_DIR/.adverse-interrupt-$$.log"
 sh "$DRIVER" > "$E_LOG" 2>&1 &
@@ -458,6 +556,109 @@ else
     [ "$E_LOCK" = "released" ] || bad "the lock was left held after the interruption"
     [ "${E_FAULTS:-1}" = "0" ] || bad "$E_FAULTS fault service(s) survived the interruption"
 fi
+# ---------------------------------------------------------------------------
+# F. The driver's failed-prerequisite guards, driven by real occupied names.
+#
+# The guards refuse to create over a name that is already taken and refuse to
+# run the case at all. Nothing previously reached them: the driver picks
+# per-invocation names, so on an ordinary run the names are always free and
+# the guarded branches are dead code from the evidence's point of view. The
+# driver's disposable names are now overridable -- the same mechanism the
+# exercise already offers it -- so this control can occupy them for real.
+# ---------------------------------------------------------------------------
+log "6/6: the driver's prerequisite guards, against names that are already taken"
+F_LOG="$EVIDENCE_DIR/.adverse-guards-$$.log"
+fpsql() {
+    compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+        postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d "${2:-postgres}" -tA \
+        -c "$1" </dev/null 2>/dev/null | tr -d ' \r\n'
+}
+# The database: CREATE's own outcome is the ownership proof, as everywhere else.
+_f_exit=0
+compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+    postgres-primary psql -U "${FN_DB_USER:-fn_app}" -d postgres \
+    -c "CREATE DATABASE $F_DB;" </dev/null >/dev/null 2>&1 || _f_exit=$?
+if [ "$_f_exit" = "0" ]; then
+    MADE_F_DB=2
+    fpsql "CREATE TABLE advf_keep(id int); INSERT INTO advf_keep VALUES (7);" "$F_DB" >/dev/null 2>&1 || true
+else
+    case "$(fpsql "SELECT count(*) FROM pg_database WHERE datname='$F_DB';")" in
+        0) bad "could not create case F's database and it does not exist; case F was NOT exercised" ;;
+        1) bad "$F_DB already exists and this control's CREATE failed against it; it is not this control's and will NOT be dropped" ;;
+        *) MADE_F_DB=1; bad "could not establish whether $F_DB exists; ownership is AMBIGUOUS and it will NOT be dropped by name" ;;
+    esac
+fi
+# The volume: the label is the ownership proof.
+_f_exit=0
+docker volume create --label "fn.owner=$F_TAG" "$F_VOL" >/dev/null 2>&1 || _f_exit=$?
+if [ "$_f_exit" != "0" ]; then
+    bad "could not create case F's volume; case F was NOT exercised"
+else
+    case "$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$F_VOL" 2>/dev/null || echo unreadable)" in
+        "$F_TAG")   MADE_F_VOL=2
+                    docker run --rm -v "$F_VOL:/v" "$UTIL_IMAGE" \
+                        sh -c 'printf "case F canary\n" > /v/canary.txt' >/dev/null 2>&1 || true ;;
+        unreadable) MADE_F_VOL=1
+                    bad "could not read $F_VOL's label; ownership is AMBIGUOUS, nothing was written and it will NOT be removed by name" ;;
+        *)          MADE_F_VOL=0
+                    bad "$F_VOL already existed under another owner; nothing was written and it will NOT be removed" ;;
+    esac
+fi
+F_ROWS_BEFORE="$(fpsql "SELECT count(*) FROM advf_keep;" "$F_DB")"
+F_SHA_BEFORE="$(docker run --rm -v "$F_VOL:/v:ro" "$UTIL_IMAGE" \
+    sh -c 'if [ -f /v/canary.txt ]; then sha256sum /v/canary.txt | cut -d" " -f1; else echo ABSENT; fi' \
+    2>/dev/null | tr -d ' \r\n')"
+F_READY=0
+if [ "$MADE_F_DB" = "2" ] && [ "$MADE_F_VOL" = "2" ] && [ "$F_ROWS_BEFORE" = "1" ]; then
+    case "$F_SHA_BEFORE" in ABSENT|"") : ;; *) F_READY=1 ;; esac
+fi
+F_EXIT=0
+if [ "$F_READY" = "1" ]; then
+    FN_REFUSAL_DB="$F_DB" FN_REFUSAL_VOL="$F_VOL" sh "$DRIVER" > "$F_LOG" 2>&1 || F_EXIT=$?
+fi
+F_DB_GUARD="$(grep -a "case 3 not exercised, nothing was created" "$F_LOG" 2>/dev/null | head -1 | sed 's/^ *//')"
+F_VOL_GUARD="$(grep -a "case 4 not exercised, nothing was created" "$F_LOG" 2>/dev/null | head -1 | sed 's/^ *//')"
+F_DB_EXISTS="$(fpsql "SELECT count(*) FROM pg_database WHERE datname='$F_DB';")"
+F_ROWS_AFTER="$(fpsql "SELECT count(*) FROM advf_keep;" "$F_DB")"
+# The driver seeds `keepme` only on the path the guard refuses. Its absence is
+# the positive evidence that the guarded CREATE and seed never ran.
+F_KEEPME="$(fpsql "SELECT count(*) FROM information_schema.tables WHERE table_name='keepme';" "$F_DB")"
+F_VOL_PRESENT="$(docker volume ls -q --filter "name=^${F_VOL}$" 2>/dev/null | grep -c . || true)"
+F_SHA_AFTER="$(docker run --rm -v "$F_VOL:/v:ro" "$UTIL_IMAGE" \
+    sh -c 'if [ -f /v/canary.txt ]; then sha256sum /v/canary.txt | cut -d" " -f1; else echo ABSENT; fi' \
+    2>/dev/null | tr -d ' \r\n')"
+F_VOL_FILES="$(docker run --rm -v "$F_VOL:/v:ro" "$UTIL_IMAGE" \
+    sh -c 'find /v -type f | wc -l' 2>/dev/null | tr -d ' \r\n')"
+emit ""
+emit "F. the driver's prerequisite guards, against names already taken"
+emit "   occupied by this control:     database $F_DB, volume $F_VOL"
+emit "   both established under proven ownership: $F_READY   (expected 1)"
+emit "   driver exit status:           $F_EXIT   (expected non-zero)"
+emit "   the database guard said:      ${F_DB_GUARD:-<the guard was not reached>}"
+emit "   the volume guard said:        ${F_VOL_GUARD:-<the guard was not reached>}"
+emit "   the database still exists:    $F_DB_EXISTS   (expected 1)"
+emit "   its rows:                     $F_ROWS_BEFORE -> $F_ROWS_AFTER   (expected 1 -> 1)"
+emit "   tables named 'keepme' in it:  $F_KEEPME   (expected 0: the driver seeds one"
+emit "                                 only on the path the guard refused, so its"
+emit "                                 absence is what proves the CREATE never ran)"
+emit "   the volume still exists:      $F_VOL_PRESENT   (expected 1)"
+emit "   its contents:                 $([ "$F_SHA_AFTER" = "$F_SHA_BEFORE" ] && echo unchanged || echo "CHANGED ($F_SHA_AFTER)")"
+emit "   files in it:                  $F_VOL_FILES   (expected 1: the driver seeds a"
+emit "                                 canary of its own only past the guard)"
+if [ "$F_READY" != "1" ]; then
+    bad "case F's occupied names were not established under proven ownership; case F was NOT exercised"
+else
+    [ "$F_EXIT" != "0" ] || bad "the driver reported success although both prerequisites were occupied"
+    [ -n "$F_DB_GUARD" ] || bad "the driver's database prerequisite guard was not reached"
+    [ -n "$F_VOL_GUARD" ] || bad "the driver's volume prerequisite guard was not reached"
+    [ "$F_DB_EXISTS" = "1" ] || bad "the occupied database was dropped by a run that refused it"
+    [ "$F_ROWS_AFTER" = "$F_ROWS_BEFORE" ] || bad "the occupied database's contents changed"
+    [ "${F_KEEPME:-1}" = "0" ] || bad "the driver created its table in a database it had refused"
+    [ "${F_VOL_PRESENT:-0}" = "1" ] || bad "the occupied volume was removed by a run that refused it"
+    [ "$F_SHA_AFTER" = "$F_SHA_BEFORE" ] || bad "the occupied volume's contents changed"
+    [ "${F_VOL_FILES:-0}" = "1" ] || bad "the driver wrote into a volume it had refused ($F_VOL_FILES files)"
+fi
+
 # Recreating shared services is a mutation like any other, so it happens under
 # the lock or not at all. The interrupted driver's own cleanup has already
 # restored what it stopped; this is the backstop, and a backstop that runs
