@@ -99,6 +99,7 @@ cleanup() {
     if [ "$LIVE_TOUCHED" = "1" ]; then
         recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
     fi
+    drop_lock
     return 0
 }
 on_signal() {
@@ -108,6 +109,25 @@ on_signal() {
 }
 trap 'cleanup' EXIT
 trap 'on_signal' INT TERM
+
+# The driver mutates the same stack the exercise does -- a document in the
+# consume root, a fault service, a database, a volume -- so it holds the
+# exercise lock while it does, and releases it only for the moment the child
+# needs it. Without that, a concurrent exercise could be running while this
+# one plants and removes fixtures under it.
+DRIVER_LOCK=0
+take_lock() {
+    exercise_lock restore-refusals-control || return 1
+    DRIVER_LOCK=1
+    return 0
+}
+drop_lock() {
+    [ "$DRIVER_LOCK" = "1" ] || return 0
+    exercise_unlock
+    DRIVER_LOCK=0
+    return 0
+}
+take_lock || { echo "error: another exercise holds the lock; nothing was changed." >&2; exit 1; }
 
 emit "Every refusal stops the work that depended on it, and preserves what it refused"
 emit ""
@@ -123,8 +143,10 @@ run_case() {
     # produce -- which is how the first run of this file ended after printing
     # one heading, while the refusal underneath it had worked correctly.
     _rc_exit=0
+    drop_lock
     ( for _kv in "$@"; do export "$_kv"; done
       sh "$SCRIPT" ) > "$_rc_log" 2>&1 || _rc_exit=$?
+    take_lock || { echo "error: could not retake the exercise lock after the child ran." >&2; exit 1; }
     # The INTENDED refusal, not merely some refusal. An unrelated failure with
     # the fixture left untouched would otherwise count as having exercised
     # this boundary.
@@ -149,7 +171,7 @@ case "$CTL_PLANT" in
     *)        bad "could not establish whether $CTL_DOC exists (read '$CTL_PLANT'); case 1 not exercised" ;;
 esac
 DOC_SHA_BEFORE="$(live_sha "/srv/fn/consume/$CTL_DOC")"
-R1="$(run_case destination "already occupies" "FN_HU_HELD_NAME=$CTL_DOC")"
+R1="$(run_case destination "already occupies /srv/fn/consume/$CTL_DOC" "FN_HU_HELD_NAME=$CTL_DOC")"
 DOC_SHA_AFTER="$(live_sha "/srv/fn/consume/$CTL_DOC")"
 emit "1. a pre-existing document occupies the destination"
 emit "   exercise exit / REFUSED lines: $(echo "$R1" | cut -d'|' -f1) / $(echo "$R1" | cut -d'|' -f2)   (expected non-zero / >= 1)"
@@ -190,10 +212,17 @@ emit "   the service's container:       $([ -n "$HOLD_ID_AFTER" ] && [ "$HOLD_ID
 [ "$(echo "$R2" | cut -d'|' -f1)" != "0" ] || bad "the exercise succeeded although a fault service already existed"
 [ -n "$HOLD_ID_AFTER" ] || bad "the pre-existing fault service was removed by a run that refused it"
 [ "$HOLD_ID_AFTER" = "$HOLD_ID_BEFORE" ] || bad "the pre-existing fault service was replaced"
-compose --profile fault stop -t 15 renamer-hold >/dev/null 2>&1 || true
-compose --profile fault rm -f renamer-hold >/dev/null 2>&1 || true
-MADE_HOLD=0
-recreate_service renamer-1 renamer-2 >/dev/null 2>&1 || true
+# Only if THIS control created it. This used to run unconditionally, so a
+# renamer-hold the control had just refused -- because somebody else owned it
+# -- was stopped and removed anyway.
+if [ "$MADE_HOLD" = "1" ]; then
+    compose --profile fault stop -t 15 renamer-hold >/dev/null 2>&1 || true
+    compose --profile fault rm -f renamer-hold >/dev/null 2>&1 || true
+    if _mh="$(compose --profile fault ps -aq renamer-hold 2>/dev/null)"; then
+        [ -z "$_mh" ] && MADE_HOLD=0
+    fi
+    recreate_service renamer-1 renamer-2 >/dev/null 2>&1 || true
+fi
 
 # --- 3. a database that this invocation did not create ---------------------
 log "3/6: the restore database name is already taken"
@@ -206,7 +235,7 @@ else
     bad "could not create the control database; case 3 not exercised"
 fi
 DB_ROWS_BEFORE="$(psqln "SELECT count(*) FROM keepme;" "$CTL_DB")"
-R3="$(run_case database "already exists" "FN_HU_RESTORE_DB=$CTL_DB")"
+R3="$(run_case database "database $CTL_DB already exists" "FN_HU_RESTORE_DB=$CTL_DB")"
 DB_EXISTS_AFTER="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)"
 DB_ROWS_AFTER="$(psqln "SELECT count(*) FROM keepme;" "$CTL_DB")"
 emit ""
@@ -232,11 +261,17 @@ case "$_cv_owner" in
     unreadable) bad "could not read $CTL_VOL's ownership label; case 4 not exercised" ;;
     *)          bad "$CTL_VOL exists and is not this control's (owner '$_cv_owner'); case 4 not exercised" ;;
 esac
-docker run --rm -v "$CTL_VOL:/v" "$UTIL_IMAGE" \
-    sh -c 'printf "do not delete\n" > /v/canary.txt' >/dev/null 2>&1
-VOL_SHA_BEFORE="$(vol_sha "$CTL_VOL")"
-case "$VOL_SHA_BEFORE" in ABSENT|"") bad "could not seed the control volume; case 4 not exercised" ;; esac
-R4="$(run_case volume "already exists" "FN_HU_BACKUP_VOL=$CTL_VOL")"
+# Seeded ONLY when the label proved this control created it. Writing into a
+# volume whose ownership was just rejected is the mutation-after-refusal this
+# whole exercise is about.
+VOL_SHA_BEFORE=ABSENT
+if [ "$MADE_VOL" = "1" ]; then
+    docker run --rm -v "$CTL_VOL:/v" "$UTIL_IMAGE" \
+        sh -c 'printf "do not delete\n" > /v/canary.txt' >/dev/null 2>&1
+    VOL_SHA_BEFORE="$(vol_sha "$CTL_VOL")"
+    case "$VOL_SHA_BEFORE" in ABSENT|"") bad "could not seed the control volume; case 4 not exercised" ;; esac
+fi
+R4="$(run_case volume "volume $CTL_VOL already exists" "FN_HU_BACKUP_VOL=$CTL_VOL")"
 VOL_PRESENT_AFTER="$(docker volume ls -q --filter "name=^${CTL_VOL}$" 2>/dev/null | wc -l | tr -d ' ')"
 VOL_SHA_AFTER="$(vol_sha "$CTL_VOL")"
 emit ""
@@ -252,14 +287,8 @@ emit "   its contents:                  $([ "$VOL_SHA_AFTER" = "$VOL_SHA_BEFORE"
 
 # --- 5. the lock is held: a rejected invocation restores NOTHING -----------
 log "5/6: the exercise lock is held by somebody else"
-LOCK_DIR="$EVIDENCE_DIR/.exercise.lock"
-MADE_LOCK=0
-if mkdir "$LOCK_DIR" 2>/dev/null; then
-    printf 'verify-restore-refusals control pid=%s\n' "$$" > "$LOCK_DIR/owner"
-    MADE_LOCK=1
-else
-    bad "the exercise lock was already held; case 5 not exercised"
-fi
+# This control already holds the lock for its own mutations, so the child
+# simply runs without it being released -- no lock directory is fabricated.
 R1_ID_BEFORE="$(compose ps -q renamer-1 2>/dev/null | head -1)"
 R2_ID_BEFORE="$(compose ps -q renamer-2 2>/dev/null | head -1)"
 W_ID_BEFORE="$(compose ps -q watcher 2>/dev/null | head -1)"
@@ -269,7 +298,6 @@ R1_ID_AFTER="$(compose ps -q renamer-1 2>/dev/null | head -1)"
 R2_ID_AFTER="$(compose ps -q renamer-2 2>/dev/null | head -1)"
 W_ID_AFTER="$(compose ps -q watcher 2>/dev/null | head -1)"
 LOCK_MSG="$(grep -ac 'holds the lock' "$EVIDENCE_DIR/.refusal-lock-$$.log" || true)"
-[ "$MADE_LOCK" = "1" ] && { rm -rf "$LOCK_DIR" 2>/dev/null || true; MADE_LOCK=0; }
 emit ""
 emit "5. the exercise lock is held by another invocation"
 emit "   exercise exit:                 $_lk_exit   (expected non-zero)"
@@ -279,20 +307,27 @@ emit "                                  (a rejected invocation must not restore"
 emit "                                   an active exercise's applications)"
 [ "$_lk_exit" != "0" ] || bad "the exercise ran although the lock was held"
 [ "${LOCK_MSG:-0}" -ge 1 ] || bad "the exercise did not report the held lock"
-[ "$R1_ID_AFTER" = "$R1_ID_BEFORE" ] || bad "renamer-1 was recreated by an invocation that never acquired the lock"
-[ "$R2_ID_AFTER" = "$R2_ID_BEFORE" ] || bad "renamer-2 was recreated by an invocation that never acquired the lock"
-[ "$W_ID_AFTER" = "$W_ID_BEFORE" ] || bad "watcher was recreated by an invocation that never acquired the lock"
+[ -n "$R1_ID_AFTER" ] && [ "$R1_ID_AFTER" = "$R1_ID_BEFORE" ] || bad "renamer-1 was recreated by an invocation that never acquired the lock"
+[ -n "$R2_ID_AFTER" ] && [ "$R2_ID_AFTER" = "$R2_ID_BEFORE" ] || bad "renamer-2 was recreated by an invocation that never acquired the lock"
+[ -n "$W_ID_AFTER" ] && [ "$W_ID_AFTER" = "$W_ID_BEFORE" ] || bad "watcher was recreated by an invocation that never acquired the lock"
 
 # --- 6. a catchable interruption ends the exercise -------------------------
 log "6/6: interrupting the exercise once it has started changing things"
 LIVE_TOUCHED=1
 INT_LOG="$EVIDENCE_DIR/.refusal-interrupt-$$.log"
+drop_lock
 sh "$SCRIPT" > "$INT_LOG" 2>&1 &
 INT_PID=$!
+# Wait for an actual MUTATION, not for the heading that precedes one. The
+# "1/8" line is printed before the child stops the renamers or creates any
+# service, so signalling on it proved only that an idle process can exit.
+# The fault service existing is a change to the stack.
 _i=0
 INT_READY=0
-while [ "$_i" -lt 180 ]; do
-    if grep -aq '1/8: producing a held fixture' "$INT_LOG" 2>/dev/null; then INT_READY=1; break; fi
+while [ "$_i" -lt 240 ]; do
+    if _ir="$(compose --profile fault ps -aq renamer-hold 2>/dev/null)"; then
+        [ -n "$_ir" ] && { INT_READY=1; break; }
+    fi
     kill -0 "$INT_PID" 2>/dev/null || break
     sleep 2; _i=$((_i + 2))
 done
@@ -316,7 +351,19 @@ sleep 10
 INT_STOPPED="$(grep -ac 'interrupted; cleaning up and stopping' "$INT_LOG" || true)"
 INT_FAULTS="$(compose --profile fault ps -aq renamer-hold renamer-fault 2>/dev/null | wc -l | tr -d ' ')"
 INT_LOCK="$([ -d "$EVIDENCE_DIR/.exercise.lock" ] && echo held || echo released)"
-INT_PAST="$(grep -ac '3/8: backing up' "$INT_LOG" || true)"
+# Exactly what the evidence excludes: every step after the one interrupted.
+# The child was signalled while step 1 held the fault service, so none of
+# steps 2 through 8 -- the uncertain fixture, the backup, the restore, the
+# restored stack, the redelivery, the quarantine, the live-system checks --
+# may appear after it.
+INT_PAST=0
+for _st in '2/8: producing an uncertain' '3/8: backing up' '4/8: restoring into' \
+           '5/8: starting real applications' '6/8: redelivering' \
+           '7/8: restored sources' '8/8: the live system'; do
+    _n="$(grep -ac -- "$_st" "$INT_LOG" || true)"
+    INT_PAST=$((INT_PAST + ${_n:-0}))
+done
+take_lock || { echo "error: could not retake the exercise lock after the interrupted child." >&2; exit 1; }
 recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
 emit ""
 emit "6. a catchable interruption (SIGTERM) part-way through"
@@ -324,8 +371,12 @@ emit "   exercise exit:                 $INT_EXIT   (expected non-zero)"
 emit "   it said it was stopping:       ${INT_STOPPED:-0} line(s)   (expected >= 1)"
 emit "   fault services left behind:    $INT_FAULTS   (expected 0)"
 emit "   exercise lock:                 $INT_LOCK   (expected released)"
-emit "   steps executed after the signal: ${INT_PAST:-0}   (expected 0: it ended,"
-emit "                                   it did not resume mutating)"
+emit "   the fault service existed before signalling: yes (a real mutation, not a heading)"
+emit "   later steps (2/8 through 8/8) executed: ${INT_PAST:-0}   (expected 0)"
+emit "                                   the evidence excludes the uncertain fixture,"
+emit "                                   the backup, the restore, the restored stack,"
+emit "                                   the redelivery, the quarantine and the"
+emit "                                   live-system checks -- none ran after the signal"
 [ "$INT_EXIT" != "0" ] || bad "an interrupted exercise reported success"
 [ "${INT_STOPPED:-0}" -ge 1 ] || bad "the exercise did not report stopping on the signal"
 [ "${INT_FAULTS:-1}" = "0" ] || bad "$INT_FAULTS fault service(s) survived the interruption"

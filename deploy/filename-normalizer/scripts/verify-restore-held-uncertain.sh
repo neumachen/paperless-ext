@@ -87,9 +87,12 @@ in_storage() {
 hu() { docker compose -p "$RESTORE_PROJECT" -f "$PROD/compose.prod.yml" \
         -f "$PROD/compose.local-rehearsal.yml" --env-file "$SCRATCH/prod.env" "$@"; }
 
+# Creation ONLY. The refusal check is a separate step the caller performs
+# before it claims ownership: `own_service` inside here ran after the flag was
+# already set, so refusing a service somebody else owns still left this
+# invocation's cleanup willing to remove it.
 start_fault() {
     _sf="$1"; shift
-    own_service "$_sf" || return 1
     ( for _kv in "$@"; do export "$_kv"; done
       compose --profile fault up -d "$_sf" >/dev/null 2>&1 ) || return 1
     return 0
@@ -127,6 +130,25 @@ restored_sha() {
 }
 short() { printf '%s' "$1" | cut -c1-12; }
 
+# Event ids for one job, from a query that is REQUIRED to have succeeded.
+#
+# `psqlq ... > file` pipes through tr and sed, so the pipeline's status is the
+# last command's and a failed query left an EMPTY file. An empty baseline then
+# compared clean against anything, and the exercise reported "0 original
+# records lost" having read none. A job that has reached a terminal outcome
+# always has history, so zero rows is a failed read here, not an answer.
+capture_event_ids() {
+    _ce_job="$1"; _ce_db="$2"; _ce_out="$3"
+    _ce_rows="$(compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
+        postgres-primary psql -U "${FN_DB_USER:-fn_app}" \
+        -d "${_ce_db:-${FN_DB_NAME:-filename_normalizer}}" -tA \
+        -c "SELECT event_id FROM job_events WHERE job_id='$_ce_job' ORDER BY event_id;" \
+        </dev/null 2>/dev/null)" || return 1
+    printf '%s\n' "$_ce_rows" | tr -d '\r' | sed '/^$/d' > "$_ce_out"
+    [ -s "$_ce_out" ] || return 1
+    return 0
+}
+
 CLEANED=0
 LIVE_TOUCHED=0
 cleanup() {
@@ -145,16 +167,22 @@ cleanup() {
     # Only what this invocation established, and every removal is confirmed.
     if [ "$OWNS_RESTORE_PROJECT" = "1" ] && [ -n "$SCRATCH" ]; then
         hu down -v --remove-orphans >/dev/null 2>&1 || true
-        _left="$(docker ps -aq --filter "label=com.docker.compose.project=$RESTORE_PROJECT" 2>/dev/null | wc -l | tr -d ' ')"
-        case "$_left" in
-            0) : ;;
-            *) echo "error: $_left container(s) of project $RESTORE_PROJECT remain" >&2; RESTORE_OK=0 ;;
-        esac
+        if _leftout="$(docker ps -aq --filter "label=com.docker.compose.project=$RESTORE_PROJECT" 2>/dev/null)"; then
+            _left="$(printf '%s' "$_leftout" | grep -c . || true)"
+            [ "$_left" = "0" ] || { echo "error: $_left container(s) of project $RESTORE_PROJECT remain" >&2; RESTORE_OK=0; }
+        else
+            echo "error: could not enumerate project $RESTORE_PROJECT; removal unconfirmed" >&2
+            RESTORE_OK=0
+        fi
     fi
     if [ "$OWNS_RESTORE_VHOST" = "1" ]; then
         compose exec -T rabbitmq rabbitmqctl delete_vhost "$RESTORE_VHOST" >/dev/null 2>&1 || true
-        if compose exec -T rabbitmq rabbitmqctl list_vhosts 2>/dev/null | grep -qx "$RESTORE_VHOST"; then
-            echo "error: broker vhost $RESTORE_VHOST remains" >&2; RESTORE_OK=0
+        if _vh="$(compose exec -T rabbitmq rabbitmqctl list_vhosts 2>/dev/null)"; then
+            printf '%s\n' "$_vh" | grep -qx "$RESTORE_VHOST" && {
+                echo "error: broker vhost $RESTORE_VHOST remains" >&2; RESTORE_OK=0; }
+        else
+            echo "error: could not list broker vhosts; removal of $RESTORE_VHOST unconfirmed" >&2
+            RESTORE_OK=0
         fi
     fi
     if [ "$OWNS_RESTORE_DB" = "1" ]; then
@@ -167,8 +195,11 @@ cleanup() {
     fi
     if [ "$OWNS_BACKUP_VOL" = "1" ]; then
         docker volume rm "$BACKUP_VOL" >/dev/null 2>&1 || true
-        if [ -n "$(docker volume ls -q --filter "name=^${BACKUP_VOL}$" 2>/dev/null)" ]; then
-            echo "error: volume $BACKUP_VOL remains" >&2; RESTORE_OK=0
+        if _vl="$(docker volume ls -q --filter "name=^${BACKUP_VOL}$" 2>/dev/null)"; then
+            [ -z "$_vl" ] || { echo "error: volume $BACKUP_VOL remains" >&2; RESTORE_OK=0; }
+        else
+            echo "error: could not list volumes; removal of $BACKUP_VOL unconfirmed" >&2
+            RESTORE_OK=0
         fi
     fi
     # The stranger is removed BY INODE, and only if this run planted it.
@@ -190,8 +221,11 @@ cleanup() {
         esac
         compose --profile fault stop -t 15 "$_f" >/dev/null 2>&1 || true
         compose --profile fault rm -f "$_f" >/dev/null 2>&1 || true
-        if [ -n "$(compose --profile fault ps -aq "$_f" 2>/dev/null)" ]; then
-            echo "error: fault service $_f remains" >&2; RESTORE_OK=0
+        if _fq="$(compose --profile fault ps -aq "$_f" 2>/dev/null)"; then
+            [ -z "$_fq" ] || { echo "error: fault service $_f remains" >&2; RESTORE_OK=0; }
+        else
+            echo "error: could not query fault service $_f; removal unconfirmed" >&2
+            RESTORE_OK=0
         fi
     done
     [ -n "$SCRATCH" ] && rm -rf "$SCRATCH" 2>/dev/null
@@ -253,8 +287,10 @@ fi
 if compose exec -T rabbitmq rabbitmqctl list_vhosts 2>/dev/null | grep -qx "$RESTORE_VHOST"; then
     fatal "broker vhost $RESTORE_VHOST already exists; nothing has been changed"
 fi
-if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$RESTORE_PROJECT" 2>/dev/null)" ]; then
-    fatal "compose project $RESTORE_PROJECT already exists; nothing has been changed"
+if _pf_proj="$(docker ps -aq --filter "label=com.docker.compose.project=$RESTORE_PROJECT" 2>/dev/null)"; then
+    [ -z "$_pf_proj" ] || fatal "compose project $RESTORE_PROJECT already exists; nothing has been changed"
+else
+    fatal "could not enumerate compose projects; refusing rather than assuming $RESTORE_PROJECT is free"
 fi
 # The destination this run will plant at must be free BEFORE the fixture is
 # produced. It is checked again at the moment of the write, because the window
@@ -280,6 +316,10 @@ compose stop -t 30 renamer-1 renamer-2 >/dev/null 2>&1
 # Ownership is taken BEFORE the creation, not after it. `compose up` can leave
 # a container behind and still fail, and ownership recorded only on success
 # would have left it for somebody else to trip over.
+# Refuse first, claim second, create third: ownership is never assigned to a
+# service this invocation refused, and it IS assigned before the creation that
+# could half-succeed.
+own_service renamer-hold || fatal "fault service 'renamer-hold' already exists; it was left alone"
 OWNS_HOLD_SVC=1
 start_fault renamer-hold FN_FAULT_POINTS=hold_before_reveal FN_FAULT_HOLD=120s \
     FN_RENAMER_PREFETCH=1 || fatal "could not start renamer-hold"
@@ -358,6 +398,10 @@ log "2/8: producing an uncertain fixture (interrupted before the link)"
 UDOC="hu-uncertain-$LOWER.pdf"
 LIVE_TOUCHED=1
 compose stop -t 30 renamer-1 renamer-2 >/dev/null 2>&1
+# Refuse first, claim second, create third: ownership is never assigned to a
+# service this invocation refused, and it IS assigned before the creation that
+# could half-succeed.
+own_service renamer-fault || fatal "fault service 'renamer-fault' already exists; it was left alone"
 OWNS_FAULT_SVC=1
 start_fault renamer-fault FN_FAULT_POINTS=before_link \
     || fatal "could not start renamer-fault"
@@ -410,8 +454,10 @@ case "$USRC_SHA" in ABSENT|"") bad "the uncertain fixture's source is missing" ;
 # dropped two and a redelivery that added two would satisfy it.
 HEV_IDS="$EVIDENCE_DIR/.hu-ev-held-$$"
 UEV_IDS="$EVIDENCE_DIR/.hu-ev-uncertain-$$"
-psqlq "SELECT event_id FROM job_events WHERE job_id='$HJOB' ORDER BY event_id;" > "$HEV_IDS"
-psqlq "SELECT event_id FROM job_events WHERE job_id='$UJOB' ORDER BY event_id;" > "$UEV_IDS"
+capture_event_ids "$HJOB" "" "$HEV_IDS" \
+    || fatal "could not read the held job's history; refusing to compare against an unread baseline"
+capture_event_ids "$UJOB" "" "$UEV_IDS" \
+    || fatal "could not read the uncertain job's history; refusing to compare against an unread baseline"
 
 log "3/8: backing up the ledger and the document roots"
 # `docker volume create` is idempotent: it returns 0 on a volume that already
@@ -590,8 +636,9 @@ R_UDOC_AFTER="$(restored_sha "consume/$UDOC")"
 # allowed; losing an original one is not.
 _rh_now="$EVIDENCE_DIR/.hu-ev-held-after-$$"
 _ru_now="$EVIDENCE_DIR/.hu-ev-uncertain-after-$$"
-psqlq "SELECT event_id FROM job_events WHERE job_id='$HJOB' ORDER BY event_id;" "$RESTORE_DB" > "$_rh_now"
-psqlq "SELECT event_id FROM job_events WHERE job_id='$UJOB' ORDER BY event_id;" "$RESTORE_DB" > "$_ru_now"
+HIST_READ=yes
+capture_event_ids "$HJOB" "$RESTORE_DB" "$_rh_now" || HIST_READ=no
+capture_event_ids "$UJOB" "$RESTORE_DB" "$_ru_now" || HIST_READ=no
 HEV_LOST="$(comm -23 "$HEV_IDS" "$_rh_now" | wc -l | tr -d ' ')"
 UEV_LOST="$(comm -23 "$UEV_IDS" "$_ru_now" | wc -l | tr -d ' ')"
 HEV_ADDED="$(comm -13 "$HEV_IDS" "$_rh_now" | wc -l | tr -d ' ')"
@@ -605,6 +652,7 @@ emit "   held      state:              $RH_STATE   (expected held: not reopened)
 emit "             reason:             $RH_CAT   (expected destination_conflict)"
 emit "             receipts:           $RH_RCPT   (expected $HRECEIPTS)"
 emit "             original history records lost: $HEV_LOST   (expected 0; $HEV_ADDED added by the redelivery)"
+emit "             restored history readable: $HIST_READ   (expected yes)"
 emit "   uncertain state:              $RU_STATE   (expected uncertain: not resolved)"
 emit "             reason:             $RU_CAT"
 emit "             receipts:           $RU_RCPT   (expected $URECEIPTS)"
@@ -618,6 +666,8 @@ emit "   a document at the uncertain name: $([ "$R_UDOC_AFTER" = "ABSENT" ] && e
 [ "$RH_STATE" = "held" ] || bad "the restored held job became '$RH_STATE'"
 [ "$RH_CAT" = "destination_conflict" ] || bad "the restored held job's reason became '$RH_CAT'"
 [ "$RH_RCPT" = "$HRECEIPTS" ] || bad "restored held receipts changed: $HRECEIPTS -> $RH_RCPT"
+# A comparison that could not be read establishes nothing either way.
+[ "$HIST_READ" = "yes" ] || bad "the restored history could not be read; preservation is unestablished"
 [ "${HEV_LOST:-1}" = "0" ] || bad "$HEV_LOST original history record(s) of the held job did not survive"
 [ "$RH_CAT" = "$HCAT" ] || bad "the held job's recorded reason changed: $HCAT -> $RH_CAT"
 [ "$RU_STATE" = "uncertain" ] || bad "the restored uncertain job was resolved to '$RU_STATE'"

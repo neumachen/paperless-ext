@@ -25,15 +25,23 @@ RUN_ID="${FN_TEST_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 # hold_after_claim and a 45s budget. That was observed: a later exercise on
 # this stack then ran against an instance that pauses on every claim.
 DRAIN_OVERRIDE_ACTIVE=0
+# The drain stops BOTH renamers so the queue can accumulate. Restoring only
+# renamer-2 left renamer-1 stopped whenever the run failed between that stop
+# and the normal restart -- during fixture creation or registration, say.
+DRAIN_SERVICES_STOPPED=0
 RESTORE_FAILED=0
 
 restore_drain_overrides() {
-    [ "$DRAIN_OVERRIDE_ACTIVE" = "1" ] || return 0
+    if [ "$DRAIN_OVERRIDE_ACTIVE" != "1" ] && [ "$DRAIN_SERVICES_STOPPED" != "1" ]; then
+        return 0
+    fi
     DRAIN_OVERRIDE_ACTIVE=0
-    log "restoring renamer-2 to its ordinary configuration"
+    DRAIN_SERVICES_STOPPED=0
+    log "restoring the renamers to their ordinary configuration"
     # Recreated, not restarted: a restart keeps the environment the container
-    # was created with, so the override would survive it.
-    recreate_service renamer-2 || true
+    # was created with, so the override would survive it. Both, because both
+    # were stopped.
+    recreate_service renamer-1 renamer-2 || true
 
     # Verified from the RUNNING service, not assumed from the compose file.
     _rd_ready="$(compose ps --format '{{.Health}}' renamer-2 2>/dev/null | head -1)"
@@ -56,22 +64,36 @@ restore_drain_overrides() {
     fi
     _rd_takeover="$(effective_value renamer-2 "d['processing']['publish_takeover_ms']")"
 
+    _rd_ready1="$(compose ps --format '{{.Health}}' renamer-1 2>/dev/null | head -1)"
+    [ -n "$_rd_ready1" ] || _rd_ready1=unreadable
+    note "renamer-1 readiness:            ${_rd_ready1:-unknown}"
     note "renamer-2 readiness:            ${_rd_ready:-unknown}"
     note "renamer-2 fault env present:    ${_rd_env:-unknown} (expected 0)"
     note "renamer-2 armed since recreate: ${_rd_armed:-unknown} (expected 0)"
     note "renamer-2 publish_takeover_ms:  ${_rd_takeover:-unreadable} (expected 20000)"
 
     # An inspection that could not run is UNKNOWN, and unknown is not restored.
-    if [ "$_rd_ready" != "healthy" ] \
+    if [ "$_rd_ready1" != "healthy" ] \
+       || [ "$_rd_ready" != "healthy" ] \
        || [ "${_rd_env:-1}" != "0" ] \
        || [ "${_rd_armed:-1}" != "0" ] \
        || [ "${_rd_takeover:-unreadable}" != "20000" ]; then
-        echo "error: renamer-2 was NOT restored to its ordinary configuration." >&2
-        echo "       It may still carry the drain phase's injected hold." >&2
+        echo "error: the renamers were NOT restored to their ordinary state." >&2
+        echo "       renamer-2 may still carry the drain phase's injected hold," >&2
+        echo "       and renamer-1 may still be stopped." >&2
         RESTORE_FAILED=1
     fi
 }
-trap 'restore_drain_overrides' EXIT INT TERM
+# A catchable interruption ENDS the runner after restoration. A plain
+# `trap restore INT` returns to the point the signal arrived and the remaining
+# phases run against a stack that has just been put back.
+on_signal() {
+    echo "error: interrupted; restoring services and stopping." >&2
+    restore_drain_overrides
+    exit 130
+}
+trap 'restore_drain_overrides' EXIT
+trap 'on_signal' INT TERM
 
 psql_scalar() {
     compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
@@ -340,6 +362,7 @@ DRAIN_OVERRIDE_ACTIVE=1
 wait_healthy renamer-2 180
 
 log "stopping both renamers so the work queue can accumulate"
+DRAIN_SERVICES_STOPPED=1
 compose stop -t 30 renamer-1 renamer-2
 wait_stopped renamer-1
 wait_stopped renamer-2
