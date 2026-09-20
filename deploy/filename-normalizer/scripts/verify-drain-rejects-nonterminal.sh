@@ -35,6 +35,7 @@ OWNS_LOCK=0
 OWNS_FAULT_SVC=0
 NEW_RUN=""
 SAVED=""
+SLOT_RESTORED=unknown
 UDOC="drainreject-$LOWER.pdf"
 
 report_begin drain-rejects-nonterminal "$OUT" "$0"
@@ -49,6 +50,14 @@ psqlq() {
 }
 psqln() { psqlq "$1" | tr -d ' \n'; }
 
+# Hash every file under a directory in ONE container run, like every other hash
+# in this stack. The output is "<sha256>  ./<relative path>", sorted, so two
+# listings taken before and after a phase compare with a plain diff.
+slot_digests() {
+    docker run --rm -v "$1":/slot:ro "$UTIL_IMAGE" \
+        sh -c 'cd /slot && find . -type f -exec sha256sum {} + 2>/dev/null | sort -k2' 2>/dev/null
+}
+
 CLEANED=0
 cleanup() {
     [ "$CLEANED" = "0" ] || return 0
@@ -62,12 +71,37 @@ cleanup() {
         [ "$OWNS_FAULT_SVC" = "0" ] || { echo "error: renamer-fault remains" >&2; RESTORE_OK=0; }
     fi
     # Put the successful drain evidence back exactly as it was.
+    #
+    # "Exactly" has to mean every file the phase writes, not the two that are
+    # easy to name. Saving only phase-drained.log and f5-drain-under-load.txt
+    # left f5-drain-readiness-summary.txt carrying THIS control's shutdown
+    # instant: that summary is recomputed from renamer-2's live log, and by the
+    # time this control runs, the real run's shutdown_started record has
+    # rotated out of the container, so the recomputation silently substitutes
+    # the wrong instant into retained evidence. Save and restore the slot whole,
+    # then prove it by digest instead of trusting the copy.
     if [ -n "$SAVED" ] && [ -d "$SAVED" ]; then
         if [ -f "$SAVED/phase-drained.log" ]; then
             cp "$SAVED/phase-drained.log" "$EVIDENCE_DIR/phase-drained.log"
         fi
-        if [ -f "$SAVED/f5-drain-under-load.txt" ]; then
-            cp "$SAVED/f5-drain-under-load.txt" "$EVIDENCE_DIR/drained/f5-drain-under-load.txt"
+        if [ -d "$SAVED/drained" ]; then
+            cp -R "$SAVED/drained/." "$EVIDENCE_DIR/drained/" 2>/dev/null || true
+        fi
+        if [ -f "$SAVED/.slot-before" ]; then
+            slot_digests "$EVIDENCE_DIR/drained" > "$SAVED/.slot-after" 2>/dev/null || true
+            if [ ! -s "$SAVED/.slot-after" ]; then
+                SLOT_RESTORED=unknown
+                echo "error: could not read back the drained evidence slot; its" >&2
+                echo "       restoration is UNCONFIRMED and must not be reported as done." >&2
+                RESTORE_OK=0
+            elif diff "$SAVED/.slot-before" "$SAVED/.slot-after" >/dev/null 2>&1; then
+                SLOT_RESTORED=yes
+            else
+                SLOT_RESTORED=NO
+                echo "error: the drained evidence slot did not come back byte-for-byte:" >&2
+                diff "$SAVED/.slot-before" "$SAVED/.slot-after" >&2 || true
+                RESTORE_OK=0
+            fi
         fi
         rm -rf "$SAVED" 2>/dev/null || true
     fi
@@ -140,12 +174,20 @@ emit "   the assertion runs."
 # --- run the real assertion over it ----------------------------------------
 log "2/3: running the real drained assertion with that job as its real-fixture set"
 SAVED="$EVIDENCE_DIR/.drain-evidence-saved-$$"
-mkdir -p "$SAVED"
+mkdir -p "$SAVED/drained"
 if [ -f "$EVIDENCE_DIR/phase-drained.log" ]; then
     cp "$EVIDENCE_DIR/phase-drained.log" "$SAVED/phase-drained.log"
 fi
-if [ -f "$EVIDENCE_DIR/drained/f5-drain-under-load.txt" ]; then
-    cp "$EVIDENCE_DIR/drained/f5-drain-under-load.txt" "$SAVED/f5-drain-under-load.txt"
+# The whole slot, plus a digest of every file in it, so the restore is an
+# assertion rather than a hope. run_phase rewrites all of these.
+if [ -d "$EVIDENCE_DIR/drained" ]; then
+    cp -R "$EVIDENCE_DIR/drained/." "$SAVED/drained/" 2>/dev/null || true
+    slot_digests "$EVIDENCE_DIR/drained" > "$SAVED/.slot-before" 2>/dev/null || true
+    if [ ! -s "$SAVED/.slot-before" ]; then
+        emit "    REFUSED: the retained drain evidence could not be hashed, so this"
+        emit "             control cannot prove it put it back; nothing has been changed"
+        exit 1
+    fi
 fi
 printf '%s,\n' "$UJOB" > "$EVIDENCE_DIR/state/$NEW_RUN.drain-real-ids"
 # run_phase reads both of these from the shell directly. PHASE_FAILURES is
@@ -194,11 +236,15 @@ emit "   the fixture's own outcome:    $FINAL   (recovery resolved it once the"
 emit "                                 renamers came back; it is this control's"
 emit "                                 own synthetic job, identified above)"
 emit "   renamer-1 / renamer-2 / watcher: $L1 / $L2 / $LW   (expected healthy x3)"
-emit "   retained drain evidence restored: $([ "${DRAIN_OK:-0}" -ge 1 ] && echo yes || echo NO)"
-emit "   state copies removed:         $(ls "$EVIDENCE_DIR/state/$NEW_RUN".* 2>/dev/null | grep -c . || true)   (expected 0)"
+emit "   retained drain evidence readable: $([ "${DRAIN_OK:-0}" -ge 1 ] && echo yes || echo NO)"
+emit "   the whole drained/ slot came back byte-for-byte: $SLOT_RESTORED   (expected yes;"
+emit "                                 every file the phase rewrites, compared by"
+emit "                                 sha256 against the listing taken before it ran)"
+emit "   state copies left behind:     $(ls "$EVIDENCE_DIR/state/$NEW_RUN".* 2>/dev/null | grep -c . || true)   (expected 0)"
 { [ "$L1" = "healthy" ] && [ "$L2" = "healthy" ] && [ "$LW" = "healthy" ]; } \
     || bad "the live stack is not healthy after this control ($L1/$L2/$LW)"
 [ "${DRAIN_OK:-0}" -ge 1 ] || bad "the retained drain evidence was not restored"
+[ "$SLOT_RESTORED" = "yes" ] || bad "the drained evidence slot was not restored byte-for-byte ($SLOT_RESTORED)"
 [ "$RESTORE_OK" = "1" ] || bad "restoration was incomplete"
 
 emit ""
