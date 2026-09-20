@@ -1,8 +1,9 @@
 #!/bin/sh
 # The adverse paths of the refusal driver and the exercise it drives:
 # inspections that genuinely fail, a resource that appears after a pre-flight
-# has passed, a stolen lock, an interrupted parent, and the driver's
-# prerequisite guards driven against names that are really occupied.
+# has passed, a stolen lock, an interrupted parent, the driver's prerequisite
+# guards driven against names that are really occupied, and a measurement of
+# what duplicate creation does on the pinned broker.
 #
 # # Why these are separate from verify-restore-refusals.sh
 #
@@ -41,6 +42,11 @@ F_VOL="fn-refusal-vol-advf-$LOWER"
 F_TAG="adverse-case-f-$STAMP"
 MADE_F_DB=0
 MADE_F_VOL=0
+# Case G's disposable vhost.
+G_VHOST="fn-adverse-vhost-$LOWER"
+G_TAG_A="adverse-G-original-$STAMP"
+G_TAG_B="adverse-G-imposter-$STAMP"
+MADE_G_VHOST=0
 # Exact resources the driver (this control's child) reported it retained.
 # Parsed from its own report, never guessed from a prefix.
 RETAINED_DOCS=""
@@ -154,6 +160,26 @@ cleanup() {
             RESTORE_OK=0
         fi
     fi
+    # Case G's vhost, removed only because its description proves this control
+    # created it. Deleting a vhost takes every queue in it, so an unproven one
+    # is retained and named.
+    if [ "$MADE_G_VHOST" = "1" ]; then
+        echo "error: broker vhost $G_VHOST is AMBIGUOUS; it is RETAINED, not deleted by name." >&2
+        RESTORE_OK=0
+    fi
+    if [ "$MADE_G_VHOST" = "2" ]; then
+        compose exec -T rabbitmq rabbitmqctl delete_vhost "$G_VHOST" >/dev/null 2>&1 || true
+        if _gv="$(compose exec -T rabbitmq rabbitmqctl list_vhosts --no-table-headers name 2>/dev/null)"; then
+            if printf '%s\n' "$_gv" | grep -qx "$G_VHOST"; then
+                echo "error: case G vhost $G_VHOST remains" >&2; RESTORE_OK=0
+            else
+                MADE_G_VHOST=0
+            fi
+        else
+            echo "error: could not list vhosts; removal of $G_VHOST is UNCONFIRMED" >&2
+            RESTORE_OK=0
+        fi
+    fi
     adv_drop_lock
     return 0
 }
@@ -162,8 +188,8 @@ trap 'cleanup' EXIT
 trap 'on_signal' INT TERM
 
 emit "The adverse paths: failing inspections, a resource that appears mid-run, a"
-emit "stolen lock, an interrupted parent, and prerequisite guards against real"
-emit "occupied names"
+emit "stolen lock, an interrupted parent, prerequisite guards against real occupied"
+emit "names, and what duplicate creation on the real broker actually does"
 emit ""
 emit "The failing inspections are pointed at $DEAD_SOCK,"
 emit "which does not exist, so the real docker client genuinely cannot connect."
@@ -172,7 +198,7 @@ emit ""
 # ---------------------------------------------------------------------------
 # A. A failed enumeration must not authorise ownership.
 # ---------------------------------------------------------------------------
-log "1/6: own_service on a genuinely failing enumeration"
+log "1/7: own_service on a genuinely failing enumeration"
 # lib.sh runs under `set -eu` and this call is REQUIRED to fail, so its
 # status is captured with `||` rather than read from `$?` afterwards. Without
 # that the control dies on the very refusal it exists to record -- which is
@@ -192,7 +218,7 @@ fi
 # ---------------------------------------------------------------------------
 # B. The exercise refuses end to end, mutating nothing.
 # ---------------------------------------------------------------------------
-log "2/6: the whole exercise against a dead docker endpoint"
+log "2/7: the whole exercise against a dead docker endpoint"
 B_LOCK_BEFORE="$([ -d "$EVIDENCE_DIR/.exercise.lock" ] && echo held || echo free)"
 B_LOG="$EVIDENCE_DIR/.adverse-deadhost-$$.log"
 B_EXIT=0
@@ -222,7 +248,7 @@ emit "   backup volumes it left:       $B_STRAY   (expected 0: it never got that
 # labelled as somebody else's. Its ownership machinery is what decides the
 # outcome, and the assertions below are about what that machinery did.
 # ---------------------------------------------------------------------------
-log "3/6: a volume that appears after the pre-flight has passed"
+log "3/7: a volume that appears after the pre-flight has passed"
 C_FOREIGN_TAG="not-this-run-$STAMP"
 C_LOG="$EVIDENCE_DIR/.adverse-foreign-$$.log"
 
@@ -337,7 +363,7 @@ fi
 # ---------------------------------------------------------------------------
 # D. The lock changes hands during a handoff.
 # ---------------------------------------------------------------------------
-log "4/6: stealing the lock while the driver has released it for a child"
+log "4/7: stealing the lock while the driver has released it for a child"
 D_LOG="$EVIDENCE_DIR/.adverse-steal-$$.log"
 sh "$DRIVER" > "$D_LOG" 2>&1 &
 ADV_CHILD=$!
@@ -496,7 +522,7 @@ emit "                                 unconfirmed or remaining: $D_LEFT)"
 # ---------------------------------------------------------------------------
 # E. The parent is interrupted while its child owns the lock.
 # ---------------------------------------------------------------------------
-log "5/6: interrupting the driver while a child exercise owns the lock"
+log "5/7: interrupting the driver while a child exercise owns the lock"
 CLEANED=0
 E_LOG="$EVIDENCE_DIR/.adverse-interrupt-$$.log"
 sh "$DRIVER" > "$E_LOG" 2>&1 &
@@ -566,7 +592,7 @@ fi
 # driver's disposable names are now overridable -- the same mechanism the
 # exercise already offers it -- so this control can occupy them for real.
 # ---------------------------------------------------------------------------
-log "6/6: the driver's prerequisite guards, against names that are already taken"
+log "6/7: the driver's prerequisite guards, against names that are already taken"
 F_LOG="$EVIDENCE_DIR/.adverse-guards-$$.log"
 fpsql() {
     compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" \
@@ -657,6 +683,73 @@ else
     [ "${F_VOL_PRESENT:-0}" = "1" ] || bad "the occupied volume was removed by a run that refused it"
     [ "$F_SHA_AFTER" = "$F_SHA_BEFORE" ] || bad "the occupied volume's contents changed"
     [ "${F_VOL_FILES:-0}" = "1" ] || bad "the driver wrote into a volume it had refused ($F_VOL_FILES files)"
+fi
+
+# ---------------------------------------------------------------------------
+# G. What duplicate creation on the real broker actually does.
+#
+# The restore exercise used to determine vhost ownership from `add_vhost`'s
+# exit status, on the stated grounds that it "fails on a vhost that already
+# exists". That was asserted and never measured, and it is false: the call is
+# idempotent. A vhost somebody else made would have been adopted on success
+# and then deleted, taking every queue in it.
+#
+# This case measures both halves of the replacement mechanism against the
+# pinned broker every time it runs, on a vhost of its own making, so the
+# claim in that exercise cannot quietly go stale again.
+# ---------------------------------------------------------------------------
+log "7/7: what duplicate vhost creation really does on the pinned broker"
+rmq() { compose exec -T rabbitmq rabbitmqctl "$@"; }
+g_desc() {
+    if _gd="$(rmq list_vhosts --no-table-headers name description 2>/dev/null)"; then
+        printf '%s\n' "$_gd" | awk -F'\t' -v v="$G_VHOST" \
+            'BEGIN{f=0} $1==v{print $2; f=1} END{if(!f) print "__ABSENT__"}' | head -1
+    else
+        printf '%s\n' "__UNREADABLE__"
+    fi
+}
+G_BROKER="$(docker inspect -f '{{.Config.Image}}' "$(compose ps -q rabbitmq 2>/dev/null | head -1)" 2>/dev/null || echo unknown)"
+G_FIRST_EXIT=0
+rmq add_vhost "$G_VHOST" --description "$G_TAG_A" >/dev/null 2>&1 || G_FIRST_EXIT=$?
+G_DESC_1=unmeasured
+if [ "$G_FIRST_EXIT" = "0" ]; then
+    G_DESC_1="$(g_desc)"
+    case "$G_DESC_1" in
+        "$G_TAG_A")      MADE_G_VHOST=2 ;;
+        __UNREADABLE__)  MADE_G_VHOST=1
+                         bad "could not read vhost metadata; case G's vhost ownership is AMBIGUOUS and it will NOT be deleted" ;;
+        *)               MADE_G_VHOST=0
+                         bad "$G_VHOST already existed (description '$G_DESC_1'); it is not this control's and will NOT be deleted" ;;
+    esac
+else
+    bad "could not create case G's disposable vhost; case G was NOT exercised"
+fi
+G_DUP_EXIT=unmeasured
+G_DESC_2=unmeasured
+if [ "$MADE_G_VHOST" = "2" ]; then
+    # The same call again, on a vhost that now exists, asking for a DIFFERENT
+    # description. Both results matter.
+    G_DUP_EXIT=0
+    rmq add_vhost "$G_VHOST" --description "$G_TAG_B" >/dev/null 2>&1 || G_DUP_EXIT=$?
+    G_DESC_2="$(g_desc)"
+fi
+emit ""
+emit "G. duplicate vhost creation, measured on the pinned broker"
+emit "   broker image:                 $G_BROKER"
+emit "   first add_vhost, fresh name:  exit $G_FIRST_EXIT   (expected 0)"
+emit "   its description reads:        $G_DESC_1   (expected $G_TAG_A)"
+emit "   second add_vhost, SAME name,  exit $G_DUP_EXIT   (expected 0: add_vhost is"
+emit "     asking for description B:   IDEMPOTENT, so its exit status is NOT evidence"
+emit "                                 of who created the vhost)"
+emit "   its description now reads:    $G_DESC_2   (expected $G_TAG_A, unchanged: the"
+emit "                                 description is written only at genuine creation"
+emit "                                 and is left alone otherwise, which is what makes"
+emit "                                 it a usable ownership marker)"
+if [ "$MADE_G_VHOST" != "2" ]; then
+    bad "case G's vhost was not established under proven ownership; case G was NOT exercised"
+else
+    [ "$G_DUP_EXIT" = "0" ] || bad "add_vhost on an existing vhost returned $G_DUP_EXIT; the exercise's ownership rule assumes idempotence and must be re-derived"
+    [ "$G_DESC_2" = "$G_TAG_A" ] || bad "the description changed to '$G_DESC_2'; it cannot be used as an ownership marker and the exercise's rule must be re-derived"
 fi
 
 # Recreating shared services is a mutation like any other, so it happens under
