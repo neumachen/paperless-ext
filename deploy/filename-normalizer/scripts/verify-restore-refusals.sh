@@ -62,10 +62,83 @@ vol_sha() {
 
 CLEANED=0
 LIVE_TOUCHED=0
+CHILD_PID=""
+
+# Ownership is three-valued, not boolean:
+#   0  never attempted -- no responsibility, never touch it
+#   1  ATTEMPTED       -- creation was issued; disposition unconfirmed
+#   2  confirmed       -- creation was issued and verified
+#
+# The flags used to go straight from 0 to "confirmed" on a post-creation
+# inspection, so a creation that SUCCEEDED followed by an inspection that
+# failed or came back empty left responsibility unrecorded and cleanup walked
+# past the resource. Responsibility is now taken before the creation command
+# and only ever upgraded, so a resource this invocation may have made is
+# always cleaned up -- and a failed confirmation is reported rather than being
+# allowed to certify cleanup.
+owned() { [ "$1" = "1" ] || [ "$1" = "2" ]; }
+
+# Does this process hold the lock RIGHT NOW?
+#
+# The cached flag is not enough: it says what we believed when we last acted,
+# not who owns the directory now. A cached 1 must never authorise a mutation
+# after the lock has in fact been released or taken by somebody else.
+hold_confirmed() {
+    [ "$DRIVER_LOCK" = "1" ] || return 1
+    _hc_owner="$(cat "$EVIDENCE_DIR/.exercise.lock/owner" 2>/dev/null)" || return 1
+    case "$_hc_owner" in
+        *"pid=$$ "*|*"pid=$$") return 0 ;;
+    esac
+    return 1
+}
+
+# Wait for a child that may still own the lock, so the parent never cleans up
+# underneath a running exercise.
+settle_child() {
+    [ -n "$CHILD_PID" ] || return 0
+    if kill -0 "$CHILD_PID" 2>/dev/null; then
+        echo "note: terminating the child exercise ($CHILD_PID) before cleanup." >&2
+        kill -TERM "$CHILD_PID" 2>/dev/null || true
+        _sc=0
+        while kill -0 "$CHILD_PID" 2>/dev/null && [ "$_sc" -lt 180 ]; do
+            sleep 2; _sc=$((_sc + 2))
+        done
+        if kill -0 "$CHILD_PID" 2>/dev/null; then
+            echo "error: the child exercise did not exit; it may still hold the lock." >&2
+            RESTORE_OK=0
+        fi
+    fi
+    wait "$CHILD_PID" 2>/dev/null || true
+    CHILD_PID=""
+    return 0
+}
+
 cleanup() {
     [ "$CLEANED" = "0" ] || return 0
     CLEANED=1
-    if [ "$MADE_DOC" = "1" ]; then
+
+    # An active child may own the lock and be mid-mutation. Finish it first.
+    settle_child
+
+    # EVERY protected action below needs ownership, not just the service
+    # restore at the end. Documents, databases, volumes and fault services
+    # were removed before the lock was ever checked.
+    if hold_confirmed || take_lock; then
+        : # ownership established for the whole protected section
+    else
+        echo "error: the exercise lock is held elsewhere; this control cleaned up NOTHING." >&2
+        echo "       Retained by this invocation and NOT removed:" >&2
+        owned "$MADE_DOC"  && echo "         document /srv/fn/consume/$CTL_DOC" >&2
+        owned "$MADE_DB"   && echo "         database $CTL_DB" >&2
+        owned "$MADE_VOL"  && echo "         volume $CTL_VOL" >&2
+        owned "$MADE_HOLD" && echo "         fault service renamer-hold" >&2
+        [ "$LIVE_TOUCHED" = "1" ] && echo "         live applications may still be stopped" >&2
+        RESTORE_OK=0
+        DRIVER_LOCK=0
+        return 0
+    fi
+
+    if owned "$MADE_DOC"; then
         compose run --rm --no-deps -T -e FN_T="/srv/fn/consume/$CTL_DOC" \
             --entrypoint sh storage-init -c 'rm -f "$FN_T"' >/dev/null 2>&1 </dev/null || true
         case "$(probe_exists "/srv/fn/consume/$CTL_DOC")" in
@@ -73,14 +146,14 @@ cleanup() {
             *)  echo "error: control document $CTL_DOC could not be confirmed removed" >&2; RESTORE_OK=0 ;;
         esac
     fi
-    if [ "$MADE_DB" = "1" ]; then
+    if owned "$MADE_DB"; then
         psqlq "DROP DATABASE IF EXISTS $CTL_DB;" postgres >/dev/null 2>&1 || true
         case "$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)" in
             0) : ;;
             *)  echo "error: control database $CTL_DB remains" >&2; RESTORE_OK=0 ;;
         esac
     fi
-    if [ "$MADE_VOL" = "1" ]; then
+    if owned "$MADE_VOL"; then
         docker volume rm "$CTL_VOL" >/dev/null 2>&1 || true
         if _cv="$(docker volume ls -q --filter "name=^${CTL_VOL}$" 2>/dev/null)"; then
             [ -z "$_cv" ] || { echo "error: control volume $CTL_VOL remains" >&2; RESTORE_OK=0; }
@@ -89,7 +162,7 @@ cleanup() {
             RESTORE_OK=0
         fi
     fi
-    if [ "$MADE_HOLD" = "1" ]; then
+    if owned "$MADE_HOLD"; then
         compose --profile fault stop -t 15 renamer-hold >/dev/null 2>&1 || true
         compose --profile fault rm -f renamer-hold >/dev/null 2>&1 || true
         if _ch="$(compose --profile fault ps -aq renamer-hold 2>/dev/null)"; then
@@ -99,21 +172,10 @@ cleanup() {
             RESTORE_OK=0
         fi
     fi
-    # Only if this control actually disturbed them. The exercise it drives
-    # refuses in its pre-flight, before touching the live applications, so on
-    # the ordinary path there is nothing here to put back.
-    # Restoring the shared applications is itself a mutation, so it happens
-    # only while holding the lock. Case 6 releases the lock for the child it
-    # interrupts; a failure in that window used to reach here and recreate the
-    # renamers and watcher with no lock held at all.
+    # Ownership was established once at the top of this function, so the
+    # restore is inside the same protected section as every removal above.
     if [ "$LIVE_TOUCHED" = "1" ]; then
-        if [ "$DRIVER_LOCK" = "1" ] || take_lock; then
-            recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
-        else
-            echo "error: the exercise lock is held elsewhere; the live applications" >&2
-            echo "       were NOT restored by this control. They may still be stopped." >&2
-            RESTORE_OK=0
-        fi
+        recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
     fi
     drop_lock
     return 0
@@ -200,6 +262,9 @@ run_case() {
 log "1/6: a file already at the held fixture's destination"
 # Exclusive create: this control must not truncate a file it did not make,
 # which is the very defect it exists to check for in the exercise.
+# Responsibility BEFORE the write. `set -C` guarantees nothing is written when
+# the path is occupied, so clearing back to 0 on OCCUPIED cannot orphan a file.
+MADE_DOC=1
 CTL_PLANT="$(compose run --rm --no-deps -T -e FN_T="/srv/fn/consume/$CTL_DOC" \
     --entrypoint sh storage-init -c '
         if [ -e "$FN_T" ]; then echo OCCUPIED; exit 0; fi
@@ -207,9 +272,11 @@ CTL_PLANT="$(compose run --rm --no-deps -T -e FN_T="/srv/fn/consume/$CTL_DOC" \
         if printf "pre-existing document, not this run\n" > "$FN_T" 2>/dev/null
         then echo CREATED; else echo OCCUPIED; fi' </dev/null 2>/dev/null | tr -d ' \r\n')"
 case "$CTL_PLANT" in
-    CREATED)  MADE_DOC=1 ;;
-    OCCUPIED) bad "$CTL_DOC already exists; case 1 not exercised and nothing was written" ;;
-    *)        bad "could not establish whether $CTL_DOC exists (read '$CTL_PLANT'); case 1 not exercised" ;;
+    CREATED)  MADE_DOC=2 ;;
+    OCCUPIED) MADE_DOC=0
+              bad "$CTL_DOC already exists; case 1 not exercised and nothing was written" ;;
+    *)        bad "could not establish whether $CTL_DOC was created (read '$CTL_PLANT');
+        responsibility is retained and cleanup will still try to remove it" ;;
 esac
 DOC_SHA_BEFORE="$(live_sha "/srv/fn/consume/$CTL_DOC")"
 release_for_child
@@ -233,11 +300,20 @@ if _pre="$(compose --profile fault ps -aq renamer-hold 2>/dev/null)"; then
     if [ -n "$_pre" ]; then
         bad "renamer-hold already exists; case 2 not exercised and it was left alone"
     else
+        # Responsibility BEFORE the creation. `compose up -d` can leave a
+        # container behind and still report failure, and the confirming read
+        # can fail on its own; either way this invocation may have made it.
+        MADE_HOLD=1
         compose --profile fault up -d renamer-hold >/dev/null 2>&1
-        if [ -n "$(compose --profile fault ps -aq renamer-hold 2>/dev/null)" ]; then
-            MADE_HOLD=1
+        if _post="$(compose --profile fault ps -aq renamer-hold 2>/dev/null)"; then
+            if [ -n "$_post" ]; then
+                MADE_HOLD=2
+            else
+                bad "renamer-hold was not created; case 2 not exercised"
+            fi
         else
-            bad "could not create the control fault service; case 2 not exercised"
+            bad "could not confirm whether renamer-hold was created;
+        responsibility is retained and cleanup will still try to remove it"
         fi
     fi
 else
@@ -260,7 +336,7 @@ emit "   the service's container:       $([ -n "$HOLD_ID_AFTER" ] && [ "$HOLD_ID
 # Only if THIS control created it. This used to run unconditionally, so a
 # renamer-hold the control had just refused -- because somebody else owned it
 # -- was stopped and removed anyway.
-if [ "$MADE_HOLD" = "1" ]; then
+if owned "$MADE_HOLD"; then
     compose --profile fault stop -t 15 renamer-hold >/dev/null 2>&1 || true
     compose --profile fault rm -f renamer-hold >/dev/null 2>&1 || true
     if _mh="$(compose --profile fault ps -aq renamer-hold 2>/dev/null)"; then
@@ -271,14 +347,22 @@ fi
 
 # --- 3. a database that this invocation did not create ---------------------
 log "3/6: the restore database name is already taken"
+# Refuse on an unreadable pre-check, then take responsibility BEFORE creating.
+_db_pre="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)"
+case "$_db_pre" in
+    0) MADE_DB=1 ;;
+    *) bad "could not establish that $CTL_DB is free (read '$_db_pre'); case 3 not exercised" ;;
+esac
 compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
     psql -U "${FN_DB_USER:-fn_app}" -d postgres -c "CREATE DATABASE $CTL_DB;" >/dev/null 2>&1 </dev/null
-if [ "$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)" = "1" ]; then
-    MADE_DB=1
-    psqlq "CREATE TABLE keepme(id int); INSERT INTO keepme VALUES (42);" "$CTL_DB" >/dev/null 2>&1
-else
-    bad "could not create the control database; case 3 not exercised"
-fi
+_db_post="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)"
+case "$_db_post" in
+    1) MADE_DB=2
+       psqlq "CREATE TABLE keepme(id int); INSERT INTO keepme VALUES (42);" "$CTL_DB" >/dev/null 2>&1 ;;
+    0) bad "the control database was not created; case 3 not exercised" ;;
+    *) bad "could not confirm whether $CTL_DB was created (read '$_db_post');
+        responsibility is retained and cleanup will still try to drop it" ;;
+esac
 DB_ROWS_BEFORE="$(psqln "SELECT count(*) FROM keepme;" "$CTL_DB")"
 release_for_child
 R3="$(run_case database "database $CTL_DB already exists" "FN_HU_RESTORE_DB=$CTL_DB")"
@@ -301,18 +385,30 @@ log "4/6: the backup volume name is already taken"
 # `docker volume create` returns 0 on a volume that already exists and does
 # not apply the label, so only the label coming back proves this control
 # created it -- and only then may its cleanup remove it.
+# Establish the name is free, then take responsibility BEFORE creating.
+if _cv_pre="$(docker volume ls -q --filter "name=^${CTL_VOL}$" 2>/dev/null)"; then
+    if [ -z "$_cv_pre" ]; then
+        MADE_VOL=1
+    else
+        bad "$CTL_VOL already exists; case 4 not exercised and it was left alone"
+    fi
+else
+    bad "could not establish whether $CTL_VOL exists; case 4 not exercised"
+fi
 docker volume create --label "fn.owner=$CTL_TAG" "$CTL_VOL" >/dev/null 2>&1 || true
 _cv_owner="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$CTL_VOL" 2>/dev/null || echo unreadable)"
 case "$_cv_owner" in
-    "$CTL_TAG") MADE_VOL=1 ;;
-    unreadable) bad "could not read $CTL_VOL's ownership label; case 4 not exercised" ;;
-    *)          bad "$CTL_VOL exists and is not this control's (owner '$_cv_owner'); case 4 not exercised" ;;
+    "$CTL_TAG") MADE_VOL=2 ;;
+    unreadable) bad "could not confirm $CTL_VOL's ownership label;
+        responsibility is retained and cleanup will still try to remove it" ;;
+    *)          bad "$CTL_VOL carries owner '$_cv_owner', not this control's;
+        responsibility is retained rather than dropped, and cleanup reports it" ;;
 esac
 # Seeded ONLY when the label proved this control created it. Writing into a
 # volume whose ownership was just rejected is the mutation-after-refusal this
 # whole exercise is about.
 VOL_SHA_BEFORE=ABSENT
-if [ "$MADE_VOL" = "1" ]; then
+if [ "$MADE_VOL" = "2" ]; then
     docker run --rm -v "$CTL_VOL:/v" "$UTIL_IMAGE" \
         sh -c 'printf "do not delete\n" > /v/canary.txt' >/dev/null 2>&1
     VOL_SHA_BEFORE="$(vol_sha "$CTL_VOL")"
@@ -367,6 +463,10 @@ INT_LOG="$EVIDENCE_DIR/.refusal-interrupt-$$.log"
 release_for_child
 sh "$SCRIPT" > "$INT_LOG" 2>&1 &
 INT_PID=$!
+# Registered so that a signal to THIS process terminates and reaps the child
+# before cleanup touches anything the child may still own -- including the
+# lock, which the child holds for the whole of its run.
+CHILD_PID="$INT_PID"
 # Wait for an actual MUTATION, not for the heading that precedes one. The
 # "1/8" line is printed before the child stops the renamers or creates any
 # service, so signalling on it proved only that an idle process can exit.
@@ -390,6 +490,7 @@ if [ "$INT_READY" = "1" ]; then
     # correctly, and the control died reporting 130 as its own exit.
     INT_EXIT=0
     wait "$INT_PID" 2>/dev/null || INT_EXIT=$?
+    CHILD_PID=""
 else
     INT_EXIT=unknown
     bad "the exercise never reached a mutating step; case 6 not exercised"

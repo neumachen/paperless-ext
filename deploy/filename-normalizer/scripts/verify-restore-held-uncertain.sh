@@ -465,13 +465,17 @@ log "3/8: backing up the ledger and the document roots"
 # about who created it. The label does: if it comes back, this invocation
 # created the volume; if it does not, something else owns it and it is left
 # alone.
+# Responsibility BEFORE the creation. Taking it only after the confirming read
+# meant a volume that WAS created but whose label could not be read was left
+# with nobody responsible for removing it.
+OWNS_BACKUP_VOL=1
 docker volume create --label "fn.owner=$HU_RUN_TAG" "$BACKUP_VOL" >/dev/null 2>&1 \
     || fatal "could not create the backup volume"
 _bv_owner="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$BACKUP_VOL" 2>/dev/null || echo unreadable)"
 case "$_bv_owner" in
-    "$HU_RUN_TAG") OWNS_BACKUP_VOL=1 ;;
-    unreadable)    fatal "could not read the backup volume's ownership label; refusing to use or remove it" ;;
-    *)             fatal "volume $BACKUP_VOL exists and is not this invocation's (owner '$_bv_owner'); leaving it untouched" ;;
+    "$HU_RUN_TAG") : ;;
+    unreadable)    fatal "could not read the backup volume's ownership label; cleanup will still try to remove it" ;;
+    *)             fatal "volume $BACKUP_VOL carries owner '$_bv_owner'; cleanup will report rather than assume" ;;
 esac
 compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
     pg_dump -U "${FN_DB_USER:-fn_app}" -d "${FN_DB_NAME:-filename_normalizer}" -Fc \
@@ -490,10 +494,11 @@ emit "   ledger dump and four role archives written"
 # 4. Restore into a throwaway ledger and a host tree the restored stack mounts.
 # ---------------------------------------------------------------------------
 log "4/8: restoring into a throwaway ledger and filesystem"
+OWNS_RESTORE_DB=1
 compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
     psql -U "${FN_DB_USER:-fn_app}" -d postgres -c "CREATE DATABASE $RESTORE_DB;" >/dev/null 2>&1 </dev/null \
     || fatal "could not create the throwaway restore database"
-OWNS_RESTORE_DB=1
+
 compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
     pg_restore -U "${FN_DB_USER:-fn_app}" -d "$RESTORE_DB" --no-owner \
     < "$EVIDENCE_DIR/.hu-backup-$$.dump" >/dev/null 2>&1 \
@@ -538,9 +543,10 @@ emit "   foreign occupant bytes:       $([ "$R_FOREIGN_SHA" = "$FOREIGN_SHA" ] &
 # 5. Start REAL applications on the restored ledger and filesystem.
 # ---------------------------------------------------------------------------
 log "5/8: starting real applications against the restored system"
+OWNS_RESTORE_VHOST=1
 compose exec -T rabbitmq rabbitmqctl add_vhost "$RESTORE_VHOST" >/dev/null 2>&1 \
     || fatal "could not create the restored stack's broker vhost"
-OWNS_RESTORE_VHOST=1
+
 compose exec -T rabbitmq rabbitmqctl set_permissions -p "$RESTORE_VHOST" \
     "${FN_AMQP_USER:-fn_app}" '.*' '.*' '.*' >/dev/null 2>&1 \
     || fatal "could not grant permissions on the restored stack's vhost"
