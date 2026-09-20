@@ -40,6 +40,10 @@ SAVE_VERIFIED=0
 SLOT_RESTORED=unknown
 PR_RESTORED=0
 CTL_RESULT_LINE=""
+# An independent pre-run copy of the ledger, kept OUTSIDE the recovery copy so
+# the comparison still has something to compare against after a successful
+# restore has removed that copy.
+PR_BEFORE=""
 LIVE_TOUCHED=0
 UDOC="drainreject-$LOWER.pdf"
 
@@ -55,12 +59,28 @@ psqlq() {
 }
 psqln() { psqlq "$1" | tr -d ' \n'; }
 
-# Hash every file under a directory in ONE container run, like every other hash
-# in this stack. The output is "<sha256>  ./<relative path>", sorted, so two
-# listings taken before and after a phase compare with a plain diff.
-slot_digests() {
-    docker run --rm -v "$1":/slot:ro "$UTIL_IMAGE" \
-        sh -c 'cd /slot && find . -type f -exec sha256sum {} + 2>/dev/null | sort -k2' 2>/dev/null
+# Hash the WHOLE evidence recovery set in ONE container run: every shared
+# output `run_phase` rewrites, not just the drained/ slot.
+#
+#   phase-drained.log   the phase log, replaced
+#   phase-results.txt   the cumulative ledger, appended to
+#   logs/               every service log, overwritten by collect_logs
+#   drained/            every file the phase itself writes
+#
+# The same function runs against the live evidence directory and against the
+# recovery copy, which share this relative layout, so the two listings compare
+# with a plain diff. Dotfiles at the root are not included, which is why the
+# manifests themselves can live inside the copy.
+recovery_digests() {
+    docker run --rm -v "$1":/r:ro "$UTIL_IMAGE" sh -c '
+        cd /r 2>/dev/null || exit 1
+        for f in phase-drained.log phase-results.txt; do
+            if [ -f "$f" ]; then sha256sum "$f"; fi
+        done
+        for d in logs drained; do
+            if [ -d "$d" ]; then find "$d" -type f -exec sha256sum {} + ; fi
+        done
+        exit 0' 2>/dev/null | sort -k2
 }
 
 CLEANED=0
@@ -119,21 +139,28 @@ cleanup() {
         if [ -d "$SAVED/logs" ]; then
             cp -R "$SAVED/logs/." "$EVIDENCE_DIR/logs/" 2>/dev/null || true
         fi
-        if [ -f "$SAVED/.slot-before" ]; then
-            slot_digests "$EVIDENCE_DIR/drained" > "$SAVED/.slot-after" 2>/dev/null || true
-            if [ ! -s "$SAVED/.slot-after" ]; then
+        # The WHOLE set is compared against its pre-run manifest -- the log,
+        # the ledger, every service log and every file in drained/ -- not the
+        # slot alone.
+        if [ -f "$SAVED/.set-before" ]; then
+            recovery_digests "$EVIDENCE_DIR" > "$SAVED/.set-after" 2>/dev/null || true
+            if [ ! -s "$SAVED/.set-after" ]; then
                 SLOT_RESTORED=unknown
-                echo "error: could not read back the drained evidence slot; its" >&2
+                echo "error: could not read back the evidence recovery set; its" >&2
                 echo "       restoration is UNCONFIRMED and must not be reported as done." >&2
                 RESTORE_OK=0
-            elif diff "$SAVED/.slot-before" "$SAVED/.slot-after" >/dev/null 2>&1; then
+            elif diff "$SAVED/.set-before" "$SAVED/.set-after" >/dev/null 2>&1; then
                 SLOT_RESTORED=yes
             else
                 SLOT_RESTORED=NO
-                echo "error: the drained evidence slot did not come back byte-for-byte:" >&2
-                diff "$SAVED/.slot-before" "$SAVED/.slot-after" >&2 || true
+                echo "error: the evidence recovery set did not come back byte-for-byte:" >&2
+                diff "$SAVED/.set-before" "$SAVED/.set-after" >&2 || true
                 RESTORE_OK=0
             fi
+        else
+            SLOT_RESTORED=unknown
+            echo "error: no pre-run manifest; restoration cannot be confirmed." >&2
+            RESTORE_OK=0
         fi
         # The recovery copy is deleted ONLY when the evidence is provably back.
         # Removing it unconditionally destroyed the last copy of the material
@@ -143,7 +170,8 @@ cleanup() {
             rm -rf "$SAVED" 2>/dev/null || true
         else
             SAVED_KEPT="$SAVED"
-            echo "error: the recovery copy is RETAINED at $SAVED" >&2
+            echo "error: a required restoration was unsuccessful or unknown, so the" >&2
+            echo "       recovery copy is RETAINED at $SAVED" >&2
             echo "       It holds phase-drained.log, phase-results.txt, logs/ and the" >&2
             echo "       whole drained/ slot as they were before this control ran." >&2
         fi
@@ -234,47 +262,52 @@ emit "   the assertion runs."
 log "2/3: running the real drained assertion with that job as its real-fixture set"
 SAVED="$EVIDENCE_DIR/.drain-evidence-saved-$$"
 mkdir -p "$SAVED/drained" "$SAVED/logs"
+# Copy the whole recovery set, then prove the COPY is complete before a single
+# byte of the original is borrowed.
+#
+# Verifying only drained/ left phase-drained.log, phase-results.txt and logs/
+# copied on trust: `cp` failures were swallowed, and an incomplete copy would
+# have been discovered only at restore time, when the originals were already
+# overwritten and the bad copy was all that remained.
 if [ -f "$EVIDENCE_DIR/phase-drained.log" ]; then
-    cp "$EVIDENCE_DIR/phase-drained.log" "$SAVED/phase-drained.log" \
-        || { emit "    REFUSED: could not copy phase-drained.log aside; nothing has been changed"; exit 1; }
+    cp "$EVIDENCE_DIR/phase-drained.log" "$SAVED/phase-drained.log" 2>/dev/null || true
 fi
-# The cumulative result ledger run_phase appends to, and the service logs
-# collect_logs overwrites. Both are shared outputs of the phase about to run.
 if [ -f "$EVIDENCE_DIR/phase-results.txt" ]; then
-    cp "$EVIDENCE_DIR/phase-results.txt" "$SAVED/phase-results.txt" \
-        || { emit "    REFUSED: could not copy phase-results.txt aside; nothing has been changed"; exit 1; }
+    cp "$EVIDENCE_DIR/phase-results.txt" "$SAVED/phase-results.txt" 2>/dev/null || true
 fi
 if [ -d "$EVIDENCE_DIR/logs" ]; then
     cp -R "$EVIDENCE_DIR/logs/." "$SAVED/logs/" 2>/dev/null || true
 fi
-# The whole slot, plus a digest of every file in it, so the restore is an
-# assertion rather than a hope. run_phase rewrites all of these.
-#
-# And the COPY is verified before anything is borrowed. A readable original
-# directory says nothing about whether the copy of it succeeded; hashing only
-# the original and trusting `cp -R` meant a partial or failed copy would not
-# be discovered until the restore, by which time the original was already
-# overwritten and the copy was the only thing left.
 if [ -d "$EVIDENCE_DIR/drained" ]; then
     cp -R "$EVIDENCE_DIR/drained/." "$SAVED/drained/" 2>/dev/null || true
-    slot_digests "$EVIDENCE_DIR/drained" > "$SAVED/.slot-before" 2>/dev/null || true
-    if [ ! -s "$SAVED/.slot-before" ]; then
-        rm -rf "$SAVED" 2>/dev/null || true
-        emit "    REFUSED: the retained drain evidence could not be hashed, so this"
-        emit "             control cannot prove it put it back; nothing has been changed"
-        exit 1
-    fi
-    slot_digests "$SAVED/drained" > "$SAVED/.copy-digests" 2>/dev/null || true
-    if ! diff "$SAVED/.slot-before" "$SAVED/.copy-digests" >/dev/null 2>&1; then
-        emit "    REFUSED: the recovery copy of the drained evidence does not match the"
-        emit "             original, so a complete recovery copy does not exist; nothing"
-        emit "             has been changed. The partial copy is at $SAVED"
-        SAVED_KEPT="$SAVED"
-        exit 1
-    fi
 fi
-# A complete, verified recovery copy now exists. Only from here may the
-# evidence be borrowed, and only from here may cleanup write anything back.
+PR_BEFORE="$EVIDENCE_DIR/.drain-pr-before-$$"
+if [ -f "$EVIDENCE_DIR/phase-results.txt" ]; then
+    cp "$EVIDENCE_DIR/phase-results.txt" "$PR_BEFORE" 2>/dev/null || true
+fi
+recovery_digests "$EVIDENCE_DIR" > "$SAVED/.set-before" 2>/dev/null || true
+if [ ! -s "$SAVED/.set-before" ]; then
+    rm -rf "$SAVED" 2>/dev/null || true
+    emit "    REFUSED: the retained evidence could not be hashed, so this control"
+    emit "             cannot prove it put it back; nothing has been changed"
+    exit 1
+fi
+recovery_digests "$SAVED" > "$SAVED/.set-copy" 2>/dev/null || true
+if ! diff "$SAVED/.set-before" "$SAVED/.set-copy" >/dev/null 2>&1; then
+    SAVED_KEPT="$SAVED"
+    emit "    REFUSED: the recovery copy is INCOMPLETE -- it does not match the"
+    emit "             evidence it was taken from, so a complete recovery copy does"
+    emit "             not exist and nothing has been borrowed. The partial copy is"
+    emit "             RETAINED at $SAVED"
+    emit "             differences (left: original, right: copy):"
+    diff "$SAVED/.set-before" "$SAVED/.set-copy" 2>&1 | head -20 | while IFS= read -r _dl; do
+        emit "               $_dl"
+    done
+    exit 1
+fi
+# A complete, verified recovery copy of every shared output now exists. Only
+# from here may the evidence be borrowed, and only from here may cleanup write
+# anything back.
 SAVE_VERIFIED=1
 printf '%s,\n' "$UJOB" > "$EVIDENCE_DIR/state/$NEW_RUN.drain-real-ids"
 # run_phase reads both of these from the shell directly. PHASE_FAILURES is
@@ -327,14 +360,18 @@ L1="$(compose ps --format '{{.Health}}' renamer-1 2>/dev/null | head -1)"
 L2="$(compose ps --format '{{.Health}}' renamer-2 2>/dev/null | head -1)"
 LW="$(compose ps --format '{{.Health}}' watcher 2>/dev/null | head -1)"
 DRAIN_OK="$(grep -ac 'real_fixtures_terminal=' "$EVIDENCE_DIR/drained/f5-drain-under-load.txt" 2>/dev/null || true)"
-# The shared ledger must carry no row from this control once it is done.
+# The shared ledger is compared against its PRE-RUN CONTENTS, not merely
+# checked for this control's row at the end. A last-line check passes just as
+# happily on a ledger that lost rows, gained different ones, or had its
+# earlier lines rewritten -- none of which is "restored".
 PR_RESTORED=0
-if [ -n "$CTL_RESULT_LINE" ]; then
-    if [ "$(tail -1 "$EVIDENCE_DIR/phase-results.txt" 2>/dev/null || true)" != "$CTL_RESULT_LINE" ]; then
+if [ -f "$PR_BEFORE" ]; then
+    if diff "$PR_BEFORE" "$EVIDENCE_DIR/phase-results.txt" >/dev/null 2>&1; then
         PR_RESTORED=1
+    else
+        echo "error: phase-results.txt differs from its pre-run contents:" >&2
+        diff "$PR_BEFORE" "$EVIDENCE_DIR/phase-results.txt" >&2 || true
     fi
-else
-    PR_RESTORED=1
 fi
 emit ""
 emit "restoration (read back from the running stack):"
@@ -343,18 +380,21 @@ emit "                                 renamers came back; it is this control's"
 emit "                                 own synthetic job, identified above)"
 emit "   renamer-1 / renamer-2 / watcher: $L1 / $L2 / $LW   (expected healthy x3)"
 emit "   retained drain evidence readable: $([ "${DRAIN_OK:-0}" -ge 1 ] && echo yes || echo NO)"
-emit "   the whole drained/ slot came back byte-for-byte: $SLOT_RESTORED   (expected yes;"
-emit "                                 every file the phase rewrites, compared by"
-emit "                                 sha256 against the listing taken before it ran)"
+emit "   the whole recovery set came back byte-for-byte: $SLOT_RESTORED   (expected yes;"
+emit "                                 phase-drained.log, phase-results.txt, logs/ and"
+emit "                                 drained/, compared by sha256 against the manifest"
+emit "                                 taken before the phase ran)"
 emit "   state copies left behind:     $(ls "$EVIDENCE_DIR/state/$NEW_RUN".* 2>/dev/null | grep -c . || true)   (expected 0)"
 emit "   shared phase ledger restored: $([ "$PR_RESTORED" = "1" ] && echo yes || echo NO)   (expected yes:"
-emit "                                 phase-results.txt back to its pre-run bytes)"
+emit "                                 phase-results.txt compared line-for-line"
+emit "                                 against a copy taken before the phase ran)"
 emit "   recovery copy:                ${SAVED_KEPT:-removed (the evidence is provably back)}"
 { [ "$L1" = "healthy" ] && [ "$L2" = "healthy" ] && [ "$LW" = "healthy" ]; } \
     || bad "the live stack is not healthy after this control ($L1/$L2/$LW)"
 [ "${DRAIN_OK:-0}" -ge 1 ] || bad "the retained drain evidence was not restored"
-[ "$SLOT_RESTORED" = "yes" ] || bad "the drained evidence slot was not restored byte-for-byte ($SLOT_RESTORED)"
-[ "$PR_RESTORED" = "1" ] || bad "this control's row is still in the shared phase ledger"
+[ "$SLOT_RESTORED" = "yes" ] || bad "the evidence recovery set was not restored byte-for-byte ($SLOT_RESTORED)"
+[ "$PR_RESTORED" = "1" ] || bad "phase-results.txt was not restored to its pre-run contents"
+[ -z "$PR_BEFORE" ] || rm -f "$PR_BEFORE" 2>/dev/null || true
 [ -z "$SAVED_KEPT" ] || bad "restoration was not confirmed; the recovery copy is retained at $SAVED_KEPT"
 [ "$RESTORE_OK" = "1" ] || bad "restoration was incomplete"
 

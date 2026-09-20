@@ -29,9 +29,15 @@ FAILURES=0
 RESTORE_OK=1
 
 # Disposable resources this control creates, and must get back unchanged.
-CTL_VOL="fn-refusal-vol-$LOWER"
-CTL_DB="fn_refusal_db_$LOWER"
-CTL_DOC="hu-held-refusal-$LOWER.pdf"
+#
+# Overridable for the same reason the exercise's names are (see its header):
+# so verify-refusal-adverse.sh can put a REAL occupied name in front of the
+# failed-prerequisite guards below and drive them against this exact code
+# path, instead of asserting that a guard it never reached would have worked.
+# Defaults are per-invocation and unique.
+CTL_VOL="${FN_REFUSAL_VOL:-fn-refusal-vol-$LOWER}"
+CTL_DB="${FN_REFUSAL_DB:-fn_refusal_db_$LOWER}"
+CTL_DOC="${FN_REFUSAL_DOC:-hu-held-refusal-$LOWER.pdf}"
 MADE_VOL=0
 MADE_DB=0
 MADE_DOC=0
