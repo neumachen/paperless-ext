@@ -232,6 +232,16 @@ test-post-commit-interval: ## Prove the interval between a committed receipt and
 	@mkdir -p $(EVIDENCE)
 	cd $(HERE) && ./scripts/verify-post-commit-interval.sh
 
+.PHONY: test-drain-rejects-nonterminal
+test-drain-rejects-nonterminal: ## Prove the drain identity assertion rejects a real non-terminal fixture
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-drain-rejects-nonterminal.sh
+
+.PHONY: test-refusal-adverse
+test-refusal-adverse: ## Prove the adverse paths (stolen lock, interrupted parent, failing inspections) contain themselves
+	@mkdir -p $(EVIDENCE)
+	cd $(HERE) && ./scripts/verify-refusal-adverse.sh
+
 .PHONY: test-restore-refusals
 test-restore-refusals: ## Prove each restore refusal stops dependent work and preserves what it refused
 	@mkdir -p $(EVIDENCE)
