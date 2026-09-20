@@ -71,16 +71,72 @@ psqln() { psqlq "$1" | tr -d ' \n'; }
 # recovery copy, which share this relative layout, so the two listings compare
 # with a plain diff. Dotfiles at the root are not included, which is why the
 # manifests themselves can live inside the copy.
+# Emit "<sha256>  <path>" for every file in the evidence recovery set, or FAIL.
+#
+#   phase-drained.log   the phase log, replaced
+#   phase-results.txt   the cumulative ledger, appended to
+#   logs/               every service log, overwritten by collect_logs
+#   drained/            every file the phase itself writes
+#
+# This used to end with an unconditional `exit 0` inside the container and a
+# pipeline ending in `sort`, so BOTH the shell's status and the pipeline's
+# status were discarded: a `find` that could not descend, or a `sha256sum`
+# that could not read a file, produced a SHORTER manifest that still looked
+# like a successful one. Two short manifests then compared equal and the
+# completeness check passed on evidence nobody had actually hashed.
+#
+# Now every failure exits non-zero, the container's status is captured before
+# anything is piped, and sorting happens afterwards on the captured text.
 recovery_digests() {
-    docker run --rm -v "$1":/r:ro "$UTIL_IMAGE" sh -c '
-        cd /r 2>/dev/null || exit 1
+    _rd_out="$(docker run --rm -v "$1":/r:ro "$UTIL_IMAGE" sh -c '
+        set -e
+        cd /r
         for f in phase-drained.log phase-results.txt; do
             if [ -f "$f" ]; then sha256sum "$f"; fi
         done
         for d in logs drained; do
-            if [ -d "$d" ]; then find "$d" -type f -exec sha256sum {} + ; fi
+            if [ -d "$d" ]; then
+                find "$d" -type f > /tmp/rd-list || exit 3
+                while IFS= read -r _p; do
+                    [ -n "$_p" ] || continue
+                    sha256sum "$_p" || exit 4
+                done < /tmp/rd-list
+            fi
+        done')" || return 1
+    printf '%s\n' "$_rd_out" | sort -k2
+    return 0
+}
+
+# How many files the recovery set is EXPECTED to contain, counted
+# independently of the hashing above. A manifest with fewer lines than this
+# means something was enumerated but never hashed.
+recovery_expected_count() {
+    docker run --rm -v "$1":/r:ro "$UTIL_IMAGE" sh -c '
+        set -e
+        cd /r
+        n=0
+        for f in phase-drained.log phase-results.txt; do
+            if [ -f "$f" ]; then n=$((n + 1)); fi
         done
-        exit 0' 2>/dev/null | sort -k2
+        for d in logs drained; do
+            if [ -d "$d" ]; then
+                c="$(find "$d" -type f | wc -l)"
+                n=$((n + c))
+            fi
+        done
+        printf "%s\n" "$n"' 2>/dev/null | tr -d ' \r\n'
+}
+
+# A manifest is COMPLETE when it was produced without error and has exactly
+# one line per expected file. Returns 0 only then.
+manifest_complete() {
+    _mc_manifest="$1"; _mc_expected="$2"
+    [ -s "$_mc_manifest" ] || return 1
+    case "$_mc_expected" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_mc_expected" -ge 1 ] || return 1
+    _mc_lines="$(grep -c . "$_mc_manifest" 2>/dev/null || echo 0)"
+    [ "$_mc_lines" = "$_mc_expected" ] || return 1
+    return 0
 }
 
 CLEANED=0
@@ -143,11 +199,15 @@ cleanup() {
         # the ledger, every service log and every file in drained/ -- not the
         # slot alone.
         if [ -f "$SAVED/.set-before" ]; then
-            recovery_digests "$EVIDENCE_DIR" > "$SAVED/.set-after" 2>/dev/null || true
-            if [ ! -s "$SAVED/.set-after" ]; then
+            _set_after_expected="$(recovery_expected_count "$EVIDENCE_DIR")"
+            if ! recovery_digests "$EVIDENCE_DIR" > "$SAVED/.set-after" 2>/dev/null; then
+                : > "$SAVED/.set-after"
+            fi
+            if ! manifest_complete "$SAVED/.set-after" "$_set_after_expected"; then
                 SLOT_RESTORED=unknown
-                echo "error: could not read back the evidence recovery set; its" >&2
-                echo "       restoration is UNCONFIRMED and must not be reported as done." >&2
+                echo "error: the restored evidence could not be completely hashed" >&2
+                echo "       ($_set_after_expected expected); restoration is UNCONFIRMED" >&2
+                echo "       and must not be reported as done." >&2
                 RESTORE_OK=0
             elif diff "$SAVED/.set-before" "$SAVED/.set-after" >/dev/null 2>&1; then
                 SLOT_RESTORED=yes
@@ -260,6 +320,53 @@ emit "   the assertion runs."
 
 # --- run the real assertion over it ----------------------------------------
 log "2/3: running the real drained assertion with that job as its real-fixture set"
+# --- the instrument is checked against a known-bad set first --------------
+#
+# A completeness check that has never been seen to fail is not evidence. On a
+# disposable directory of this control's own making -- never the retained
+# evidence -- it is shown to (a) accept a whole set, (b) reject a set with a
+# file missing, and (c) FAIL, rather than silently shorten, when a path cannot
+# be hashed. (c) is the case the old helper masked with `exit 0`.
+SELFTEST="$EVIDENCE_DIR/.drain-selftest-$$"
+rm -rf "$SELFTEST" 2>/dev/null || true
+mkdir -p "$SELFTEST/logs" "$SELFTEST/drained"
+printf 'selftest\n' > "$SELFTEST/phase-drained.log"
+printf 'selftest\n' > "$SELFTEST/phase-results.txt"
+printf 'selftest\n' > "$SELFTEST/logs/selftest.log"
+printf 'selftest\n' > "$SELFTEST/drained/selftest.txt"
+ST_EXPECTED="$(recovery_expected_count "$SELFTEST")"
+ST_WHOLE=0
+if recovery_digests "$SELFTEST" > "$SELFTEST/.m" 2>/dev/null; then
+    if manifest_complete "$SELFTEST/.m" "$ST_EXPECTED"; then ST_WHOLE=1; fi
+fi
+rm -f "$SELFTEST/drained/selftest.txt"
+ST_SHORT=0
+recovery_digests "$SELFTEST" > "$SELFTEST/.m2" 2>/dev/null || true
+if ! manifest_complete "$SELFTEST/.m2" "$ST_EXPECTED"; then ST_SHORT=1; fi
+# A path the hashing loop cannot consume. `find -type f` lists it, sha256sum
+# cannot read either half of it, and the run must end non-zero.
+printf 'selftest\n' > "$SELFTEST/drained/selftest.txt"
+touch "$SELFTEST/drained/broken
+name" 2>/dev/null || true
+ST_FAILS=0
+if ! recovery_digests "$SELFTEST" > "$SELFTEST/.m3" 2>/dev/null; then ST_FAILS=1; fi
+rm -rf "$SELFTEST" 2>/dev/null || true
+emit ""
+emit "0. the completeness check, measured on a disposable set before borrowing"
+emit "   accepts a whole set ($ST_EXPECTED files): $ST_WHOLE   (expected 1)"
+emit "   rejects a set with one file missing:      $ST_SHORT   (expected 1)"
+emit "   FAILS when a path cannot be hashed:       $ST_FAILS   (expected 1: the"
+emit "                                 previous helper exited 0 here and returned a"
+emit "                                 short manifest that looked complete)"
+[ "$ST_WHOLE" = "1" ] || bad "the completeness check rejected a whole set; it cannot be trusted"
+[ "$ST_SHORT" = "1" ] || bad "the completeness check accepted a set with a file missing"
+[ "$ST_FAILS" = "1" ] || bad "a path that cannot be hashed did not fail the manifest"
+if [ "$ST_WHOLE" != "1" ] || [ "$ST_SHORT" != "1" ] || [ "$ST_FAILS" != "1" ]; then
+    emit "    REFUSED: the completeness check does not behave as required, so this"
+    emit "             control will not borrow evidence it cannot prove it restored"
+    exit 1
+fi
+
 SAVED="$EVIDENCE_DIR/.drain-evidence-saved-$$"
 mkdir -p "$SAVED/drained" "$SAVED/logs"
 # Copy the whole recovery set, then prove the COPY is complete before a single
@@ -285,14 +392,37 @@ PR_BEFORE="$EVIDENCE_DIR/.drain-pr-before-$$"
 if [ -f "$EVIDENCE_DIR/phase-results.txt" ]; then
     cp "$EVIDENCE_DIR/phase-results.txt" "$PR_BEFORE" 2>/dev/null || true
 fi
-recovery_digests "$EVIDENCE_DIR" > "$SAVED/.set-before" 2>/dev/null || true
-if [ ! -s "$SAVED/.set-before" ]; then
+SET_EXPECTED="$(recovery_expected_count "$EVIDENCE_DIR")"
+if ! recovery_digests "$EVIDENCE_DIR" > "$SAVED/.set-before" 2>/dev/null; then
     rm -rf "$SAVED" 2>/dev/null || true
-    emit "    REFUSED: the retained evidence could not be hashed, so this control"
-    emit "             cannot prove it put it back; nothing has been changed"
+    emit "    REFUSED: hashing the retained evidence FAILED, so this control cannot"
+    emit "             prove it put it back; nothing has been changed"
     exit 1
 fi
-recovery_digests "$SAVED" > "$SAVED/.set-copy" 2>/dev/null || true
+if ! manifest_complete "$SAVED/.set-before" "$SET_EXPECTED"; then
+    rm -rf "$SAVED" 2>/dev/null || true
+    emit "    REFUSED: the retained evidence manifest is INCOMPLETE -- $SET_EXPECTED file(s)"
+    emit "             expected, $(grep -c . "$SAVED/.set-before" 2>/dev/null || echo 0) hashed. Nothing has been changed."
+    exit 1
+fi
+# The copy is hashed with the same instrument and must be complete on its own
+# terms as well as identical: two short manifests can agree with each other.
+SET_COPY_EXPECTED="$(recovery_expected_count "$SAVED")"
+if ! recovery_digests "$SAVED" > "$SAVED/.set-copy" 2>/dev/null; then
+    SAVED_KEPT="$SAVED"
+    emit "    REFUSED: hashing the recovery COPY failed, so a complete recovery copy"
+    emit "             cannot be proved to exist; nothing has been borrowed. The copy"
+    emit "             is RETAINED at $SAVED"
+    exit 1
+fi
+if ! manifest_complete "$SAVED/.set-copy" "$SET_COPY_EXPECTED" \
+   || [ "$SET_COPY_EXPECTED" != "$SET_EXPECTED" ]; then
+    SAVED_KEPT="$SAVED"
+    emit "    REFUSED: the recovery copy is INCOMPLETE -- $SET_EXPECTED file(s) expected,"
+    emit "             $SET_COPY_EXPECTED found in the copy. Nothing has been borrowed and the"
+    emit "             copy is RETAINED at $SAVED"
+    exit 1
+fi
 if ! diff "$SAVED/.set-before" "$SAVED/.set-copy" >/dev/null 2>&1; then
     SAVED_KEPT="$SAVED"
     emit "    REFUSED: the recovery copy is INCOMPLETE -- it does not match the"

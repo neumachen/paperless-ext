@@ -82,7 +82,16 @@ CHILD_PID=""
 # and only ever upgraded, so a resource this invocation may have made is
 # always cleaned up -- and a failed confirmation is reported rather than being
 # allowed to certify cleanup.
-owned() { [ "$1" = "1" ] || [ "$1" = "2" ]; }
+# Only CONFIRMED ownership authorises a destructive action. Ambiguous
+# ownership -- a creation was issued and its outcome could not be established
+# -- preserves the resource, names it, and reports restoration incomplete.
+# `owned()` covered both and was used for every removal below, so "we might
+# have made this" was enough to drop a database or remove a volume by name.
+owned_confirmed() { [ "$1" = "2" ]; }
+owned_ambiguous() { [ "$1" = "1" ]; }
+# For the retained-resources report only: anything this invocation may have
+# created is worth naming when cleanup cannot run at all.
+owned_any()       { [ "$1" = "1" ] || [ "$1" = "2" ]; }
 
 # Does this process hold the lock RIGHT NOW?
 #
@@ -134,17 +143,22 @@ cleanup() {
     else
         echo "error: the exercise lock is held elsewhere; this control cleaned up NOTHING." >&2
         echo "       Retained by this invocation and NOT removed:" >&2
-        owned "$MADE_DOC"  && echo "         document /srv/fn/consume/$CTL_DOC" >&2
-        owned "$MADE_DB"   && echo "         database $CTL_DB" >&2
-        owned "$MADE_VOL"  && echo "         volume $CTL_VOL" >&2
-        owned "$MADE_HOLD" && echo "         fault service renamer-hold" >&2
+        owned_any "$MADE_DOC"  && echo "         document /srv/fn/consume/$CTL_DOC" >&2
+        owned_any "$MADE_DB"   && echo "         database $CTL_DB" >&2
+        owned_any "$MADE_VOL"  && echo "         volume $CTL_VOL" >&2
+        owned_any "$MADE_HOLD" && echo "         fault service renamer-hold" >&2
         [ "$LIVE_TOUCHED" = "1" ] && echo "         live applications may still be stopped" >&2
         RESTORE_OK=0
         DRIVER_LOCK=0
         return 0
     fi
 
-    if owned "$MADE_DOC"; then
+    if owned_ambiguous "$MADE_DOC"; then
+        echo "error: document /srv/fn/consume/$CTL_DOC is AMBIGUOUS -- this invocation" >&2
+        echo "       may or may not have created it. It is RETAINED, not removed by name." >&2
+        RESTORE_OK=0
+    fi
+    if owned_confirmed "$MADE_DOC"; then
         compose run --rm --no-deps -T -e FN_T="/srv/fn/consume/$CTL_DOC" \
             --entrypoint sh storage-init -c 'rm -f "$FN_T"' >/dev/null 2>&1 </dev/null || true
         case "$(probe_exists "/srv/fn/consume/$CTL_DOC")" in
@@ -152,14 +166,30 @@ cleanup() {
             *)  echo "error: control document $CTL_DOC could not be confirmed removed" >&2; RESTORE_OK=0 ;;
         esac
     fi
-    if owned "$MADE_DB"; then
+    if owned_ambiguous "$MADE_DB"; then
+        echo "error: database $CTL_DB is AMBIGUOUS -- this invocation may or may not" >&2
+        echo "       have created it. It is RETAINED, not dropped by name." >&2
+        RESTORE_OK=0
+    fi
+    if owned_confirmed "$MADE_DB"; then
         psqlq "DROP DATABASE IF EXISTS $CTL_DB;" postgres >/dev/null 2>&1 || true
         case "$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)" in
             0) : ;;
             *)  echo "error: control database $CTL_DB remains" >&2; RESTORE_OK=0 ;;
         esac
     fi
-    if owned "$MADE_VOL"; then
+    # A volume carries its own answer, so an ambiguous one is disambiguated by
+    # re-reading the label rather than removed on a guess.
+    if owned_ambiguous "$MADE_VOL"; then
+        case "$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$CTL_VOL" 2>/dev/null || echo unreadable)" in
+            "$CTL_TAG") MADE_VOL=2 ;;
+            unreadable) echo "error: volume $CTL_VOL's label is still unreadable; it is RETAINED, not removed by name." >&2
+                        RESTORE_OK=0 ;;
+            *)          MADE_VOL=0
+                        echo "note: volume $CTL_VOL belongs to somebody else; leaving it untouched." >&2 ;;
+        esac
+    fi
+    if owned_confirmed "$MADE_VOL"; then
         docker volume rm "$CTL_VOL" >/dev/null 2>&1 || true
         if _cv="$(docker volume ls -q --filter "name=^${CTL_VOL}$" 2>/dev/null)"; then
             [ -z "$_cv" ] || { echo "error: control volume $CTL_VOL remains" >&2; RESTORE_OK=0; }
@@ -168,7 +198,15 @@ cleanup() {
             RESTORE_OK=0
         fi
     fi
-    if owned "$MADE_HOLD"; then
+    # A compose service carries no per-invocation marker, so an ambiguous one
+    # cannot be disambiguated later. It is retained and named; the next run's
+    # pre-flight refuses on it rather than adopting it.
+    if owned_ambiguous "$MADE_HOLD"; then
+        echo "error: fault service renamer-hold is AMBIGUOUS -- this invocation may or" >&2
+        echo "       may not have created it. It is RETAINED, not removed." >&2
+        RESTORE_OK=0
+    fi
+    if owned_confirmed "$MADE_HOLD"; then
         compose --profile fault stop -t 15 renamer-hold >/dev/null 2>&1 || true
         compose --profile fault rm -f renamer-hold >/dev/null 2>&1 || true
         if _ch="$(compose --profile fault ps -aq renamer-hold 2>/dev/null)"; then
@@ -342,7 +380,7 @@ emit "   the service's container:       $([ -n "$HOLD_ID_AFTER" ] && [ "$HOLD_ID
 # Only if THIS control created it. This used to run unconditionally, so a
 # renamer-hold the control had just refused -- because somebody else owned it
 # -- was stopped and removed anyway.
-if owned "$MADE_HOLD"; then
+if owned_confirmed "$MADE_HOLD"; then
     compose --profile fault stop -t 15 renamer-hold >/dev/null 2>&1 || true
     compose --profile fault rm -f renamer-hold >/dev/null 2>&1 || true
     if _mh="$(compose --profile fault ps -aq renamer-hold 2>/dev/null)"; then
@@ -366,16 +404,36 @@ case "$_db_pre" in
     *) bad "$CTL_DB already exists (read '$_db_pre'); case 3 not exercised, nothing was created and it was left alone" ;;
 esac
 if [ "$CASE3_READY" = "1" ]; then
+    # The CREATE's own exit status decides ownership, and it was being thrown
+    # away. A database appearing between the check above and this line makes
+    # the CREATE fail; the post-check then read 1 because somebody ELSE's
+    # database was there, ownership was recorded as confirmed, a table was
+    # written into it and cleanup dropped it.
+    _db_exit=0
     compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
-        psql -U "${FN_DB_USER:-fn_app}" -d postgres -c "CREATE DATABASE $CTL_DB;" >/dev/null 2>&1 </dev/null
+        psql -U "${FN_DB_USER:-fn_app}" -d postgres -c "CREATE DATABASE $CTL_DB;" >/dev/null 2>&1 </dev/null \
+        || _db_exit=$?
     _db_post="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)"
-    case "$_db_post" in
-        1) MADE_DB=2
-           psqlq "CREATE TABLE keepme(id int); INSERT INTO keepme VALUES (42);" "$CTL_DB" >/dev/null 2>&1 ;;
-        0) bad "the control database was not created; case 3 not exercised" ;;
-        *) bad "could not confirm whether $CTL_DB was created (read '$_db_post');
-        responsibility is retained and cleanup will still try to drop it" ;;
-    esac
+    if [ "$_db_exit" = "0" ]; then
+        case "$_db_post" in
+            1) MADE_DB=2
+               psqlq "CREATE TABLE keepme(id int); INSERT INTO keepme VALUES (42);" "$CTL_DB" >/dev/null 2>&1 ;;
+            0) MADE_DB=0
+               bad "CREATE DATABASE $CTL_DB reported success but the database is absent; case 3 not exercised" ;;
+            *) bad "could not confirm whether $CTL_DB was created (read '$_db_post');
+        responsibility is AMBIGUOUS, it will NOT be dropped by name, and restoration is reported unconfirmed" ;;
+        esac
+    else
+        case "$_db_post" in
+            0) MADE_DB=0
+               bad "CREATE DATABASE $CTL_DB failed and the database is absent; case 3 not exercised and nothing was created" ;;
+            1) MADE_DB=0
+               bad "$CTL_DB exists but this control's CREATE failed against it; it is not this control's,
+        nothing was written into it and it will NOT be dropped" ;;
+            *) bad "CREATE DATABASE $CTL_DB failed and its existence could not be established (read '$_db_post');
+        responsibility is AMBIGUOUS, it will NOT be dropped by name, and restoration is reported unconfirmed" ;;
+        esac
+    fi
 fi
 DB_ROWS_BEFORE="$(psqln "SELECT count(*) FROM keepme;" "$CTL_DB")"
 if [ "$MADE_DB" = "2" ]; then

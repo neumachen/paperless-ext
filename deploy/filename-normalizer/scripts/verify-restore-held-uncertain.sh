@@ -623,31 +623,47 @@ emit "   foreign occupant bytes:       $([ "$R_FOREIGN_SHA" = "$FOREIGN_SHA" ] &
 # 5. Start REAL applications on the restored ledger and filesystem.
 # ---------------------------------------------------------------------------
 log "5/8: starting real applications against the restored system"
-# Same rule for the broker, and for the same reason: `rabbitmqctl add_vhost`
-# fails on a vhost that already exists, so its outcome says who made this one.
-# Deleting a vhost takes every queue in it with it, which is the last thing
-# that should rest on a freeness check taken minutes earlier.
+# The broker needs a MARKER, not an exit status.
 #
-# The listing below is tested inside `if`, not as `... | grep -qx X && ...`:
-# under `set -e` that list aborts the script when grep finds nothing, which is
-# the ordinary case.
+# This used to read "add_vhost fails on a vhost that already exists, so its
+# outcome says who made this one". That was asserted, never measured, and it
+# is false. Measured against the pinned broker
+# (rabbitmq:4.3.6-management-alpine, sha256:0057f1a7...):
+#
+#   add_vhost <fresh>                      -> exit 0
+#   add_vhost <same name again>            -> exit 0      <- idempotent
+#   add_vhost <existing> --description B   -> exit 0, and the description
+#                                             stays A     <- NOT overwritten
+#
+# So the exit status proves nothing -- a vhost somebody else made would have
+# been adopted on success and then deleted, taking every queue in it. But the
+# second measurement gives a real marker: the description is written only when
+# the vhost is genuinely created and is left alone otherwise, exactly like a
+# docker volume label. Reading back this run's tag is therefore proof that
+# this run created it, and reading back anything else is proof that it did
+# not. verify-refusal-adverse.sh case G re-measures both facts on a disposable
+# vhost each time it runs, so this comment cannot quietly go stale again.
 OWNS_RESTORE_VHOST=1
-_vh_exit=0
-compose exec -T rabbitmq rabbitmqctl add_vhost "$RESTORE_VHOST" >/dev/null 2>&1 || _vh_exit=$?
-if [ "$_vh_exit" = "0" ]; then
-    OWNS_RESTORE_VHOST=2
+compose exec -T rabbitmq rabbitmqctl add_vhost "$RESTORE_VHOST" --description "$HU_RUN_TAG" >/dev/null 2>&1 \
+    || fatal "could not create the restored stack's broker vhost"
+if _vh_list="$(compose exec -T rabbitmq rabbitmqctl list_vhosts --no-table-headers name description 2>/dev/null)"; then
+    _vh_desc="$(printf '%s\n' "$_vh_list" | awk -F'\t' -v v="$RESTORE_VHOST" \
+        'BEGIN{f=0} $1==v{print $2; f=1} END{if(!f) print "__ABSENT__"}' | head -1)"
 else
-    if _vh_post="$(compose exec -T rabbitmq rabbitmqctl list_vhosts 2>/dev/null)"; then
-        if printf '%s\n' "$_vh_post" | grep -qx "$RESTORE_VHOST"; then
-            OWNS_RESTORE_VHOST=0
-            fatal "broker vhost $RESTORE_VHOST already exists and this invocation's add_vhost failed against it; it is not this invocation's and will NOT be deleted"
-        fi
-        OWNS_RESTORE_VHOST=0
-        fatal "could not create broker vhost $RESTORE_VHOST, and it does not exist; nothing has been changed"
-    else
-        fatal "could not create broker vhost $RESTORE_VHOST and could not list vhosts; responsibility is AMBIGUOUS, it will NOT be deleted by name, and restoration is reported unconfirmed"
-    fi
+    _vh_desc=__UNREADABLE__
 fi
+case "$_vh_desc" in
+    "$HU_RUN_TAG")
+        OWNS_RESTORE_VHOST=2 ;;
+    __ABSENT__)
+        OWNS_RESTORE_VHOST=0
+        fatal "broker vhost $RESTORE_VHOST does not exist although add_vhost reported success; nothing has been changed" ;;
+    __UNREADABLE__)
+        fatal "could not read broker vhost metadata; responsibility for $RESTORE_VHOST is AMBIGUOUS, it will NOT be deleted by name, and restoration is reported unconfirmed" ;;
+    *)
+        OWNS_RESTORE_VHOST=0
+        fatal "broker vhost $RESTORE_VHOST pre-dates this invocation (its description is '$_vh_desc', not this run's tag); add_vhost is idempotent and left it alone, so this vhost is not this invocation's and will NOT be deleted" ;;
+esac
 
 compose exec -T rabbitmq rabbitmqctl set_permissions -p "$RESTORE_VHOST" \
     "${FN_AMQP_USER:-fn_app}" '.*' '.*' '.*' >/dev/null 2>&1 \
