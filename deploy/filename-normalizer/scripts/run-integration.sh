@@ -247,8 +247,24 @@ log "filling the work queue"
 run_phase drain_under_load "" || true
 
 log "starting the renamers again"
-compose start renamer-1 renamer-2
+compose start renamer-1
 wait_healthy renamer-1 180
+# renamer-2 comes back holding each delivery it claims, so the drain this
+# phase terminates it during is DETERMINISTIC rather than raced.
+#
+# Each handler is one durable write, so the window between "the orchestrator
+# sees in_flight >= 1" and "SIGTERM lands" is normally longer than the work
+# itself: the delivery settles first and the phase reports, correctly, that
+# `this phase did not exercise a drain`. That is what it reported for several
+# runs. A later run caught exactly one delivery and passed. Whether the
+# assertion runs at all should not be decided that way.
+#
+# 12s is chosen against the two budgets that bound it: the handler budget is
+# FN_SHUTDOWN_TIMEOUT (20s by default), so the held delivery still completes
+# during the drain and `shutdown_timeout` stays false; and stop_timed's grace
+# below is 40s, so the stop stays well inside it.
+FN_RENAMER2_FAULT_POINTS=hold_after_claim FN_RENAMER2_FAULT_HOLD=12s \
+    compose up -d --force-recreate renamer-2
 wait_healthy renamer-2 180
 
 # The fault interval and the readiness sampling both begin HERE, with
@@ -290,7 +306,11 @@ stop_readiness_watch
 run_phase drained "" || true
 
 log "restarting renamer-2"
-compose start renamer-2
+# Recreated, not started: `compose start` would bring back the SAME container,
+# still carrying the deliberate hold above, and every later phase would run
+# against an instance that pauses on each claim. With the variables unset the
+# compose defaults are empty, which LoadFaultPoints treats as no fault points.
+compose up -d --force-recreate renamer-2
 wait_healthy renamer-2 180
 sleep 6
 

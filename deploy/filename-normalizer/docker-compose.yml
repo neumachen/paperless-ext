@@ -416,6 +416,20 @@ services:
       FN_INSTANCE: renamer-2
       FN_DB_APPLY_MIGRATIONS: "false"
       FN_RENAMER_CONCURRENCY: ${FN_RENAMER_CONCURRENCY:-2}
+      # Inert unless the drain phase sets them, and empty is genuinely inert:
+      # LoadFaultPoints returns (nil, nil) on an empty FN_FAULT_POINTS, so this
+      # instance behaves exactly as before in every other phase.
+      #
+      # The drain phase sets them because the window it measures is otherwise
+      # a race it usually loses. Each handler is one durable write, so between
+      # the orchestrator observing `in_flight >= 1` and SIGTERM arriving, the
+      # delivery has normally already settled: the phase then reports
+      # `settled_after_shutdown=0 ... this phase did not exercise a drain`,
+      # correctly. One observed run caught a single delivery and passed; the
+      # previous caught none and failed. A property worth asserting should not
+      # depend on which of those happens.
+      FN_FAULT_POINTS: ${FN_RENAMER2_FAULT_POINTS:-}
+      FN_FAULT_HOLD: ${FN_RENAMER2_FAULT_HOLD:-0s}
     ports:
       - "${FN_RENAMER2_PORT:-18082}:8080"
 
