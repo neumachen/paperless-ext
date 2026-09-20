@@ -35,7 +35,12 @@ OWNS_LOCK=0
 OWNS_FAULT_SVC=0
 NEW_RUN=""
 SAVED=""
+SAVED_KEPT=""
+SAVE_VERIFIED=0
 SLOT_RESTORED=unknown
+PR_RESTORED=0
+CTL_RESULT_LINE=""
+LIVE_TOUCHED=0
 UDOC="drainreject-$LOWER.pdf"
 
 report_begin drain-rejects-nonterminal "$OUT" "$0"
@@ -62,6 +67,16 @@ CLEANED=0
 cleanup() {
     [ "$CLEANED" = "0" ] || return 0
     CLEANED=1
+
+    # A rejected invocation restores NOTHING. The EXIT trap is armed before
+    # the lock is taken, so a refused acquisition reached this function and
+    # force-recreated renamer-1, renamer-2 and watcher -- disrupting the run
+    # that legitimately held the lock, on the way out of a control whose
+    # entire subject is not disturbing other holders. Nothing below was
+    # reached in that case either.
+    if [ "$OWNS_LOCK" != "1" ]; then
+        return 0
+    fi
     if [ "$OWNS_FAULT_SVC" = "1" ]; then
         compose --profile fault stop -t 15 renamer-fault >/dev/null 2>&1 || true
         compose --profile fault rm -f renamer-fault >/dev/null 2>&1 || true
@@ -80,12 +95,29 @@ cleanup() {
     # rotated out of the container, so the recomputation silently substitutes
     # the wrong instant into retained evidence. Save and restore the slot whole,
     # then prove it by digest instead of trusting the copy.
-    if [ -n "$SAVED" ] && [ -d "$SAVED" ]; then
+    # Only a VERIFIED recovery copy may be written back. An unverified one --
+    # a partial `cp -R`, or a refusal that happened before the copy was
+    # checked -- would overwrite intact evidence with a worse version of it,
+    # which is the opposite of what this block is for.
+    if [ "$SAVE_VERIFIED" = "1" ] && [ -n "$SAVED" ] && [ -d "$SAVED" ]; then
         if [ -f "$SAVED/phase-drained.log" ]; then
             cp "$SAVED/phase-drained.log" "$EVIDENCE_DIR/phase-drained.log"
         fi
         if [ -d "$SAVED/drained" ]; then
             cp -R "$SAVED/drained/." "$EVIDENCE_DIR/drained/" 2>/dev/null || true
+        fi
+        # The other shared outputs `run_phase` rewrites, which are not part of
+        # the drained/ slot: the cumulative phase result ledger it APPENDS a
+        # line to, and the service logs `collect_logs` overwrites wholesale.
+        # Leaving phase-results.txt alone put an unattributed
+        # "drained FAIL (exit 1)" directly beneath the 21-phase baseline's
+        # "drained PASS", so the retained record of a passing suite read as a
+        # failing one.
+        if [ -f "$SAVED/phase-results.txt" ]; then
+            cp "$SAVED/phase-results.txt" "$EVIDENCE_DIR/phase-results.txt"
+        fi
+        if [ -d "$SAVED/logs" ]; then
+            cp -R "$SAVED/logs/." "$EVIDENCE_DIR/logs/" 2>/dev/null || true
         fi
         if [ -f "$SAVED/.slot-before" ]; then
             slot_digests "$EVIDENCE_DIR/drained" > "$SAVED/.slot-after" 2>/dev/null || true
@@ -103,14 +135,40 @@ cleanup() {
                 RESTORE_OK=0
             fi
         fi
-        rm -rf "$SAVED" 2>/dev/null || true
+        # The recovery copy is deleted ONLY when the evidence is provably back.
+        # Removing it unconditionally destroyed the last copy of the material
+        # needed to recover by hand, in exactly the case that needed it, while
+        # the report said restoration had failed.
+        if [ "$SLOT_RESTORED" = "yes" ] && [ "$RESTORE_OK" = "1" ]; then
+            rm -rf "$SAVED" 2>/dev/null || true
+        else
+            SAVED_KEPT="$SAVED"
+            echo "error: the recovery copy is RETAINED at $SAVED" >&2
+            echo "       It holds phase-drained.log, phase-results.txt, logs/ and the" >&2
+            echo "       whole drained/ slot as they were before this control ran." >&2
+        fi
     fi
     # Remove only the state copies this control made.
     if [ -n "$NEW_RUN" ]; then
         rm -f "$EVIDENCE_DIR/state/$NEW_RUN".* 2>/dev/null || true
     fi
-    recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
-    if [ "$OWNS_LOCK" = "1" ]; then exercise_unlock; fi
+    # Only what this invocation actually changed. It stops renamer-1 and
+    # renamer-2 to strand the fixture; if it never got that far there is
+    # nothing to put back.
+    if [ "$LIVE_TOUCHED" = "1" ]; then
+        recreate_service renamer-1 renamer-2 watcher >/dev/null 2>&1 || true
+    fi
+    # `exercise_unlock` is an unconditional `rm -rf`, so the owner file is
+    # checked first: a lock that has changed hands is not this process's to
+    # remove.
+    if [ "$OWNS_LOCK" = "1" ]; then
+        _dl="$(cat "$EVIDENCE_DIR/.exercise.lock/owner" 2>/dev/null || true)"
+        case "$_dl" in
+            *"pid=$$ "*|*"pid=$$") exercise_unlock ;;
+            *) echo "warning: the exercise lock is not this process's; leaving it in place." >&2 ;;
+        esac
+        OWNS_LOCK=0
+    fi
     return 0
 }
 on_signal() { echo "error: interrupted; cleaning up and stopping." >&2; cleanup; exit 130; }
@@ -138,6 +196,7 @@ emit "   (the retained run's own state and evidence are not modified)"
 
 # --- a real, genuinely non-terminal job ------------------------------------
 log "1/3: producing a real job that is genuinely stuck in publishing"
+LIVE_TOUCHED=1
 compose stop -t 30 renamer-1 renamer-2 >/dev/null 2>&1
 own_service renamer-fault || { emit "    REFUSED: renamer-fault already exists"; exit 1; }
 OWNS_FAULT_SVC=1
@@ -174,21 +233,49 @@ emit "   the assertion runs."
 # --- run the real assertion over it ----------------------------------------
 log "2/3: running the real drained assertion with that job as its real-fixture set"
 SAVED="$EVIDENCE_DIR/.drain-evidence-saved-$$"
-mkdir -p "$SAVED/drained"
+mkdir -p "$SAVED/drained" "$SAVED/logs"
 if [ -f "$EVIDENCE_DIR/phase-drained.log" ]; then
-    cp "$EVIDENCE_DIR/phase-drained.log" "$SAVED/phase-drained.log"
+    cp "$EVIDENCE_DIR/phase-drained.log" "$SAVED/phase-drained.log" \
+        || { emit "    REFUSED: could not copy phase-drained.log aside; nothing has been changed"; exit 1; }
+fi
+# The cumulative result ledger run_phase appends to, and the service logs
+# collect_logs overwrites. Both are shared outputs of the phase about to run.
+if [ -f "$EVIDENCE_DIR/phase-results.txt" ]; then
+    cp "$EVIDENCE_DIR/phase-results.txt" "$SAVED/phase-results.txt" \
+        || { emit "    REFUSED: could not copy phase-results.txt aside; nothing has been changed"; exit 1; }
+fi
+if [ -d "$EVIDENCE_DIR/logs" ]; then
+    cp -R "$EVIDENCE_DIR/logs/." "$SAVED/logs/" 2>/dev/null || true
 fi
 # The whole slot, plus a digest of every file in it, so the restore is an
 # assertion rather than a hope. run_phase rewrites all of these.
+#
+# And the COPY is verified before anything is borrowed. A readable original
+# directory says nothing about whether the copy of it succeeded; hashing only
+# the original and trusting `cp -R` meant a partial or failed copy would not
+# be discovered until the restore, by which time the original was already
+# overwritten and the copy was the only thing left.
 if [ -d "$EVIDENCE_DIR/drained" ]; then
     cp -R "$EVIDENCE_DIR/drained/." "$SAVED/drained/" 2>/dev/null || true
     slot_digests "$EVIDENCE_DIR/drained" > "$SAVED/.slot-before" 2>/dev/null || true
     if [ ! -s "$SAVED/.slot-before" ]; then
+        rm -rf "$SAVED" 2>/dev/null || true
         emit "    REFUSED: the retained drain evidence could not be hashed, so this"
         emit "             control cannot prove it put it back; nothing has been changed"
         exit 1
     fi
+    slot_digests "$SAVED/drained" > "$SAVED/.copy-digests" 2>/dev/null || true
+    if ! diff "$SAVED/.slot-before" "$SAVED/.copy-digests" >/dev/null 2>&1; then
+        emit "    REFUSED: the recovery copy of the drained evidence does not match the"
+        emit "             original, so a complete recovery copy does not exist; nothing"
+        emit "             has been changed. The partial copy is at $SAVED"
+        SAVED_KEPT="$SAVED"
+        exit 1
+    fi
 fi
+# A complete, verified recovery copy now exists. Only from here may the
+# evidence be borrowed, and only from here may cleanup write anything back.
+SAVE_VERIFIED=1
 printf '%s,\n' "$UJOB" > "$EVIDENCE_DIR/state/$NEW_RUN.drain-real-ids"
 # run_phase reads both of these from the shell directly. PHASE_FAILURES is
 # normally set by run-integration.sh, and under `set -u` its absence is a
@@ -201,12 +288,22 @@ run_phase drained "" || PHASE_EXIT=$?
 REJECT_LINE="$(grep -a "is in non-terminal state" "$EVIDENCE_DIR/phase-drained.log" 2>/dev/null | head -1 | sed 's/^ *//')"
 REJECT_N="$(grep -ac 'real drain fixtures did not reach a durable outcome' "$EVIDENCE_DIR/phase-drained.log" 2>/dev/null || true)"
 cp "$EVIDENCE_DIR/phase-drained.log" "$EVIDENCE_DIR/drain-rejects-nonterminal-phase.log" 2>/dev/null || true
+# run_phase appends this control's outcome to the shared, cumulative result
+# ledger. It is recorded HERE, attributed to this control, and the baseline
+# ledger is put back in cleanup -- so the negative result is preserved with
+# its provenance instead of sitting unattributed under the real suite's row.
+CTL_RESULT_LINE="$(tail -1 "$EVIDENCE_DIR/phase-results.txt" 2>/dev/null || true)"
 emit ""
 emit "3. what the real assertion did with it"
 emit "   phase exit status:            $PHASE_EXIT   (expected non-zero)"
 emit "   it named the fixture:         ${REJECT_LINE:-<no rejection line>}"
 emit "   it summarised the rejection:  ${REJECT_N:-0} line(s)   (expected >= 1)"
 emit "   full phase output retained at .evidence/drain-rejects-nonterminal-phase.log"
+emit "   the line it appended to the shared phase ledger, which belongs to THIS"
+emit "   negative control and not to the 21-phase baseline:"
+emit "       ${CTL_RESULT_LINE:-<none>}"
+emit "   (phase-results.txt is restored to the baseline below; this row is the"
+emit "    attributed copy)"
 [ "$PHASE_EXIT" != "0" ] || bad "the phase passed with a non-terminal real fixture"
 [ -n "$REJECT_LINE" ] || bad "the assertion did not name the non-terminal fixture"
 [ "${REJECT_N:-0}" -ge 1 ] || bad "the assertion did not summarise the rejection"
@@ -230,6 +327,15 @@ L1="$(compose ps --format '{{.Health}}' renamer-1 2>/dev/null | head -1)"
 L2="$(compose ps --format '{{.Health}}' renamer-2 2>/dev/null | head -1)"
 LW="$(compose ps --format '{{.Health}}' watcher 2>/dev/null | head -1)"
 DRAIN_OK="$(grep -ac 'real_fixtures_terminal=' "$EVIDENCE_DIR/drained/f5-drain-under-load.txt" 2>/dev/null || true)"
+# The shared ledger must carry no row from this control once it is done.
+PR_RESTORED=0
+if [ -n "$CTL_RESULT_LINE" ]; then
+    if [ "$(tail -1 "$EVIDENCE_DIR/phase-results.txt" 2>/dev/null || true)" != "$CTL_RESULT_LINE" ]; then
+        PR_RESTORED=1
+    fi
+else
+    PR_RESTORED=1
+fi
 emit ""
 emit "restoration (read back from the running stack):"
 emit "   the fixture's own outcome:    $FINAL   (recovery resolved it once the"
@@ -241,10 +347,15 @@ emit "   the whole drained/ slot came back byte-for-byte: $SLOT_RESTORED   (expe
 emit "                                 every file the phase rewrites, compared by"
 emit "                                 sha256 against the listing taken before it ran)"
 emit "   state copies left behind:     $(ls "$EVIDENCE_DIR/state/$NEW_RUN".* 2>/dev/null | grep -c . || true)   (expected 0)"
+emit "   shared phase ledger restored: $([ "$PR_RESTORED" = "1" ] && echo yes || echo NO)   (expected yes:"
+emit "                                 phase-results.txt back to its pre-run bytes)"
+emit "   recovery copy:                ${SAVED_KEPT:-removed (the evidence is provably back)}"
 { [ "$L1" = "healthy" ] && [ "$L2" = "healthy" ] && [ "$LW" = "healthy" ]; } \
     || bad "the live stack is not healthy after this control ($L1/$L2/$LW)"
 [ "${DRAIN_OK:-0}" -ge 1 ] || bad "the retained drain evidence was not restored"
 [ "$SLOT_RESTORED" = "yes" ] || bad "the drained evidence slot was not restored byte-for-byte ($SLOT_RESTORED)"
+[ "$PR_RESTORED" = "1" ] || bad "this control's row is still in the shared phase ledger"
+[ -z "$SAVED_KEPT" ] || bad "restoration was not confirmed; the recovery copy is retained at $SAVED_KEPT"
 [ "$RESTORE_OK" = "1" ] || bad "restoration was incomplete"
 
 emit ""

@@ -348,25 +348,37 @@ fi
 # --- 3. a database that this invocation did not create ---------------------
 log "3/6: the restore database name is already taken"
 # Refuse on an unreadable pre-check, then take responsibility BEFORE creating.
+# The prerequisite STOPS the CREATE it guards. Falling through meant that a
+# name already in use was created over: the CREATE failed, the post-check then
+# read 1 because somebody else's database was there, ownership was recorded as
+# confirmed, a table was written into it and cleanup dropped it.
+CASE3_READY=0
 _db_pre="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)"
 case "$_db_pre" in
-    0) MADE_DB=1 ;;
-    *) bad "could not establish that $CTL_DB is free (read '$_db_pre'); case 3 not exercised" ;;
+    0) MADE_DB=1; CASE3_READY=1 ;;
+    "") bad "could not establish whether $CTL_DB is free; case 3 not exercised and nothing was created" ;;
+    *) bad "$CTL_DB already exists (read '$_db_pre'); case 3 not exercised, nothing was created and it was left alone" ;;
 esac
-compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
-    psql -U "${FN_DB_USER:-fn_app}" -d postgres -c "CREATE DATABASE $CTL_DB;" >/dev/null 2>&1 </dev/null
-_db_post="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)"
-case "$_db_post" in
-    1) MADE_DB=2
-       psqlq "CREATE TABLE keepme(id int); INSERT INTO keepme VALUES (42);" "$CTL_DB" >/dev/null 2>&1 ;;
-    0) bad "the control database was not created; case 3 not exercised" ;;
-    *) bad "could not confirm whether $CTL_DB was created (read '$_db_post');
+if [ "$CASE3_READY" = "1" ]; then
+    compose exec -T -e PGPASSWORD="$(cat "$DEPLOY_DIR/secrets/fn_db_password")" postgres-primary \
+        psql -U "${FN_DB_USER:-fn_app}" -d postgres -c "CREATE DATABASE $CTL_DB;" >/dev/null 2>&1 </dev/null
+    _db_post="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)"
+    case "$_db_post" in
+        1) MADE_DB=2
+           psqlq "CREATE TABLE keepme(id int); INSERT INTO keepme VALUES (42);" "$CTL_DB" >/dev/null 2>&1 ;;
+        0) bad "the control database was not created; case 3 not exercised" ;;
+        *) bad "could not confirm whether $CTL_DB was created (read '$_db_post');
         responsibility is retained and cleanup will still try to drop it" ;;
-esac
+    esac
+fi
 DB_ROWS_BEFORE="$(psqln "SELECT count(*) FROM keepme;" "$CTL_DB")"
-release_for_child
-R3="$(run_case database "database $CTL_DB already exists" "FN_HU_RESTORE_DB=$CTL_DB")"
-reacquire_after_child
+if [ "$MADE_DB" = "2" ]; then
+    release_for_child
+    R3="$(run_case database "database $CTL_DB already exists" "FN_HU_RESTORE_DB=$CTL_DB")"
+    reacquire_after_child
+else
+    R3="skipped|0|case 3 was not set up, so the exercise was not run against it"
+fi
 DB_EXISTS_AFTER="$(psqln "SELECT count(*) FROM pg_database WHERE datname='$CTL_DB';" postgres)"
 DB_ROWS_AFTER="$(psqln "SELECT count(*) FROM keepme;" "$CTL_DB")"
 emit ""
@@ -375,10 +387,12 @@ emit "   exercise exit / REFUSED lines: $(echo "$R3" | cut -d'|' -f1) / $(echo "
 emit "   it said:                       $(echo "$R3" | cut -d'|' -f3-)"
 emit "   the database still exists:     $DB_EXISTS_AFTER   (expected 1)"
 emit "   its rows:                      $DB_ROWS_BEFORE -> $DB_ROWS_AFTER   (expected 1 -> 1)"
-[ "$(echo "$R3" | cut -d'|' -f2)" -ge 1 ] || bad "the INTENDED refusal (database) was not the one recorded"
-[ "$(echo "$R3" | cut -d'|' -f1)" != "0" ] || bad "the exercise succeeded although the database already existed"
-[ "$DB_EXISTS_AFTER" = "1" ] || bad "the pre-existing database was dropped by a run that refused it"
-[ "$DB_ROWS_AFTER" = "$DB_ROWS_BEFORE" ] || bad "the pre-existing database's contents changed"
+if [ "$MADE_DB" = "2" ]; then
+    [ "$(echo "$R3" | cut -d'|' -f2)" -ge 1 ] || bad "the INTENDED refusal (database) was not the one recorded"
+    [ "$(echo "$R3" | cut -d'|' -f1)" != "0" ] || bad "the exercise succeeded although the database already existed"
+    [ "$DB_EXISTS_AFTER" = "1" ] || bad "the pre-existing database was dropped by a run that refused it"
+    [ "$DB_ROWS_AFTER" = "$DB_ROWS_BEFORE" ] || bad "the pre-existing database's contents changed"
+fi
 
 # --- 4. a volume that this invocation did not create -----------------------
 log "4/6: the backup volume name is already taken"
@@ -386,24 +400,37 @@ log "4/6: the backup volume name is already taken"
 # not apply the label, so only the label coming back proves this control
 # created it -- and only then may its cleanup remove it.
 # Establish the name is free, then take responsibility BEFORE creating.
+# A failed prerequisite STOPS the creation it guards. Recording the mismatch
+# and falling through into `docker volume create` anyway is how this control
+# came to create over a name it had just found occupied.
+CASE4_READY=0
 if _cv_pre="$(docker volume ls -q --filter "name=^${CTL_VOL}$" 2>/dev/null)"; then
     if [ -z "$_cv_pre" ]; then
         MADE_VOL=1
+        CASE4_READY=1
     else
-        bad "$CTL_VOL already exists; case 4 not exercised and it was left alone"
+        bad "$CTL_VOL already exists; case 4 not exercised, nothing was created and it was left alone"
     fi
 else
-    bad "could not establish whether $CTL_VOL exists; case 4 not exercised"
+    bad "could not establish whether $CTL_VOL exists; case 4 not exercised and nothing was created"
 fi
-docker volume create --label "fn.owner=$CTL_TAG" "$CTL_VOL" >/dev/null 2>&1 || true
-_cv_owner="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$CTL_VOL" 2>/dev/null || echo unreadable)"
-case "$_cv_owner" in
-    "$CTL_TAG") MADE_VOL=2 ;;
-    unreadable) bad "could not confirm $CTL_VOL's ownership label;
+if [ "$CASE4_READY" = "1" ]; then
+    docker volume create --label "fn.owner=$CTL_TAG" "$CTL_VOL" >/dev/null 2>&1 || true
+    _cv_owner="$(docker volume inspect -f '{{index .Labels "fn.owner"}}' "$CTL_VOL" 2>/dev/null || echo unreadable)"
+    case "$_cv_owner" in
+        "$CTL_TAG") MADE_VOL=2 ;;
+        unreadable) bad "could not confirm $CTL_VOL's ownership label;
         responsibility is retained and cleanup will still try to remove it" ;;
-    *)          bad "$CTL_VOL carries owner '$_cv_owner', not this control's;
-        responsibility is retained rather than dropped, and cleanup reports it" ;;
-esac
+        # Positively somebody else's: created between the check and now, and
+        # `docker volume create` applies no label to an existing volume.
+        # Responsibility for an ATTEMPT is not permission to delete a
+        # stranger's resource, so it is dropped back to "not ours".
+        *)          MADE_VOL=0
+                    CASE4_READY=0
+                    bad "$CTL_VOL carries owner '$_cv_owner', not this control's;
+        it will NOT be removed by this control's cleanup" ;;
+    esac
+fi
 # Seeded ONLY when the label proved this control created it. Writing into a
 # volume whose ownership was just rejected is the mutation-after-refusal this
 # whole exercise is about.
@@ -414,9 +441,13 @@ if [ "$MADE_VOL" = "2" ]; then
     VOL_SHA_BEFORE="$(vol_sha "$CTL_VOL")"
     case "$VOL_SHA_BEFORE" in ABSENT|"") bad "could not seed the control volume; case 4 not exercised" ;; esac
 fi
-release_for_child
-R4="$(run_case volume "volume $CTL_VOL already exists" "FN_HU_BACKUP_VOL=$CTL_VOL")"
-reacquire_after_child
+if [ "$MADE_VOL" = "2" ]; then
+    release_for_child
+    R4="$(run_case volume "volume $CTL_VOL already exists" "FN_HU_BACKUP_VOL=$CTL_VOL")"
+    reacquire_after_child
+else
+    R4="skipped|0|case 4 was not set up, so the exercise was not run against it"
+fi
 VOL_PRESENT_AFTER="$(docker volume ls -q --filter "name=^${CTL_VOL}$" 2>/dev/null | wc -l | tr -d ' ')"
 VOL_SHA_AFTER="$(vol_sha "$CTL_VOL")"
 emit ""
@@ -425,10 +456,12 @@ emit "   exercise exit / REFUSED lines: $(echo "$R4" | cut -d'|' -f1) / $(echo "
 emit "   it said:                       $(echo "$R4" | cut -d'|' -f3-)"
 emit "   the volume still exists:       $VOL_PRESENT_AFTER   (expected 1)"
 emit "   its contents:                  $([ "$VOL_SHA_AFTER" = "$VOL_SHA_BEFORE" ] && echo unchanged || echo "CHANGED ($VOL_SHA_AFTER)")"
-[ "$(echo "$R4" | cut -d'|' -f2)" -ge 1 ] || bad "the INTENDED refusal (volume) was not the one recorded"
-[ "$(echo "$R4" | cut -d'|' -f1)" != "0" ] || bad "the exercise succeeded although the volume already existed"
-[ "$VOL_PRESENT_AFTER" = "1" ] || bad "the pre-existing volume was removed by a run that refused it"
-[ "$VOL_SHA_AFTER" = "$VOL_SHA_BEFORE" ] || bad "the pre-existing volume's contents changed"
+if [ "$MADE_VOL" = "2" ]; then
+    [ "$(echo "$R4" | cut -d'|' -f2)" -ge 1 ] || bad "the INTENDED refusal (volume) was not the one recorded"
+    [ "$(echo "$R4" | cut -d'|' -f1)" != "0" ] || bad "the exercise succeeded although the volume already existed"
+    [ "$VOL_PRESENT_AFTER" = "1" ] || bad "the pre-existing volume was removed by a run that refused it"
+    [ "$VOL_SHA_AFTER" = "$VOL_SHA_BEFORE" ] || bad "the pre-existing volume's contents changed"
+fi
 
 # --- 5. the lock is held: a rejected invocation restores NOTHING -----------
 log "5/6: the exercise lock is held by somebody else"
