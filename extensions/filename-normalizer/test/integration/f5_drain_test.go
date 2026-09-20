@@ -148,6 +148,9 @@ func TestF5DrainLoadFillsTheWorkQueue(t *testing.T) {
 	e.SaveState(t, "drain-registered", strconv.Itoa(len(ids)))
 	e.SaveState(t, "drain-published", strconv.Itoa(published))
 	e.SaveState(t, "drain-sample-ids", strings.Join(sample, ","))
+	// Every id, not only a sample. The drained phase has to account for the
+	// complete fixture set; a sample cannot show that the rest finished.
+	e.SaveState(t, "drain-all-ids", strings.Join(ids, ","))
 	e.SaveState(t, "drain-backlog", strconv.Itoa(st.Ready+st.Unacknowledged))
 
 	e.WriteEvidence(t, "f5-drain-load.txt", []byte(fmt.Sprintf(
@@ -163,6 +166,18 @@ func TestF5DrainLoadFillsTheWorkQueue(t *testing.T) {
 
 // TestF5DrainUnderLoadReachedDurableOutcomes is the assertion after the
 // orchestrator terminated a renamer mid-batch.
+// splitIDs turns the comma-joined state value back into ids, dropping the
+// empty element an empty or trailing-comma value would otherwise produce.
+func splitIDs(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 	e := Suite()
 	e.OnlyIn(t, PhaseDrained)
@@ -224,11 +239,22 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 			if snap.ByState[st] == 0 {
 				continue
 			}
-			rows, lerr := led.JobsInState(ctx, st, 5000)
+			// The whole state, not its oldest 5000. JobsInState orders by
+			// updated_at ASC and truncates, so a fixed bound silently drops
+			// the newest rows -- which are exactly this run's. The snapshot
+			// already says how many there are; the margin covers rows that
+			// arrive between the two reads.
+			want := snap.ByState[st] + 256
+			rows, lerr := led.JobsInState(ctx, st, want)
 			if lerr != nil {
 				// An inspection that could not run is unknown, and unknown is
 				// not "none outstanding".
 				return fmt.Errorf("listing jobs in state %s: %w", st, lerr)
+			}
+			if len(rows) >= want {
+				return fmt.Errorf("state %s returned %d rows at the bound %d; "+
+					"the listing may be truncated and cannot establish that none are outstanding",
+					st, len(rows), want)
 			}
 			n := 0
 			for _, j := range rows {
@@ -278,12 +304,42 @@ func TestF5DrainUnderLoadReachedDurableOutcomes(t *testing.T) {
 		}
 	}
 
-	if n := snap.ByState[jobs.StateProcessing]; n != 0 {
-		t.Errorf("%d job(s) are stranded in %q after the drain", n, jobs.StateProcessing)
+	// Both of the assertions that used to live here read the WHOLE ledger.
+	//
+	// `processing != 0` failed on any job another exercise left mid-flight,
+	// and `held >= registered` passed on a ledger already holding tens of
+	// thousands of held rows from months of runs -- it could not have failed.
+	// Neither said anything about this run.
+	//
+	// Every id registered by the load is checked individually instead. These
+	// jobs are registered with no source file, so `held` is the only outcome
+	// they can legitimately reach, and there are a few hundred of them.
+	allIDs := splitIDs(e.LoadState(t, "drain-all-ids"))
+	if len(allIDs) != registered {
+		t.Fatalf("recorded %d job ids for a load that registered %d; the fixture set is incomplete",
+			len(allIDs), registered)
 	}
-	if snap.ByState[jobs.StateHeld] < registered {
-		t.Errorf("the ledger holds %d jobs in %q but %d were registered during the load window",
-			snap.ByState[jobs.StateHeld], jobs.StateHeld, registered)
+	notHeld := 0
+	unreadable := 0
+	for _, id := range allIDs {
+		j, gerr := led.GetJob(ctx, id)
+		if gerr != nil {
+			unreadable++
+			continue
+		}
+		if j.State != jobs.StateHeld {
+			notHeld++
+			if notHeld <= 5 {
+				t.Errorf("load job %s is in state %q, expected %q", id, j.State, jobs.StateHeld)
+			}
+		}
+	}
+	if unreadable != 0 {
+		t.Errorf("%d of %d load jobs could not be read; unknown is not a durable outcome",
+			unreadable, len(allIDs))
+	}
+	if notHeld != 0 {
+		t.Errorf("%d of %d load jobs did not reach %q", notHeld, len(allIDs), jobs.StateHeld)
 	}
 	// There used to be a whole-ledger assertion here that no job is ever
 	// delivered or uncertain. Both states are reachable now, and the
