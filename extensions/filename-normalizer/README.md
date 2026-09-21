@@ -14,11 +14,8 @@ not an owner-accepted production policy; every surface that reports it says so.
 Production filesystem, security, monitoring, backup and deployment
 qualification are separate and unfinished.
 
-- [Operations and configuration](../../docs/filename-normalizer-operations.md)
-  — the operator's reference.
-- [Requirements](../../docs/filename-normalizer-requirements.md) — the contract.
-- [Foundation status](../../docs/foundation-status-001.md) — what the
-  containerized foundation proved, and its correction history.
+- [Local stack](../../deploy/filename-normalizer/README.md) — containerized development commands.
+- [Deployment package](../../deploy/filename-normalizer/production/README.md) — storage, monitoring, backup and deployment procedures.
 
 ## The two applications
 

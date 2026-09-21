@@ -35,8 +35,8 @@ a renamer whose identity differs holds the job as `policy_version_mismatch`.
 That is what makes a configuration change visible instead of silent.
 
 **The naming policy is a documented CANDIDATE, not accepted production policy.**
-`v1-candidate-2026-09-16`. Its undecided choices are listed in
-`docs/filename-normalizer-operations.md` §2.2.
+`v1-candidate-2026-09-16`. Review the configuration and preview filenames
+before accepting the policy for a production deployment.
 
 ## 2. Placement and sizing
 
@@ -294,7 +294,7 @@ The job ids themselves come from the ledger; `fnctl` reads, it does not list
 by state. Query the database for the ids, then inspect each one.
 
 Resolve one at a time, by hand, using the preserved source. **Never bulk
-resolve.** See `docs/filename-normalizer-operations.md`, "Uncertain outcomes".
+resolve.** Confirm the receipt and consumer state before deciding what to do.
 
 ## 7. Local validation
 
