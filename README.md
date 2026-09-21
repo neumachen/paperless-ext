@@ -13,14 +13,11 @@ directories may reside on different filesystems.
 Written in Go, backed by a PostgreSQL cluster and a RabbitMQ broker, shipped as
 two independently containerized executables.
 
-**Current state: containerized foundation.** Configuration, process lifecycle,
-dependency integration and telemetry are implemented and exercised against real
-dependencies. **Filename normalization itself is not implemented yet.**
+See the extension documentation for current capabilities and qualification
+limits.
 
 - [Extension documentation](extensions/filename-normalizer/README.md) — the applications, their configuration and telemetry
 - [Local stack](deploy/filename-normalizer/README.md) — container-only build, run and test commands
-- [Requirements](docs/filename-normalizer-requirements.md) — the behaviour the finished extension owes
-- [Foundation status](docs/foundation-status-001.md) — what is proven, what is unrun, and what remains
 
 ## Working agreement
 
@@ -30,16 +27,12 @@ operations. The implementation agent owns code, tests, packaging, and
 implementation choices within those boundaries, and applies every repository
 change. **The user holds final acceptance and production authorization.**
 
-- [Development roles and decisions](docs/development-workflow.md)
-- [First implementation handoff](docs/implementation-handoff-001.md)
-
 ## Repository layout
 
 ```text
 paperless-ext/
 ├── deploy/
 │   └── filename-normalizer/   # compose stack, cluster config, orchestration scripts
-├── docs/                      # cross-project requirements, roles, handoffs, status
 └── extensions/
     └── filename-normalizer/   # File Normalizer source, tests and packaging
 ```

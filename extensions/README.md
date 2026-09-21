@@ -34,4 +34,4 @@ directory stays buildable on its own and the stack that runs it stays separate.
 
 | Extension | Language | State |
 |---|---|---|
-| [`filename-normalizer`](filename-normalizer/README.md) — File Normalizer | Go | Containerized foundation. Configuration, lifecycle, PostgreSQL and RabbitMQ integration, and telemetry are implemented and exercised against real dependencies. **Filename normalization is not implemented.** See [foundation status](../docs/foundation-status-001.md). |
+| [`filename-normalizer`](filename-normalizer/README.md) — File Normalizer | Go | See the extension README for current capabilities and qualification limits. |
