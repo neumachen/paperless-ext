@@ -320,8 +320,25 @@ evidence on the actual mounts:
 - permission behaviour as uid 65532 on the real export
 - a real Paperless instance ingesting from the real consume directory
 
-This requires a concrete target and an explicit authorization. Neither has been
-supplied. See the decision packet in the final report.
+A concrete target has since been supplied: the home-server Kubernetes cluster
+and its live Paperless installation. The deployment package for it lives in
+the `neumachen/home-server` repository, not here:
+
+* `gitops/03-apps/filename-normalizer/` — watcher, two renamers, storage
+* `gitops/02-services/filename-normalizer-db/` — the dedicated CNPG cluster
+* `gitops/02-services/rabbitmq/` — the broker the cluster did not have
+* `docs/runbooks/filename-normalizer-deployment.md` — target procedures
+
+That package is **desired state only**: nothing is applied, synced or
+published, the watcher is committed at `replicas: 0` with discovery disabled,
+and no image has been built for the target architecture yet. The qualification
+listed above is still NOT done, and this compose manifest remains the local
+reference deployment.
+
+One item on the list is now answered rather than pending: the target `consume`
+is the Longhorn/ext4 PVC `paperless-consume`, **not** an SMB share, so NAS/SMB
+semantics are not on the path to this target. The `paperless-media` SMB share
+belongs to Paperless and the Normalizer never touches it.
 
 ## 9. What is still unresolved
 
