@@ -35,6 +35,9 @@ die() { echo "error: $*" >&2; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DEPLOY_DIR="$REPO_ROOT/deploy/filename-normalizer"
+# Same path scripts/lib.sh resolves, and the same one the compose file mounts
+# into the containers as /evidence.
+EVIDENCE_DIR="$REPO_ROOT/extensions/filename-normalizer/.evidence"
 
 [ -n "${FN_CI_ID:-}" ]      || die "FN_CI_ID is required."
 [ -n "${FN_CI_VERSION:-}" ] || die "FN_CI_VERSION is required."
@@ -105,6 +108,27 @@ chmod 0600 .env
 # The secret files are rewritten from the patched .env, so the files the
 # containers mount and the values in .env cannot drift apart.
 make secrets >/dev/null
+
+# The evidence directory, created here so the subdirectories exist with a mode
+# the unprivileged containers can write.
+#
+# scripts/lib.sh creates .evidence/logs and .evidence/state itself, as the
+# invoking user under the usual umask, which leaves them 0755 and owned by that
+# user. The readiness sampler is a container running as 65532:65532 and it
+# appends its observations to .evidence/state, so on Linux that write is
+# refused and the drain phase records nothing -- the assertion then fails with
+# "only 0 readiness observation(s) were recorded", which is the harness failing
+# to observe rather than the application failing to drain.
+#
+# It does not happen on a developer machine: Docker Desktop's bind mounts do
+# not enforce host ownership, so every write appears permitted. It happens on
+# any real Linux host, which is what CI runs on.
+#
+# `mkdir -p` leaves an existing directory's mode alone, so creating them here
+# is what decides it. This is the CI workspace and the directory holds run
+# state, not credentials; secrets live in secrets/ at 0700.
+mkdir -p "$EVIDENCE_DIR/logs" "$EVIDENCE_DIR/state"
+chmod 0777 "$EVIDENCE_DIR" "$EVIDENCE_DIR/logs" "$EVIDENCE_DIR/state"
 
 # --- assertions -----------------------------------------------------------
 # Each of these is a way a run has to be able to fail EARLY rather than half
