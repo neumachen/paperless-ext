@@ -1,0 +1,261 @@
+# Containerized verification and the real integration suite.
+#
+# Nothing is compiled, formatted, vetted or executed on the runner itself. The
+# Go toolchain, the applications, the inspection client and the test binary all
+# run inside containers built from the pinned toolchain image, exactly as they
+# do on a developer machine. The runner contributes git, Docker, Make and shell
+# orchestration and nothing else.
+#
+# The dependencies are real: a PostgreSQL primary and its streaming standby, a
+# RabbitMQ broker, the two applications and the storage volumes. No dependency
+# is mocked, stubbed or replaced with a recorded result.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Exact commit to check out and test. The release workflow passes the
+          resolved release commit, so the checks run against the artifact being
+          released rather than against whatever main points at now.
+        type: string
+        required: false
+        default: ''
+    outputs:
+      tested_sha:
+        description: >-
+          The commit the integration suite actually ran against, read back from
+          the checkout. A caller must compare this with the commit it asked for.
+        value: ${{ jobs.integration.outputs.tested_sha }}
+
+# Read-only by default. No job here needs more, and no job here is given a
+# registry credential: publication lives in release.yml, behind an environment.
+permissions:
+  contents: read
+
+concurrency:
+  # A superseded pull-request run is cancelled. A push to main and a release's
+  # checks are not: those runs are the record for a commit that is going
+  # somewhere.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Formatting, vet and unit tests
+    # Explicit, not ubuntu-latest: the images this repository builds and the
+    # release platform are linux/amd64, and a moving label could change that.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Empty for push, pull_request and workflow_dispatch, which leaves
+          # the action's own default (the event's commit) in place.
+          ref: ${{ inputs.ref }}
+          # Nothing in this job talks to the remote after checkout.
+          persist-credentials: false
+
+      - name: Record the tested identity
+        id: identity
+        run: |
+          set -eu
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "runner_arch=$(uname -m)"
+            echo "docker_arch=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Give this run its own project, image namespace and credentials
+        env:
+          FN_CI_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}-verify
+          FN_CI_VERSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: .github/scripts/isolate-stack.sh
+
+      - name: gofmt, go vet and unit tests, inside the toolchain image
+        id: verify
+        working-directory: deploy/filename-normalizer
+        run: make verify
+
+      - name: Collect the sanitized report
+        id: collect
+        if: always()
+        env:
+          FN_CI_REPORTS: ${{ runner.temp }}/ci-reports
+        run: .github/scripts/collect-reports.sh
+
+      - name: Upload the report
+        id: upload
+        if: always() && steps.collect.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-verify-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-reports
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Summarize
+        if: always()
+        env:
+          TESTED_SHA: ${{ steps.identity.outputs.sha }}
+          RUNNER_ARCH: ${{ steps.identity.outputs.runner_arch }}
+          DOCKER_ARCH: ${{ steps.identity.outputs.docker_arch }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          set -eu
+          {
+            echo "## Formatting, vet and unit tests"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tested commit | \`$TESTED_SHA\` |"
+            echo "| Runner architecture | \`$RUNNER_ARCH\` |"
+            echo "| Docker server | \`$DOCKER_ARCH\` |"
+            echo "| \`make verify\` | $VERIFY_OUTCOME |"
+            echo "| Report collection | $COLLECT_OUTCOME |"
+            if [ -n "$ARTIFACT_URL" ]; then
+              echo "| Report | [ci-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}]($ARTIFACT_URL) |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove this run's resources
+        if: always()
+        run: .github/scripts/teardown-stack.sh
+
+  integration:
+    name: Integration suite against real dependencies
+    needs: verify
+    runs-on: ubuntu-24.04
+    # The suite starts and stops the cluster, the broker and the applications
+    # many times over, including a crash-recovery phase and a drain sampled in
+    # real time. It is long by construction. This bound exists so a hung phase
+    # ends the job rather than the runner's own six-hour ceiling.
+    timeout-minutes: 150
+    outputs:
+      tested_sha: ${{ steps.identity.outputs.sha }}
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Record the tested identity
+        id: identity
+        run: |
+          set -eu
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "runner_arch=$(uname -m)"
+            echo "docker_arch=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Give this run its own project, image namespace and credentials
+        env:
+          FN_CI_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}-int
+          FN_CI_VERSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: .github/scripts/isolate-stack.sh
+
+      - name: Build every image in the test profile
+        id: build
+        working-directory: deploy/filename-normalizer
+        run: make build
+
+      - name: Build the inspection client
+        id: build_fnctl
+        working-directory: deploy/filename-normalizer
+        # fnctl lives in the tools profile, so `make build` -- which builds the
+        # test profile -- does not produce it. The suite needs it: the drain
+        # phase reads each renamer's effective configuration back over the gRPC
+        # API with this client, and the restoration check that follows treats an
+        # unreadable answer as "not restored". On a developer machine the image
+        # is usually already there. On a fresh runner it is not, so it is built
+        # explicitly rather than left to an implicit build during a `run`.
+        run: docker compose --profile tools build --progress=plain fnctl
+
+      - name: Run the full phased integration suite
+        id: test
+        working-directory: deploy/filename-normalizer
+        run: make test
+
+      - name: Collect the sanitized reports
+        id: collect
+        if: always()
+        env:
+          FN_CI_REPORTS: ${{ runner.temp }}/ci-reports
+        run: .github/scripts/collect-reports.sh
+
+      - name: Upload the reports
+        id: upload
+        if: always() && steps.collect.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-reports
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Summarize
+        if: always()
+        env:
+          TESTED_SHA: ${{ steps.identity.outputs.sha }}
+          RUNNER_ARCH: ${{ steps.identity.outputs.runner_arch }}
+          DOCKER_ARCH: ${{ steps.identity.outputs.docker_arch }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          FNCTL_OUTCOME: ${{ steps.build_fnctl.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          REPORTS: ${{ runner.temp }}/ci-reports
+        run: |
+          set -eu
+          results="$REPORTS/phase-results.txt"
+          total=0; passed=0; failed=0
+          if [ -f "$results" ]; then
+            total="$(grep -c . "$results" || true)"
+            passed="$(grep -c ' PASS ' "$results" || true)"
+            failed="$(grep -c ' FAIL ' "$results" || true)"
+          fi
+          {
+            echo "## Integration suite against real dependencies"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tested commit | \`$TESTED_SHA\` |"
+            echo "| Runner architecture | \`$RUNNER_ARCH\` |"
+            echo "| Docker server | \`$DOCKER_ARCH\` |"
+            echo "| \`make build\` | $BUILD_OUTCOME |"
+            echo "| \`docker compose build fnctl\` | $FNCTL_OUTCOME |"
+            echo "| \`make test\` | $TEST_OUTCOME |"
+            echo "| Report collection | $COLLECT_OUTCOME |"
+            echo "| Phases recorded | $total |"
+            echo "| Phases passed | $passed |"
+            echo "| Phases failed | $failed |"
+            if [ -n "$ARTIFACT_URL" ]; then
+              echo "| Reports | [ci-integration-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}]($ARTIFACT_URL) |"
+            fi
+            if [ -f "$results" ]; then
+              echo
+              echo "### Phase results"
+              echo
+              echo '```text'
+              cat "$results"
+              echo '```'
+            else
+              echo
+              echo "No phase results were produced; the suite did not reach its first phase."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove this run's resources
+        if: always()
+        run: .github/scripts/teardown-stack.sh
