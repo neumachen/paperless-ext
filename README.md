@@ -1,57 +1,26 @@
 # Paperless Extensions
 
-`paperless-ext` is a language-neutral home for small services and integrations that extend a Paperless-ngx deployment without modifying Paperless itself.
+A language-neutral home for small services that extend a Paperless-ngx
+deployment without modifying Paperless itself.
 
-## First extension: File Normalizer
+## File Normalizer
 
-The **File Normalizer** prepares documents before Paperless consumes them. The
-watcher application registers completed uploads; RabbitMQ distributes jobs to a
-configurable pool of renamer instances that preserve Unicode, normalize
-filenames, and safely publish complete documents. Incoming and consumption
-directories may reside on different filesystems.
+Paperless-ngx consumes whatever filename it is handed, and that name is what
+you later search for, skim past in a list, and recognise a document by.
+Documents seldom arrive with a useful one. Scanners emit `scan_0001.pdf`,
+phones emit `IMG_20260118_113052.jpg`, and browsers emit
+`Bank Statement (2).PDF`. Renaming them by hand does not scale, and renaming
+them inside the consume directory races Paperless's own watcher, which may
+take a file while it is still being written.
 
-Written in Go, backed by a PostgreSQL cluster and a RabbitMQ broker, shipped as
-two independently containerized executables.
+File Normalizer stands in front of that directory. Documents are dropped into
+an intake directory instead; each one is given a consistent name under a single
+declared policy and published into the consume directory as a finished
+document, so Paperless only ever sees a complete file under its final name.
 
-See the extension documentation for current capabilities and qualification
-limits.
-
-- [Extension documentation](extensions/filename-normalizer/README.md) — the applications, their configuration and telemetry
-- [Local stack](deploy/filename-normalizer/README.md) — container-only build, run and test commands
-
-## Working agreement
-
-ChatGPT owns requirements, architectural boundaries, acceptance criteria, and
-evidence review; it does not edit repository files or run development
-operations. The implementation agent owns code, tests, packaging, and
-implementation choices within those boundaries, and applies every repository
-change. **The user holds final acceptance and production authorization.**
-
-## Repository layout
-
-```text
-paperless-ext/
-├── deploy/
-│   └── filename-normalizer/   # compose stack, cluster config, orchestration scripts
-└── extensions/
-    └── filename-normalizer/   # File Normalizer source, tests and packaging
-```
-
-Each extension may use the language and runtime best suited to its job. Keep extension-specific source, tests, packaging, and documentation together beneath `extensions/<name>/`, and its deployment example beneath `deploy/<name>/`.
-
-## Principles
-
-- Keep Paperless-ngx unmodified and upgradeable.
-- Prefer small, independently deployable services.
-- Make filesystem operations recoverable and idempotent.
-- Treat document contents and filenames as potentially sensitive: keep names,
-  paths, contents, fingerprints and credentials out of ordinary logs and out of
-  metric labels.
-- Pin deployable artifacts by version or digest, run application containers
-  non-root, and download no executable dependencies at startup.
-- Run all dependency tooling, formatting, linting, builds, tests and
-  application execution inside containers.
-- Demonstrate behaviour against real dependencies. No mocks, stubs, in-memory
-  substitutes or fake services; anything not demonstrated is reported as unrun.
-- Report status honestly. Absence of a file is not proof of success, and a
-  consumer acknowledgement is not a completion record.
+It is built for an archive that is added to continuously rather than imported
+in one batch. Intake and consumption may live on different filesystems, the
+renaming work spreads across as many instances as the volume needs, and every
+document either lands with a durable receipt or is left in a state an operator
+can see and act on. Paperless-ngx is neither modified nor wrapped: it goes on
+consuming its own directory, and it can be upgraded on its own schedule.
