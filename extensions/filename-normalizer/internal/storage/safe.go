@@ -245,13 +245,35 @@ type Entry struct {
 	// indistinguishable from the file it replaced, which is how a check that
 	// exists to refuse a stranger's file comes to accept it.
 	//
-	// Not every filesystem answers. overlayfs and tmpfs reject the ioctl, and
-	// those allocate numbers monotonically rather than reusing them, so the
-	// Inode comparison is already sound there. GenerationKnown records which
-	// case this is, because a generation that was never read must never
-	// compare equal to one that was.
+	// Not every filesystem answers. overlayfs rejects the ioctl -- including
+	// the overlay2 layer a container build runs in, which is precisely where
+	// inode numbers ARE reused, so this field alone is not enough.
+	// GenerationKnown records which case this is, because a generation that
+	// was never read must never compare equal to one that was.
 	Generation      uint64
 	GenerationKnown bool
+	// Btime is the inode's birth time, and it is what covers the case the
+	// generation cannot.
+	//
+	// Measured inside a container build on overlay2 over ext4 -- the CI runner,
+	// and the shape of a Kubernetes node -- 200 of 200 remove-then-create
+	// cycles reused the inode number, the generation ioctl was refused every
+	// time, and the birth time differed every time.
+	//
+	// It is preferred over mtime for this, even though mtime distinguished the
+	// same 200: mtime is writable by anyone holding the file, through
+	// utimensat, so it is a claim rather than a fact, and it legitimately
+	// changes when a file is written without the file becoming a different
+	// file. A birth time cannot be set from userspace at all and never changes
+	// for a given inode, which is exactly what an identity needs.
+	//
+	// Both clocks are coarse, so a replacement created inside the same tick as
+	// the original, onto the same reused inode number, still compares equal.
+	// That is a narrower window than the one this closes, not the absence of
+	// one; closing it entirely needs a descriptor held across the gap, which
+	// this API's callers cannot always do.
+	Btime      time.Time
+	BtimeKnown bool
 }
 
 // fsIocGetVersion is FS_IOC_GETVERSION, which golang.org/x/sys/unix does not
@@ -278,6 +300,29 @@ func readGeneration(fd int) (uint64, bool) {
 	return uint64(v), true
 }
 
+// readBirthTime reads an inode's birth time from an open descriptor.
+//
+// statx is asked about the descriptor itself rather than a pathname, so the
+// answer belongs to the file the rest of the entry describes. A filesystem
+// that does not record a birth time leaves STATX_BTIME out of the returned
+// mask; that is an absence of evidence and is reported as such.
+func readBirthTime(fd int) (time.Time, bool) {
+	var x unix.Statx_t
+	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH, unix.STATX_BTIME, &x); err != nil {
+		return time.Time{}, false
+	}
+	if x.Mask&unix.STATX_BTIME == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(x.Btime.Sec, int64(x.Btime.Nsec)), true
+}
+
+// readIdentityExtras fills in the fields that survive inode reuse.
+func readIdentityExtras(e *Entry, fd int) {
+	e.Generation, e.GenerationKnown = readGeneration(fd)
+	e.Btime, e.BtimeKnown = readBirthTime(fd)
+}
+
 // SameIdentity reports whether two observations describe the same file.
 //
 // This is the question "is what I am about to read, or delete, still the thing
@@ -287,10 +332,14 @@ func SameIdentity(a, b Entry) bool {
 	if a.Inode != b.Inode || a.Device != b.Device {
 		return false
 	}
-	// Only two generations that were both actually read can say anything. If
-	// either side is unknown this falls back to the comparison above, which is
-	// what the filesystems that cannot answer need.
+	// Each of these only speaks when BOTH sides were actually read. A value
+	// that was never obtained must not compare equal to one that was, or an
+	// unreadable signal would start confirming identities instead of declining
+	// to comment on them.
 	if a.GenerationKnown && b.GenerationKnown && a.Generation != b.Generation {
+		return false
+	}
+	if a.BtimeKnown && b.BtimeKnown && !a.Btime.Equal(b.Btime) {
 		return false
 	}
 	return true
@@ -349,7 +398,7 @@ func openRegular(path string) (*os.File, Entry, error) {
 	}
 	// Read from the descriptor that was just proved regular, so the generation
 	// belongs to the same file as the rest of this entry.
-	e.Generation, e.GenerationKnown = readGeneration(int(f.Fd()))
+	readIdentityExtras(&e, int(f.Fd()))
 	return f, e, nil
 }
 
@@ -490,7 +539,7 @@ func openRegularAt(dir *os.File, name string) (*os.File, Entry, error) {
 		e.Inode = uint64(st.Ino)
 		e.Device = uint64(st.Dev)
 	}
-	e.Generation, e.GenerationKnown = readGeneration(int(f.Fd()))
+	readIdentityExtras(&e, int(f.Fd()))
 	return f, e, nil
 }
 
@@ -886,7 +935,7 @@ func (d *Dir) Identify(name string) (Entry, error) {
 		var fst unix.Stat_t
 		if unix.Fstat(fd, &fst) == nil &&
 			uint64(fst.Ino) == e.Inode && uint64(fst.Dev) == e.Device {
-			e.Generation, e.GenerationKnown = readGeneration(fd)
+			readIdentityExtras(&e, fd)
 		}
 		_ = unix.Close(fd)
 	}
@@ -1357,6 +1406,6 @@ func identifyFile(f *os.File, name, root string) (Entry, error) {
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		e.Inode, e.Device = uint64(st.Ino), uint64(st.Dev)
 	}
-	e.Generation, e.GenerationKnown = readGeneration(int(f.Fd()))
+	readIdentityExtras(&e, int(f.Fd()))
 	return e, nil
 }
