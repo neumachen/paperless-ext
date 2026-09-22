@@ -4,8 +4,8 @@ Two workflows live here.
 
 | Workflow | File | What it is for |
 |---|---|---|
-| CI | [`workflows/ci.yml`](workflows/ci.yml) | Containerized verification and the real integration suite. |
-| Release | [`workflows/release.yml`](workflows/release.yml) | Validate a release commit, then build and publish the two application images. |
+| CI | [`ci.yml`](ci.yml) | Containerized verification and the real integration suite. |
+| Release | [`release.yml`](release.yml) | Validate a release commit, then build and publish the two application images. |
 
 Everything the Go toolchain does — formatting, vet, unit tests, compilation,
 the integration test binary, the applications themselves and the inspection
@@ -58,7 +58,7 @@ because the images this repository builds and the release platform are
 ### Isolation
 
 Every run, and every re-run attempt, gets its own identity from
-[`scripts/isolate-stack.sh`](scripts/isolate-stack.sh):
+[`scripts/isolate-stack.sh`](../scripts/isolate-stack.sh):
 
 | | |
 |---|---|
@@ -83,7 +83,7 @@ to overwrite a `.env` that belongs to a different project.
 
 ### Cleanup
 
-[`scripts/teardown-stack.sh`](scripts/teardown-stack.sh) runs on success,
+[`scripts/teardown-stack.sh`](../scripts/teardown-stack.sh) runs on success,
 failure and cancellation. It takes the project name from the generated `.env`,
 refuses to proceed if that name is `fnfoundation` or disagrees with the exported
 one, then removes this project's containers, network and volumes across all
@@ -104,7 +104,7 @@ Each job writes a summary containing the tested commit, the runner
 architecture, the Docker server platform, each command's outcome, the
 integration phase totals, the phase result lines and a link to its artifact.
 
-[`scripts/collect-reports.sh`](scripts/collect-reports.sh) copies an explicit
+[`scripts/collect-reports.sh`](../scripts/collect-reports.sh) copies an explicit
 allow-list out of `.evidence`:
 
 - `f1-verify.log`, `f1-build.log`
@@ -197,7 +197,7 @@ is outside this pass.
 
 ### Identity check before publication
 
-[`scripts/check-image-identity.sh`](scripts/check-image-identity.sh) runs each
+[`scripts/check-image-identity.sh`](../scripts/check-image-identity.sh) runs each
 built image's real `version` subcommand — the image's entrypoint is the
 application, so this is the binary that would run in production — and requires:
 
