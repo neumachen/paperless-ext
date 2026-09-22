@@ -33,6 +33,10 @@ node_modules/
 dist/
 **/dist/
 
+# Sanitized reports the CI helpers stage for upload. Default output of
+# .github/scripts/collect-reports.sh when FN_CI_REPORTS is not set.
+.ci-reports/
+
 # Integration evidence produced by the containerized test suite
 .evidence/
 **/.evidence/

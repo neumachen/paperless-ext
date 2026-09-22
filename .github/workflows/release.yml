@@ -1,0 +1,523 @@
+# Validate a release commit, then build and publish the two application images.
+#
+# The gate has three independent parts, and all three must hold before a push
+# happens:
+#
+#   1. The commit is resolved exactly once, from the tag, and every later job
+#      is given that SHA rather than a branch name.
+#   2. The reusable CI workflow runs against THAT commit, and the publishing
+#      job compares the commit CI reports back with the one it resolved. A
+#      green run on some other commit of main does not qualify.
+#   3. The publishing job runs in the `release` environment, so the repository
+#      owner approves it and the registry credential is scoped to it. No other
+#      job in this repository can read that credential.
+#
+# There is no pull_request_target job and no workflow_run bridge: nothing built
+# from a fork's code is ever handed a credential.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Release tag (for example v0.1.0) or a commit SHA to build'
+        type: string
+        required: true
+      dry_run:
+        description: 'Build and validate only. Nothing is published.'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve and gate the release commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      build_date: ${{ steps.resolve.outputs.build_date }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      reason: ${{ steps.resolve.outputs.reason }}
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # fetch-depth 0 fetches every branch and tag, so refs/remotes/origin/main
+          # exists locally and the reachability test below is a real ancestry
+          # question rather than a guess. No further network access is needed,
+          # which is why the credential is not persisted.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the commit and decide whether it may be published
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_REF: ${{ github.ref_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -eu
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            requested="$TAG_REF"
+            dry_run=false
+          else
+            requested="$INPUT_REF"
+            dry_run="$INPUT_DRY_RUN"
+          fi
+          [ -n "$requested" ] || { echo "::error::no ref was given."; exit 1; }
+
+          # Supported version syntax: a v prefix followed by semantic versioning
+          # 2.0.0. A ref that looks like a version tag but is not one fails here
+          # rather than producing an image tagged with something unparseable.
+          tag=''
+          version=''
+          case "$requested" in
+            v*)
+              if printf '%s' "$requested" | grep -Eq \
+                '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+                tag="$requested"
+                version="${requested#v}"
+              else
+                echo "::error::'$requested' starts with v but is not a supported version tag."
+                exit 1
+              fi
+              ;;
+          esac
+
+          sha="$(git rev-parse --verify --quiet "${requested}^{commit}")" || {
+            echo "::error::'$requested' does not resolve to a commit in this repository."
+            exit 1
+          }
+          short_sha="$(git rev-parse --short=12 "$sha")"
+
+          # Image tags may not contain '+', so a build metadata suffix cannot be
+          # carried into one. An untagged ref gets a development version that the
+          # gate below refuses to publish in any case.
+          if [ -z "$version" ]; then
+            version="0.0.0-dev-$short_sha"
+          else
+            version="$(printf '%s' "$version" | tr '+' '-')"
+          fi
+
+          # Stamped from the release commit's own committer timestamp, not from
+          # the wall clock. Two builds of one commit then produce the same
+          # image content, so the artifact the validation job proved and the
+          # artifact the publishing job pushes are the same thing.
+          build_date="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ "$sha")"
+
+          if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+            if git merge-base --is-ancestor "$sha" refs/remotes/origin/main; then
+              reachable=true
+            else
+              reachable=false
+            fi
+          else
+            reachable=unknown
+          fi
+
+          publish=false
+          if [ "$dry_run" = "true" ]; then
+            reason='dry run was requested; nothing will be published'
+          elif [ -z "$tag" ]; then
+            reason='publication requires a release tag; this ref is not one'
+          elif [ "$reachable" = "unknown" ]; then
+            reason='origin/main is not available, so reachability could not be established'
+          elif [ "$reachable" != "true" ]; then
+            reason="commit $sha is not reachable from main"
+          else
+            publish=true
+            reason="release tag $tag resolves to $sha, which is reachable from main"
+          fi
+
+          {
+            echo "sha=$sha"
+            echo "short_sha=$short_sha"
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "build_date=$build_date"
+            echo "publish=$publish"
+            echo "reason=$reason"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Release gate"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Requested ref | \`$requested\` |"
+            echo "| Resolved commit | \`$sha\` |"
+            echo "| Release tag | \`${tag:-none}\` |"
+            echo "| Image version | \`$version\` |"
+            echo "| Build date stamp | \`$build_date\` |"
+            echo "| Reachable from main | $reachable |"
+            echo "| Will publish | $publish |"
+            echo "| Reason | $reason |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ci:
+    name: Checks
+    needs: resolve
+    # The same commit as this workflow file, so a release cannot be checked by
+    # a different revision of the checks than the one it was reviewed with.
+    uses: ./.github/workflows/ci.yml
+    # No `secrets: inherit`. The checks never receive a registry credential.
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+
+  image:
+    name: Build and validate the release images
+    needs: [resolve, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      WATCHER_IMAGE: fn-release-local/fn-watcher:${{ needs.resolve.outputs.version }}
+      RENAMER_IMAGE: fn-release-local/fn-renamer:${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Require that the checks ran against this exact commit
+        env:
+          TESTED_SHA: ${{ needs.ci.outputs.tested_sha }}
+          RESOLVED_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -eu
+          if [ "$TESTED_SHA" != "$RESOLVED_SHA" ]; then
+            echo "::error::the checks ran against '$TESTED_SHA' but this release is '$RESOLVED_SHA'."
+            exit 1
+          fi
+          echo "checks ran against $TESTED_SHA"
+
+      - name: Check out the resolved commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the watcher image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: extensions/filename-normalizer
+          file: extensions/filename-normalizer/Dockerfile
+          target: watcher
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ env.WATCHER_IMAGE }}
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
+            REVISION=${{ needs.resolve.outputs.sha }}
+            BUILD_DATE=${{ needs.resolve.outputs.build_date }}
+
+      - name: Build the renamer image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: extensions/filename-normalizer
+          file: extensions/filename-normalizer/Dockerfile
+          target: renamer
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ env.RENAMER_IMAGE }}
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
+            REVISION=${{ needs.resolve.outputs.sha }}
+            BUILD_DATE=${{ needs.resolve.outputs.build_date }}
+
+      - name: Run each image's own version command and check what it reports
+        id: identity
+        env:
+          EXPECTED_VERSION: ${{ needs.resolve.outputs.version }}
+          EXPECTED_REVISION: ${{ needs.resolve.outputs.sha }}
+        run: .github/scripts/check-image-identity.sh
+
+      - name: Summarize
+        if: always()
+        env:
+          RESOLVED_SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          REASON: ${{ needs.resolve.outputs.reason }}
+          IDENTITY_REPORT: ${{ steps.identity.outputs.report }}
+        run: |
+          set -eu
+          {
+            echo "## Release images built and validated"
+            echo
+            echo "No registry credential is available to this job, and nothing was published."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`$RESOLVED_SHA\` |"
+            echo "| Version | \`$VERSION\` |"
+            echo "| Platform | \`linux/amd64\` |"
+            echo "| Gate | $REASON |"
+            if [ -n "$IDENTITY_REPORT" ]; then
+              echo
+              echo '```text'
+              printf '%s\n' "$IDENTITY_REPORT"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish to Docker Hub
+    needs: [resolve, ci, image]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # The approval gate and the only place DOCKERHUB_TOKEN is readable.
+    environment: release
+    env:
+      WATCHER_IMAGE: fn-release-local/fn-watcher:${{ needs.resolve.outputs.version }}
+      RENAMER_IMAGE: fn-release-local/fn-renamer:${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Require the Docker Hub configuration
+        env:
+          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          # The expression is evaluated by Actions; only true or false reaches
+          # the shell, never the token.
+          TOKEN_PRESENT: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        run: |
+          set -eu
+          missing=''
+          [ -n "$NAMESPACE" ]        || missing="$missing DOCKERHUB_NAMESPACE(variable)"
+          [ -n "$USERNAME" ]         || missing="$missing DOCKERHUB_USERNAME(variable)"
+          [ "$TOKEN_PRESENT" = true ] || missing="$missing DOCKERHUB_TOKEN(secret)"
+          if [ -n "$missing" ]; then
+            echo "::error::publication is configured incomplete; missing:$missing"
+            exit 1
+          fi
+          echo "namespace=$NAMESPACE username=$USERNAME token=present"
+
+      - name: Require that the checks ran against this exact commit
+        env:
+          TESTED_SHA: ${{ needs.ci.outputs.tested_sha }}
+          RESOLVED_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -eu
+          if [ "$TESTED_SHA" != "$RESOLVED_SHA" ]; then
+            echo "::error::the checks ran against '$TESTED_SHA' but this release is '$RESOLVED_SHA'."
+            exit 1
+          fi
+          echo "checks ran against $TESTED_SHA"
+
+      - name: Check out the resolved commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Built and checked HERE, before the registry credential is introduced,
+      # and pushed from the same builder cache below. The second build resolves
+      # from cache, so what is published is the artifact this job validated.
+      - name: Build the watcher image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: extensions/filename-normalizer
+          file: extensions/filename-normalizer/Dockerfile
+          target: watcher
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ env.WATCHER_IMAGE }}
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
+            REVISION=${{ needs.resolve.outputs.sha }}
+            BUILD_DATE=${{ needs.resolve.outputs.build_date }}
+
+      - name: Build the renamer image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: extensions/filename-normalizer
+          file: extensions/filename-normalizer/Dockerfile
+          target: renamer
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ env.RENAMER_IMAGE }}
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
+            REVISION=${{ needs.resolve.outputs.sha }}
+            BUILD_DATE=${{ needs.resolve.outputs.build_date }}
+
+      - name: Run each image's own version command and check what it reports
+        id: identity
+        env:
+          EXPECTED_VERSION: ${{ needs.resolve.outputs.version }}
+          EXPECTED_REVISION: ${{ needs.resolve.outputs.sha }}
+        run: .github/scripts/check-image-identity.sh
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push the watcher image
+        id: push_watcher
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: extensions/filename-normalizer
+          file: extensions/filename-normalizer/Dockerfile
+          target: watcher
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          # No moving tag. `latest` is never written, so a deployment cannot
+          # drift onto a different artifact without a reviewed change.
+          tags: |
+            ${{ vars.DOCKERHUB_NAMESPACE }}/fn-watcher:${{ needs.resolve.outputs.version }}
+            ${{ vars.DOCKERHUB_NAMESPACE }}/fn-watcher:sha-${{ needs.resolve.outputs.short_sha }}
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
+            REVISION=${{ needs.resolve.outputs.sha }}
+            BUILD_DATE=${{ needs.resolve.outputs.build_date }}
+
+      - name: Push the renamer image
+        id: push_renamer
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: extensions/filename-normalizer
+          file: extensions/filename-normalizer/Dockerfile
+          target: renamer
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ vars.DOCKERHUB_NAMESPACE }}/fn-renamer:${{ needs.resolve.outputs.version }}
+            ${{ vars.DOCKERHUB_NAMESPACE }}/fn-renamer:sha-${{ needs.resolve.outputs.short_sha }}
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
+            REVISION=${{ needs.resolve.outputs.sha }}
+            BUILD_DATE=${{ needs.resolve.outputs.build_date }}
+
+      - name: Record what was published
+        id: record
+        if: always()
+        env:
+          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
+          RESOLVED_SHA: ${{ needs.resolve.outputs.sha }}
+          WATCHER_OUTCOME: ${{ steps.push_watcher.outcome }}
+          WATCHER_DIGEST: ${{ steps.push_watcher.outputs.digest }}
+          WATCHER_IMAGEID: ${{ steps.push_watcher.outputs.imageid }}
+          RENAMER_OUTCOME: ${{ steps.push_renamer.outcome }}
+          RENAMER_DIGEST: ${{ steps.push_renamer.outputs.digest }}
+          RENAMER_IMAGEID: ${{ steps.push_renamer.outputs.imageid }}
+          IDENTITY_REPORT: ${{ steps.identity.outputs.report }}
+          OUT_DIR: ${{ runner.temp }}/release
+        run: |
+          set -eu
+          mkdir -p "$OUT_DIR"
+          # A local image id names a blob in this runner's daemon and is
+          # meaningless to a cluster. The registry digest is what a deployment
+          # pins. Both are recorded, labelled, and never conflated.
+          cat > "$OUT_DIR/release-images.json" <<JSON
+          {
+            "commit": "$RESOLVED_SHA",
+            "version": "$VERSION",
+            "platform": "linux/amd64",
+            "images": [
+              {
+                "target": "watcher",
+                "repository": "$NAMESPACE/fn-watcher",
+                "tags": ["$VERSION", "sha-$SHORT_SHA"],
+                "push_outcome": "$WATCHER_OUTCOME",
+                "registry_digest": "$WATCHER_DIGEST",
+                "local_image_id": "$WATCHER_IMAGEID"
+              },
+              {
+                "target": "renamer",
+                "repository": "$NAMESPACE/fn-renamer",
+                "tags": ["$VERSION", "sha-$SHORT_SHA"],
+                "push_outcome": "$RENAMER_OUTCOME",
+                "registry_digest": "$RENAMER_DIGEST",
+                "local_image_id": "$RENAMER_IMAGEID"
+              }
+            ]
+          }
+          JSON
+          cat "$OUT_DIR/release-images.json"
+
+          published=0
+          {
+            echo "## Publication"
+            echo
+            echo "| Image | Push | Registry digest (pin this) |"
+            echo "|---|---|---|"
+            if [ "$WATCHER_OUTCOME" = success ] && [ -n "$WATCHER_DIGEST" ]; then
+              echo "| \`$NAMESPACE/fn-watcher:$VERSION\` | published | \`$WATCHER_DIGEST\` |"
+              published=$((published + 1))
+            else
+              echo "| \`$NAMESPACE/fn-watcher:$VERSION\` | **not published** (${WATCHER_OUTCOME:-did not run}) | — |"
+            fi
+            if [ "$RENAMER_OUTCOME" = success ] && [ -n "$RENAMER_DIGEST" ]; then
+              echo "| \`$NAMESPACE/fn-renamer:$VERSION\` | published | \`$RENAMER_DIGEST\` |"
+              published=$((published + 1))
+            else
+              echo "| \`$NAMESPACE/fn-renamer:$VERSION\` | **not published** (${RENAMER_OUTCOME:-did not run}) | — |"
+            fi
+            echo
+            if [ "$published" -eq 2 ]; then
+              echo "Both images were published from commit \`$RESOLVED_SHA\`."
+            elif [ "$published" -eq 1 ]; then
+              echo "**Partial publication.** One image reached Docker Hub and one did not."
+              echo "The registry now holds an incomplete release; the missing image must be"
+              echo "published before the digests above are deployed together."
+            else
+              echo "Nothing was published."
+            fi
+            echo
+            echo "Each tag above also exists as \`sha-$SHORT_SHA\`. No \`latest\` tag is written."
+            if [ -n "$IDENTITY_REPORT" ]; then
+              echo
+              echo "### Build identity checked before the push"
+              echo
+              echo '```text'
+              printf '%s\n' "$IDENTITY_REPORT"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the published digests
+        if: always() && steps.record.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-images-${{ needs.resolve.outputs.version }}
+          path: ${{ runner.temp }}/release/release-images.json
+          retention-days: 90
+          if-no-files-found: error
