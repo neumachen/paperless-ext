@@ -185,7 +185,25 @@ jobs:
       - name: Run the full phased integration suite
         id: test
         working-directory: deploy/filename-normalizer
-        run: make test
+        run: |
+          # The readiness sampler is a container running as 65532:65532, and
+          # scripts/lib.sh creates the file it appends to on the HOST first --
+          # `: > "$_wr_out"` -- before starting that container. Under the
+          # default umask that file is 0644 owned by the runner, so the
+          # sampler's writes are refused and the drain phase asserts on nothing:
+          # "only 0 readiness observation(s) were recorded". Making the
+          # directory writable is not enough; the file is the object being
+          # opened. Measured: the same file created under umask 022 is denied
+          # and under umask 000 is written.
+          #
+          # It cannot be reproduced on a developer machine, where Docker
+          # Desktop's bind mounts do not enforce host ownership at all.
+          #
+          # This affects evidence the harness creates while it runs. Credentials
+          # are not written here: .env and secrets/ were created in an earlier
+          # step and carry explicit modes of their own.
+          umask 000
+          make test
 
       - name: Collect the sanitized reports
         id: collect
