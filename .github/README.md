@@ -323,7 +323,8 @@ Actions job:
 - the `release` environment approval gate
 - Docker Hub login, push, and therefore every registry digest
 - artifact upload, retention and the artifact links in the summaries
-- the integration suite's timing on a two-core hosted runner. The suite waits
+- the integration suite's timing on a hosted runner, which is smaller and
+  slower than the machine it has been run on. The suite waits
   on real readiness and real broker counters rather than fixed delays in the
   places that matter, but it also uses fixed sleeps between phases, and those
   have only ever been observed on a developer machine.

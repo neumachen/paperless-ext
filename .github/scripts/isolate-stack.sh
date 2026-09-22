@@ -65,9 +65,11 @@ IMAGE_PREFIX="fnci-$RUN_SLUG"
 VERSION="$(sanitize_tag "$FN_CI_VERSION")"
 [ -n "$VERSION" ] || die "FN_CI_VERSION '$FN_CI_VERSION' sanitises to an empty tag."
 
-# The one name this must never resolve to. fnfoundation is the developer
-# stack's project: a run that adopted it would build over that stack's images
-# and a scoped teardown would delete its containers and volumes.
+# fnfoundation is the developer stack's project: a run that adopted it would
+# build over that stack's images and a scoped teardown would delete its
+# containers and volumes. With the fnci- prefix above this cannot trigger, and
+# it is not what protects that stack -- the .env ownership check below is. It
+# guards a future change to the derivation, not this one.
 [ "$PROJECT" != "fnfoundation" ] || die "refusing to run as the developer project 'fnfoundation'."
 
 cd "$DEPLOY_DIR"
