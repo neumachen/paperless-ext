@@ -178,8 +178,14 @@ artifact validated is the artifact published.
 
 | Target | Repository | Platform |
 |---|---|---|
-| `watcher` | `<DOCKERHUB_NAMESPACE>/fn-watcher` | `linux/amd64` |
-| `renamer` | `<DOCKERHUB_NAMESPACE>/fn-renamer` | `linux/amd64` |
+| `watcher` | `ghcr.io/neumachen/paperless-ext/fn-watcher` | `linux/amd64` |
+| `renamer` | `ghcr.io/neumachen/paperless-ext/fn-renamer` | `linux/amd64` |
+
+GHCR rather than Docker Hub because it accepts a nested path,
+`ghcr.io/owner/repo/image`, which is what the deployment manifests pin. Docker
+Hub has only `namespace/repo` and cannot express it. The path is derived from
+`github.repository` and lowercased, so nothing has to be configured to keep it
+in step with the repository name.
 
 Dockerfile `extensions/filename-normalizer/Dockerfile`, build context
 `extensions/filename-normalizer`.
@@ -223,25 +229,22 @@ manifest digest directly.
 If one push succeeds and the other fails, the summary says so in those words
 and states that the registry holds an incomplete release.
 
-## Configuration to add before the first publication
+## Registry access
 
-None of these are set yet. Their absence does not block CI, the `image` job or
-a dry run; it fails a publishing invocation with a message naming what is
-missing.
+Nothing to configure. GHCR authenticates with the workflow's own
+`GITHUB_TOKEN`, so there is no registry secret to store, scope or rotate. The
+`publish` job declares `packages: write` and no other job in this repository
+does, so nothing else here can push a package, and a pull-request run has no
+path to one at all.
 
-| Kind | Name | Value |
-|---|---|---|
-| Repository variable | `DOCKERHUB_NAMESPACE` | the Docker Hub user or organization the images live under |
-| Repository variable | `DOCKERHUB_USERNAME` | the account used to authenticate |
-| Environment secret | `DOCKERHUB_TOKEN` | a Docker Hub access token with write scope for those two repositories |
+What does need doing, **once, by hand, after the first publish**: a package
+created by a push is **private**, and nothing in the cluster authenticates to
+GHCR — there is no `imagePullSecrets` anywhere in it. Each package's settings
+page has *Change visibility → Public*; until that is done the cluster cannot
+pull the image it is pinned to. Both packages need it, once each.
 
-Put `DOCKERHUB_TOKEN` in an environment named `release`, not in repository
-secrets, and give that environment required reviewers. Then it is readable only
-by the `publish` job, only after a human approves the deployment, and never by
-a pull-request run.
-
-Settings → Environments → **New environment** → `release` → *Required
-reviewers* → add the owner → *Add secret* → `DOCKERHUB_TOKEN`.
+The `release` environment still gates publication with required reviewers. It
+no longer holds a secret; it holds the approval.
 
 ## Running a release
 
@@ -311,24 +314,31 @@ docker run --rm -v "$PWD":/repo -w /repo \
 
 `actionlint` also runs `shellcheck` over every `run:` block.
 
-## Not yet exercised on GitHub
+## What has and has not run on GitHub
 
-This repository has **no GitHub remote**. Everything below has been implemented
-and, where it can be, verified locally, but none of it has run as a hosted
-Actions job:
+**Exercised.** CI runs on hosted `ubuntu-24.04` runners and passes: the verify
+job, and the full 21-phase integration suite against the real PostgreSQL pair,
+the real broker and the real applications. The per-run isolation, the sanitized
+report collection and the scoped teardown all work there.
 
-- any workflow run, on any trigger
-- the `workflow_call` link between the release workflow and CI, and the
-  tested-commit comparison that depends on its output
+That first hosted run was worth having. It found three defects that a developer
+machine structurally cannot show, all from the same root: Docker Desktop's bind
+mounts do not enforce host ownership and its filesystem does not recycle inode
+numbers, while a Linux host does both. Two were in the harness; one was a real
+identity bug in `internal/storage`. Treat "it passes locally" as weak evidence
+for this repository.
+
+**Not exercised.** The release workflow has never run, because no tag has been
+pushed. That leaves unproven:
+
+- the `workflow_call` link from the release workflow to CI, and the
+  tested-commit comparison that reads its output
 - the `release` environment approval gate
-- Docker Hub login, push, and therefore every registry digest
-- artifact upload, retention and the artifact links in the summaries
-- the integration suite's timing on a hosted runner, which is smaller and
-  slower than the machine it has been run on. The suite waits
-  on real readiness and real broker counters rather than fixed delays in the
-  places that matter, but it also uses fixed sleeps between phases, and those
-  have only ever been observed on a developer machine.
+- GHCR login, push, and therefore every registry digest
+- making the resulting packages public, which the cluster needs and which no
+  workflow does
 
-To activate: create the remote, push `main`, add the two variables and the
-`release` environment with its secret and reviewers, and open a pull request so
-CI runs once before anything is tagged.
+To cut the first release: tag a commit on `main` and push the tag. The workflow
+resolves it, runs these checks against that exact commit, builds and validates
+both images, then waits for approval. Afterwards, set both packages to public
+once.

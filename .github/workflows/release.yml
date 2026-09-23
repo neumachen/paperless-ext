@@ -51,6 +51,7 @@ jobs:
       build_date: ${{ steps.resolve.outputs.build_date }}
       publish: ${{ steps.resolve.outputs.publish }}
       reason: ${{ steps.resolve.outputs.reason }}
+      image_base: ${{ steps.resolve.outputs.image_base }}
     steps:
       - name: Check out the full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -144,9 +145,16 @@ jobs:
             reason="release tag $tag resolves to $sha, which is reachable from main"
           fi
 
+          # GHCR is the registry because it accepts a nested path --
+          # ghcr.io/owner/repo/image -- which is what the deployment manifests
+          # pin. Docker Hub has only namespace/repo and cannot express it.
+          # Repository names must be lowercase in an image reference.
+          image_base="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+
           {
             echo "sha=$sha"
             echo "short_sha=$short_sha"
+            echo "image_base=$image_base"
             echo "version=$version"
             echo "tag=$tag"
             echo "build_date=$build_date"
@@ -167,6 +175,7 @@ jobs:
             echo "| Reachable from main | $reachable |"
             echo "| Will publish | $publish |"
             echo "| Reason | $reason |"
+            echo "| Images | \`$image_base/fn-watcher\`, \`$image_base/fn-renamer\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   ci:
@@ -288,31 +297,16 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    # The approval gate and the only place DOCKERHUB_TOKEN is readable.
+      # GHCR authenticates with the workflow's own token, so there is no
+      # registry secret to store or rotate. The scope is declared here and
+      # nowhere else, so no other job in this repository can push a package.
+      packages: write
+    # The approval gate.
     environment: release
     env:
       WATCHER_IMAGE: fn-release-local/fn-watcher:${{ needs.resolve.outputs.version }}
       RENAMER_IMAGE: fn-release-local/fn-renamer:${{ needs.resolve.outputs.version }}
     steps:
-      - name: Require the Docker Hub configuration
-        env:
-          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
-          USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          # The expression is evaluated by Actions; only true or false reaches
-          # the shell, never the token.
-          TOKEN_PRESENT: ${{ secrets.DOCKERHUB_TOKEN != '' }}
-        run: |
-          set -eu
-          missing=''
-          [ -n "$NAMESPACE" ]        || missing="$missing DOCKERHUB_NAMESPACE(variable)"
-          [ -n "$USERNAME" ]         || missing="$missing DOCKERHUB_USERNAME(variable)"
-          [ "$TOKEN_PRESENT" = true ] || missing="$missing DOCKERHUB_TOKEN(secret)"
-          if [ -n "$missing" ]; then
-            echo "::error::publication is configured incomplete; missing:$missing"
-            exit 1
-          fi
-          echo "namespace=$NAMESPACE username=$USERNAME token=present"
-
       - name: Require that the checks ran against this exact commit
         env:
           TESTED_SHA: ${{ needs.ci.outputs.tested_sha }}
@@ -378,11 +372,12 @@ jobs:
           EXPECTED_REVISION: ${{ needs.resolve.outputs.sha }}
         run: .github/scripts/check-image-identity.sh
 
-      - name: Log in to Docker Hub
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push the watcher image
         id: push_watcher
@@ -398,8 +393,8 @@ jobs:
           # No moving tag. `latest` is never written, so a deployment cannot
           # drift onto a different artifact without a reviewed change.
           tags: |
-            ${{ vars.DOCKERHUB_NAMESPACE }}/fn-watcher:${{ needs.resolve.outputs.version }}
-            ${{ vars.DOCKERHUB_NAMESPACE }}/fn-watcher:sha-${{ needs.resolve.outputs.short_sha }}
+            ${{ needs.resolve.outputs.image_base }}/fn-watcher:${{ needs.resolve.outputs.version }}
+            ${{ needs.resolve.outputs.image_base }}/fn-watcher:sha-${{ needs.resolve.outputs.short_sha }}
           build-args: |
             VERSION=${{ needs.resolve.outputs.version }}
             REVISION=${{ needs.resolve.outputs.sha }}
@@ -417,8 +412,8 @@ jobs:
           provenance: false
           sbom: false
           tags: |
-            ${{ vars.DOCKERHUB_NAMESPACE }}/fn-renamer:${{ needs.resolve.outputs.version }}
-            ${{ vars.DOCKERHUB_NAMESPACE }}/fn-renamer:sha-${{ needs.resolve.outputs.short_sha }}
+            ${{ needs.resolve.outputs.image_base }}/fn-renamer:${{ needs.resolve.outputs.version }}
+            ${{ needs.resolve.outputs.image_base }}/fn-renamer:sha-${{ needs.resolve.outputs.short_sha }}
           build-args: |
             VERSION=${{ needs.resolve.outputs.version }}
             REVISION=${{ needs.resolve.outputs.sha }}
@@ -428,7 +423,7 @@ jobs:
         id: record
         if: always()
         env:
-          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          IMAGE_BASE: ${{ needs.resolve.outputs.image_base }}
           VERSION: ${{ needs.resolve.outputs.version }}
           SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
           RESOLVED_SHA: ${{ needs.resolve.outputs.sha }}
@@ -454,7 +449,7 @@ jobs:
             "images": [
               {
                 "target": "watcher",
-                "repository": "$NAMESPACE/fn-watcher",
+                "repository": "$IMAGE_BASE/fn-watcher",
                 "tags": ["$VERSION", "sha-$SHORT_SHA"],
                 "push_outcome": "$WATCHER_OUTCOME",
                 "registry_digest": "$WATCHER_DIGEST",
@@ -462,7 +457,7 @@ jobs:
               },
               {
                 "target": "renamer",
-                "repository": "$NAMESPACE/fn-renamer",
+                "repository": "$IMAGE_BASE/fn-renamer",
                 "tags": ["$VERSION", "sha-$SHORT_SHA"],
                 "push_outcome": "$RENAMER_OUTCOME",
                 "registry_digest": "$RENAMER_DIGEST",
@@ -480,16 +475,16 @@ jobs:
             echo "| Image | Push | Registry digest (pin this) |"
             echo "|---|---|---|"
             if [ "$WATCHER_OUTCOME" = success ] && [ -n "$WATCHER_DIGEST" ]; then
-              echo "| \`$NAMESPACE/fn-watcher:$VERSION\` | published | \`$WATCHER_DIGEST\` |"
+              echo "| \`$IMAGE_BASE/fn-watcher:$VERSION\` | published | \`$WATCHER_DIGEST\` |"
               published=$((published + 1))
             else
-              echo "| \`$NAMESPACE/fn-watcher:$VERSION\` | **not published** (${WATCHER_OUTCOME:-did not run}) | — |"
+              echo "| \`$IMAGE_BASE/fn-watcher:$VERSION\` | **not published** (${WATCHER_OUTCOME:-did not run}) | — |"
             fi
             if [ "$RENAMER_OUTCOME" = success ] && [ -n "$RENAMER_DIGEST" ]; then
-              echo "| \`$NAMESPACE/fn-renamer:$VERSION\` | published | \`$RENAMER_DIGEST\` |"
+              echo "| \`$IMAGE_BASE/fn-renamer:$VERSION\` | published | \`$RENAMER_DIGEST\` |"
               published=$((published + 1))
             else
-              echo "| \`$NAMESPACE/fn-renamer:$VERSION\` | **not published** (${RENAMER_OUTCOME:-did not run}) | — |"
+              echo "| \`$IMAGE_BASE/fn-renamer:$VERSION\` | **not published** (${RENAMER_OUTCOME:-did not run}) | — |"
             fi
             echo
             if [ "$published" -eq 2 ]; then
