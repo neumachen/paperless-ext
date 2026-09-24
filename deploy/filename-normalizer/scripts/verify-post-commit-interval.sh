@@ -9,8 +9,9 @@
 # Three scenarios, all with the publisher held at `hold_before_reveal`:
 #
 #   1. a competing handler cannot close or duplicate an authorised publication
-#   2. a foreign file arriving at the reserved name is not adopted, and both
-#      it and the undelivered job survive
+#   2. a foreign file arriving at the reserved name is not adopted: it
+#      survives untouched and the job is delivered around it under the next
+#      name, the same outcome A3 requires for a file planted before the job
 #   3. an operation failing AFTER the document is visible does not erase the
 #      receipt or unpublish anything
 . "$(dirname "$0")/lib.sh"
@@ -221,24 +222,35 @@ while [ "$_i" -lt 300 ]; do
 done
 NOW_INO="$(probe_inode "/srv/fn/consume/$NAME2")"
 RCPT2="$(psqlq "SELECT count(*) FROM delivery_receipts WHERE job_id = '$JOB2';")"
+DELIVERED2="$(psqlq "SELECT delivered_name FROM delivery_receipts WHERE job_id = '$JOB2';")"
 CAT2="$(psqlq "SELECT coalesce(failure_category,'-') FROM jobs WHERE job_id = '$JOB2';")"
 SRC2="$(probe_exists "/srv/fn/incoming/$DOC2")"
 COPIES2="$(in_storage "ls -1 /srv/fn/consume | grep -c '^pci-foreign-$LOWER' || true")"
+if [ -n "$DELIVERED2" ]; then OURS2="$(probe_exists "/srv/fn/consume/$DELIVERED2")"; else OURS2=no; fi
 
+# The receipt this attempt committed describes a publication its reveal then
+# refused, so it is withdrawn and the attempt advances to the next name --
+# which it can only do because the receipt reads back the identity it
+# recorded. Before that, the withdrawal matched nothing, the delivery was
+# returned, and recovery later held the job and deleted the receipt instead.
 emit "2. a foreign, byte-identical file arrives at the reserved name"
 emit "   the foreign file's inode:          ${FOREIGN_INO:-none}"
 emit "   inode at that name afterwards:     $NOW_INO   (expected ${FOREIGN_INO:-?}: it survived)"
-emit "   final state:                       $STATE2   (expected held)"
-emit "   failure category:                  $CAT2   (expected destination_conflict)"
-emit "   delivery receipts:                 $RCPT2   (expected 0: the receipt was withdrawn)"
-emit "   documents with that name:          $COPIES2   (expected 1: only the stranger's)"
+emit "   final state:                       $STATE2   (expected delivered, under another name)"
+emit "   failure category:                  $CAT2   (expected '-')"
+emit "   delivery receipts:                 $RCPT2   (expected 1)"
+emit "   delivered as:                      ${DELIVERED2:-none}   (expected not $NAME2)"
+emit "   this job's document present:       $OURS2   (expected yes)"
+emit "   documents with that stem:          $COPIES2   (expected 2: the stranger's and this job's)"
 emit "   source preserved:                  $SRC2   (expected yes)"
 [ -n "$FOREIGN_INO" ] || bad "the foreign file could not be planted; this case was not exercised"
 [ "$NOW_INO" = "$FOREIGN_INO" ] || bad "the foreign file was replaced or removed (now $NOW_INO)"
-[ "$STATE2" = "held" ] || bad "the job reached '$STATE2'; a foreign occupant must be a conflict"
-[ "$CAT2" = "destination_conflict" ] || bad "category is '$CAT2', not destination_conflict"
-[ "${RCPT2:-1}" = "0" ] || bad "$RCPT2 receipt(s) remain for a publication that never happened"
-[ "${COPIES2:-0}" = "1" ] || bad "$COPIES2 documents with that name; the job's own copy must not be published"
+[ "$STATE2" = "delivered" ] || bad "the job reached '$STATE2'; it must be delivered around the stranger's file"
+[ "$CAT2" = "-" ] || bad "a delivery around an occupied name acquired the category '$CAT2'"
+[ "${RCPT2:-0}" = "1" ] || bad "$RCPT2 receipts for one delivery"
+[ -n "$DELIVERED2" ] && [ "$DELIVERED2" != "$NAME2" ] || bad "the receipt names '${DELIVERED2:-nothing}', not a different name"
+[ "$OURS2" = "yes" ] || bad "the document the receipt describes is not in the destination"
+[ "${COPIES2:-0}" = "2" ] || bad "$COPIES2 documents with that stem; expected the stranger's and this job's"
 [ "$SRC2" = "yes" ] || bad "the source was not preserved"
 # Take the stranger's file away again -- this run planted it -- by identity.
 compose run --rm --no-deps -T -e FN_T="/srv/fn/consume/$NAME2" -e FN_I="$FOREIGN_INO" \

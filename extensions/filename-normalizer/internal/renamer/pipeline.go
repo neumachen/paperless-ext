@@ -1276,10 +1276,14 @@ func (p *Pipeline) resolveOccupiedDestination(ctx context.Context, job ledger.Jo
 			// Same reasoning as the recovery path: a file that is gone cannot
 			// be shown to have been this job's, because its identity is free
 			// for the filesystem to hand to anybody.
+			//
+			// `ours` requires a receipt, and the ordinary uncertain path
+			// refuses any job that holds one, so it must be the door that
+			// keeps the receipt.
 			log.Error("the occupied destination went before it could be read; not adopting it",
 				slog.String("event", "publication_uncertain"),
 				slog.String("category", string(jobs.CategoryPublicationUncertain)))
-			return p.uncertain(ctx, job, attempt), true
+			return p.uncertainWithReceipt(ctx, job, attempt), true
 		}
 		if serr != nil {
 			out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)
@@ -1372,6 +1376,28 @@ func (p *Pipeline) recoverOccupied(ctx context.Context, job ledger.Job, root, na
 	if existing.PublishedInode != 0 && existing.PublishedDevice != 0 &&
 		existing.PublishedInode == int64(got.Inode) &&
 		existing.PublishedDevice == int64(got.Device) {
+		// The recorded identity is authority only while the file holding it
+		// exists, and this branch is reached because the name was EMPTY a
+		// moment ago: the occupant arrived since. A file created there can
+		// carry a recycled identity, so the bytes must be this job's before
+		// the occupant is accepted as its delivery -- the rule the other two
+		// ownership decisions already apply.
+		sum, _, serr := fingerprintPublished(root, name, got)
+		switch {
+		case errors.Is(serr, fs.ErrNotExist) || errors.Is(serr, storage.ErrMutated):
+			log.Error("the occupied destination went before it could be read; not adopting it",
+				slog.String("event", "publication_uncertain"),
+				slog.String("category", string(jobs.CategoryPublicationUncertain)))
+			return p.uncertainWithReceipt(ctx, job, attempt)
+		case serr != nil:
+			out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)
+			return out
+		case job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint):
+			log.Error("the destination carries this job's recorded identity but not its content",
+				slog.String("event", "destination_conflict"),
+				slog.String("category", string(jobs.CategoryDestinationConflict)))
+			return p.hold(ctx, job, jobs.CategoryDestinationConflict, attempt)
+		}
 		if merr := p.led.MarkDelivered(ctx, job.JobID, attempt, true); merr != nil {
 			return unsettled(merr)
 		}
@@ -1519,11 +1545,13 @@ func (p *Pipeline) recoverPublishing(ctx context.Context, job ledger.Job, attemp
 			// So this attempt says what it actually knows: a publication may
 			// have happened and cannot be confirmed. That is what `uncertain`
 			// is for, and a person resolves it with the source, which is still
-			// in the incoming root.
+			// in the incoming root. The receipt that authorised it is kept:
+			// this branch is only reached with one, and the ordinary uncertain
+			// path refuses a job that holds a receipt.
 			log.Error("the destination went before it could be read; ownership cannot be established from a vanished file",
 				slog.String("event", "publication_uncertain"),
 				slog.String("category", string(jobs.CategoryPublicationUncertain)))
-			return p.uncertain(ctx, job, attempt)
+			return p.uncertainWithReceipt(ctx, job, attempt)
 		}
 		if serr != nil {
 			out, _ := p.holdOr(ctx, job, jobs.Category(storage.RejectionCategory(serr)), attempt, serr)

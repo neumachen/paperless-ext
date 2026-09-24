@@ -903,19 +903,36 @@ func (l *Ledger) RecordUncertain(ctx context.Context, jobID string, category job
 }
 
 // GetReceipt returns a job's delivery receipt, if one exists.
+//
+// It returns the published identity as well. Recovery decides whether the file
+// at a job's destination is the job's own document by comparing it with the
+// device and inode this receipt recorded, and a receipt read without them
+// always reported zero: recovery then took the job's own visible document for
+// a stranger's, held the job, and deleted the receipt of a publication that
+// had become visible.
 func (l *Ledger) GetReceipt(ctx context.Context, jobID string) (Receipt, error) {
-	var r Receipt
+	var (
+		r        Receipt
+		dev, ino *int64
+	)
 	row := l.primary.QueryRow(ctx, `
 		SELECT job_id, destination_root, delivered_name, size_bytes,
-		       content_fingerprint, attempt, delivered_at, absent_observed_at
+		       content_fingerprint, attempt, delivered_at, absent_observed_at,
+		       published_device, published_inode
 		  FROM delivery_receipts WHERE job_id = $1`, jobID)
 	err := row.Scan(&r.JobID, &r.DestinationRoot, &r.DeliveredName, &r.SizeBytes,
-		&r.Fingerprint, &r.Attempt, &r.DeliveredAt, &r.AbsentObservedAt)
+		&r.Fingerprint, &r.Attempt, &r.DeliveredAt, &r.AbsentObservedAt, &dev, &ino)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Receipt{}, ErrNotFound
 	}
 	if err != nil {
 		return Receipt{}, fmt.Errorf("read delivery receipt: %w", err)
+	}
+	if dev != nil {
+		r.PublishedDevice = *dev
+	}
+	if ino != nil {
+		r.PublishedInode = *ino
 	}
 	return r, nil
 }
