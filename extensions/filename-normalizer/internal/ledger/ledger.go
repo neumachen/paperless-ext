@@ -62,6 +62,10 @@ type Job struct {
 	SourceInode      *int64
 	SourceDevice     *int64
 	SourceModifiedAt *time.Time
+	// SourceBirthTime is the source's birth time, when the filesystem reported
+	// one. Where it is known it identifies the file in place of the device,
+	// which names a mount rather than a file and changes on every SMB remount.
+	SourceBirthTime *time.Time
 	// PublishAttemptedAt is set immediately before the destination link, so a
 	// crash during publication is recoverable as "may have published".
 	PublishAttemptedAt *time.Time
@@ -254,6 +258,8 @@ type RegisterInput struct {
 	SourceInode      *int64
 	SourceDevice     *int64
 	SourceModifiedAt *time.Time
+	// SourceBirthTime is nil when the filesystem did not report one.
+	SourceBirthTime *time.Time
 	// DestinationRoot is the consume root this submission is accepted for.
 	DestinationRoot string
 }
@@ -279,13 +285,14 @@ func (l *Ledger) RegisterJob(ctx context.Context, in RegisterInput) (Job, error)
 				job_id, contract_version, state, source_root, source_name,
 				size_bytes, fingerprint_algorithm, content_fingerprint, policy_version,
 				source_inode, source_device, source_modified_at, discovered_at,
-				destination_root
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), $13)
+				destination_root, source_birth_time
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), $13, $14)
 			RETURNING `+jobColumns,
 			id, jobs.ContractVersion, string(jobs.StatePendingDispatch),
 			in.SourceRoot, in.SourceName, in.SizeBytes, in.FingerprintAlgo,
 			in.Fingerprint, in.PolicyIdentity,
-			in.SourceInode, in.SourceDevice, in.SourceModifiedAt, nullIfEmpty(in.DestinationRoot))
+			in.SourceInode, in.SourceDevice, in.SourceModifiedAt, nullIfEmpty(in.DestinationRoot),
+			in.SourceBirthTime)
 		var scanErr error
 		job, scanErr = scanJob(row)
 		if scanErr != nil {
@@ -894,7 +901,7 @@ const jobColumns = `job_id, contract_version, state, source_root, source_name,
 	dispatched_at, last_delivery_at, terminal_at,
 	source_inode, source_device, source_modified_at, publish_attempted_at,
 	destination_root, publish_claimed_by, publish_inode, publish_device,
-	destination_root_unknown`
+	destination_root_unknown, source_birth_time`
 
 func prefixedJobColumns(alias string) string {
 	cols := []string{
@@ -905,7 +912,7 @@ func prefixedJobColumns(alias string) string {
 		"dispatched_at", "last_delivery_at", "terminal_at",
 		"source_inode", "source_device", "source_modified_at", "publish_attempted_at",
 		"destination_root", "publish_claimed_by", "publish_inode", "publish_device",
-		"destination_root_unknown",
+		"destination_root_unknown", "source_birth_time",
 	}
 	out := make([]string, len(cols))
 	for i, c := range cols {
@@ -940,7 +947,7 @@ func scanJob(row scannable) (Job, error) {
 		&j.DispatchedAt, &j.LastDeliveryAt, &j.TerminalAt,
 		&j.SourceInode, &j.SourceDevice, &j.SourceModifiedAt, &j.PublishAttemptedAt,
 		&j.DestinationRoot, &j.PublishClaimedBy, &j.PublishInode, &j.PublishDevice,
-		&j.DestinationRootUnknown)
+		&j.DestinationRootUnknown, &j.SourceBirthTime)
 	if err != nil {
 		return Job{}, err
 	}

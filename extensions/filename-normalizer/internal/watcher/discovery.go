@@ -255,8 +255,10 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 		return false
 	}
 
-	// Already known? Identity, not name, decides.
-	if _, exists, err := d.base.Ledger.AlreadyRegistered(ctx, root, name, entry.Inode, entry.Device); err != nil {
+	// Already known? Identity, not name, decides -- and the birth time, where
+	// the filesystem reports one, is part of it. See AlreadyRegistered.
+	birth := birthTime(entry)
+	if _, exists, err := d.base.Ledger.AlreadyRegistered(ctx, root, name, entry.Inode, entry.Device, birth); err != nil {
 		d.log.Error("could not check whether a submission is already registered",
 			slog.String("event", "discovery_lookup_failed"),
 			slog.String("dependency", "postgres_primary"),
@@ -327,6 +329,7 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 		SourceInode:      &inode,
 		SourceDevice:     &device,
 		SourceModifiedAt: &modified,
+		SourceBirthTime:  birth,
 		// The destination is part of what this submission is accepted under.
 		// Recording it means a renamer configured with a different consume
 		// root refuses the job rather than silently redirecting it.
@@ -351,6 +354,17 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 		slog.Int64("size_bytes", size),
 		slog.String("policy_version", d.cfg.Policy.Identity))
 	return true
+}
+
+// birthTime returns the entry's birth time for the ledger, or nil when the
+// filesystem did not report one. It is truncated to what PostgreSQL keeps, so
+// the value written and the value later compared are the same value.
+func birthTime(e storage.Entry) *time.Time {
+	if !e.BtimeKnown {
+		return nil
+	}
+	t := e.Btime.Truncate(time.Microsecond)
+	return &t
 }
 
 // complete applies the configured completion contract.

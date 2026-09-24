@@ -955,16 +955,33 @@ func (l *Ledger) NoteDeliveredFileAbsent(ctx context.Context, jobID string) erro
 
 // AlreadyRegistered reports whether a submission identity is already a job.
 //
-// Identity is root, name, inode and device together. A producer that reuses a
-// filename for genuinely new content gets a new inode, and therefore a new
-// job: distinct submissions stay distinct even when their names match.
-func (l *Ledger) AlreadyRegistered(ctx context.Context, root, name string, inode, device uint64) (string, bool, error) {
+// Identity is the root, the name, the inode, and then ONE of two things:
+//
+//   - the birth time, when both the registered row and this observation have
+//     one. A new document dropped under a name used before can arrive on the
+//     inode number the old one freed -- ext4 hands them straight back -- and
+//     only the birth time tells the two apart. Comparing the device instead
+//     meant that document was silently never registered.
+//   - the device otherwise: rows registered before birth times were recorded,
+//     and filesystems that do not report one.
+//
+// The device is deliberately NOT compared when the birth time is. It names
+// the mount a file was reached through, not the file: an SMB mount gets a new
+// one every time it is mounted, so every file still waiting in a NAS drop
+// folder would otherwise look new after a remount and be delivered twice.
+//
+// birth is nil when the filesystem did not report a birth time.
+func (l *Ledger) AlreadyRegistered(ctx context.Context, root, name string, inode, device uint64, birth *time.Time) (string, bool, error) {
 	var jobID string
 	row := l.primary.QueryRow(ctx, `
 		SELECT job_id FROM jobs
 		 WHERE source_root = $1 AND source_name = $2
-		   AND source_inode = $3 AND source_device = $4`,
-		root, name, int64(inode), int64(device))
+		   AND source_inode = $3
+		   AND CASE WHEN source_birth_time IS NOT NULL AND $5::timestamptz IS NOT NULL
+		            THEN source_birth_time = $5::timestamptz
+		            ELSE source_device = $4 END
+		 LIMIT 1`,
+		root, name, int64(inode), int64(device), birth)
 	err := row.Scan(&jobID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil

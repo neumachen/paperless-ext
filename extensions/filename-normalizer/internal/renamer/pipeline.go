@@ -298,23 +298,7 @@ func (p *Pipeline) Process(ctx context.Context, job ledger.Job, attempt int) Out
 // recorded. Identity is checked as well as size, so a file swapped for another
 // of the same length is still detected.
 func (p *Pipeline) sourceMatchesRegistration(job ledger.Job, e storage.Entry) bool {
-	if job.SizeBytes != nil && *job.SizeBytes != e.Size {
-		return false
-	}
-	if job.SourceInode != nil && *job.SourceInode != int64(e.Inode) {
-		return false
-	}
-	if job.SourceDevice != nil && *job.SourceDevice != int64(e.Device) {
-		return false
-	}
-	// PostgreSQL stores timestamptz at microsecond resolution, so the value
-	// read back is a truncation of the nanosecond modification time that was
-	// written. Comparing them directly reports every source as mutated.
-	if job.SourceModifiedAt != nil &&
-		!job.SourceModifiedAt.Truncate(time.Microsecond).Equal(e.ModTime.Truncate(time.Microsecond)) {
-		return false
-	}
-	return true
+	return job.RegisteredSourceIs(e)
 }
 
 // makeWorkingCopy produces a verified copy and returns a path to content that

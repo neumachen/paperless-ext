@@ -42,7 +42,9 @@ incoming/                 a producer writes a temporary name and renames it into
         ▼
 watcher / discovery       selection patterns decide eligibility (never transform a name)
         │                 completion contract: stability heuristic, or rename
-        │                 fingerprint + source identity (root+name+inode+device)
+        │                 fingerprint + source identity: root+name+inode, and the
+        │                 birth time where the filesystem reports one (the device
+        │                 otherwise; it changes on every SMB remount)
         ▼
 ledger.RegisterJob        durable job identity (uuid), stamped with the POLICY IDENTITY
         │                 it is accepted under; state pending_dispatch
