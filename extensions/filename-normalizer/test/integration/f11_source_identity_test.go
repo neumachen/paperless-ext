@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ import (
 //   - the same file seen through a new mount -- a new device, as every SMB
 //     remount gives -- IS already registered, so it is not delivered twice.
 //   - a row without a birth time keeps the device rule.
-//   - the exact same identity cannot be registered twice.
+//   - each of the two identities is unique, over exactly its own rows.
 func TestSourceIdentityInTheLedger(t *testing.T) {
 	e := Suite()
 	e.OnlyIn(t, PhaseNormalization)
@@ -77,8 +78,36 @@ func TestSourceIdentityInTheLedger(t *testing.T) {
 	if err := register(device, &tuesday); err != nil {
 		t.Errorf("registering the new file on the reused inode was refused: %v", err)
 	}
-	if err := register(remounted, &monday); err == nil {
-		t.Error("the same identity was registered twice")
+
+	// Uniqueness is read from the catalogue rather than provoked. A refused
+	// duplicate makes PostgreSQL write the rejected key -- a path and a file
+	// name -- into its own error log, which is exactly the leak the stack
+	// privacy phase exists to catch.
+	pool := appPool(t, e)
+	rows, err := pool.Query(ctx, `
+		SELECT indexname, indexdef FROM pg_indexes
+		 WHERE tablename = 'jobs'
+		   AND indexname IN ('jobs_source_identity_idx', 'jobs_source_birth_identity_idx')`)
+	if err != nil {
+		t.Fatalf("read the identity indexes: %v", err)
+	}
+	defs := map[string]string{}
+	for rows.Next() {
+		var name, def string
+		if err := rows.Scan(&name, &def); err != nil {
+			t.Fatal(err)
+		}
+		defs[name] = def
+	}
+	rows.Close()
+	for name, predicate := range map[string]string{
+		"jobs_source_birth_identity_idx": "source_birth_time IS NOT NULL",
+		"jobs_source_identity_idx":       "source_birth_time IS NULL",
+	} {
+		def := defs[name]
+		if !strings.Contains(def, "UNIQUE") || !strings.Contains(def, predicate) {
+			t.Errorf("%s is %q; want a unique index over the rows where %s", name, def, predicate)
+		}
 	}
 
 	// A row from before birth times were recorded keeps the device rule.
