@@ -570,9 +570,11 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	// is issued from this descriptor, so the file that appears at the
 	// destination is the file these bytes were read from.
 	stagedFile, stagedSum, stagedSize, verr := openAndFingerprintOwnTemp(dir, filepath.Base(tmp), staged)
-	if stagedFile != nil {
-		defer func() { _ = stagedFile.Close() }()
-	}
+	defer func() {
+		if stagedFile != nil {
+			_ = stagedFile.Close()
+		}
+	}()
 	if verr != nil {
 		cat := jobs.Category(storage.RejectionCategory(verr))
 		log.Error("could not verify the staged document before publishing it",
@@ -786,6 +788,14 @@ func (p *Pipeline) linkIntoPlace(ctx context.Context, job ledger.Job, root, cand
 	if published {
 		linked = true
 	}
+	// The descriptor has done its one job: what became visible is the file
+	// its bytes were read from. It is closed now, before anything opens the
+	// published name. A CIFS client refuses to open a second name of a file
+	// while a handle on the first is still open -- EINVAL, measured against
+	// the DS1517 share -- so with the consume directory on the NAS the
+	// read-back below failed after every publication.
+	_ = stagedFile.Close()
+	stagedFile = nil
 
 	switch {
 	case published:
