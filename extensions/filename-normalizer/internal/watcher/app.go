@@ -9,6 +9,9 @@
 //
 //   - discovery: registers eligible completed submissions from the incoming
 //     root, and reconciles work that arrived while this process was down.
+//
+//   - archive: when enabled, moves each delivered original out of the
+//     incoming root into an archive directory inside it. Nothing is deleted.
 package watcher
 
 import (
@@ -67,6 +70,10 @@ func (a *App) Run(ctx context.Context) int {
 
 	discoverer := NewDiscoverer(a.base, a.cfg)
 	sup.Add("discovery", discoverer.Run)
+
+	archiver := NewArchiver(a.cfg, a.base.Ledger,
+		log.With(slog.String("component", "archive")), a.base.Metrics)
+	sup.Add("archive", archiver.Run)
 
 	if a.cfg.GRPCAddr != "" {
 		api := grpcapi.New(a.cfg.GRPCAddr, grpcapi.Deps{

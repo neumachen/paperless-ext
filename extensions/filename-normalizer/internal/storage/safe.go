@@ -1108,6 +1108,122 @@ func (d *Dir) RemoveIfOurs(name string, expect Entry) error {
 	return err
 }
 
+// ErrNotDirectory reports a name that was expected to be a directory and is
+// something else.
+var ErrNotDirectory = errors.New("not a directory")
+
+// OpenSubdir opens a directory inside this one and returns it as a Dir of its
+// own, verified by construction: it is reached from this descriptor, one
+// component, without following a symlink.
+//
+// Nothing is created. A missing directory is reported as missing, for the same
+// reason a missing root is: creating it would hide the fact that the directory
+// an operator set up is not the one this process is looking at.
+func (d *Dir) OpenSubdir(name string) (*Dir, error) {
+	if err := checkLeaf(name); err != nil {
+		return nil, err
+	}
+	f, err := openatDir(d.f, name)
+	if err != nil {
+		// O_DIRECTORY is checked before O_NOFOLLOW, so Linux answers a symlink
+		// with ENOTDIR, the same as a file. It is refused either way; the entry
+		// is looked at only to say which it was.
+		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR) {
+			var st unix.Stat_t
+			if unix.Fstatat(int(d.f.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil &&
+				st.Mode&unix.S_IFMT == unix.S_IFLNK {
+				return nil, fmt.Errorf("%w: %s is a symbolic link", ErrEscapesRoot, name)
+			}
+			return nil, fmt.Errorf("%w: %s", ErrNotDirectory, name)
+		}
+		return nil, &os.PathError{Op: "openat", Path: filepath.Join(d.root, name), Err: err}
+	}
+	return &Dir{f: f, root: filepath.Join(d.root, name)}, nil
+}
+
+// MoveOwned moves one entry of this directory into another directory, under a
+// name that must not already exist there, and only while the entry is still the
+// file the caller identified.
+//
+// It exists to take a delivered original out of a drop folder, and it keeps the
+// two promises RemoveOwned keeps, for the same reasons.
+//
+// Nothing is replaced. The move is renameat2 with RENAME_NOREPLACE, so "is the
+// destination free?" and "take it" are one step the filesystem decides. A plain
+// rename(2) would silently destroy an original archived earlier under the same
+// name -- and scanners reuse names every day.
+//
+// Only the caller's file moves. There is no "rename this inode": identifying a
+// name and then renaming it leaves a window in which the name can be given to a
+// different file, and the rename then takes that one. So what arrived is
+// identified afterwards, and anything that is not the caller's file is put back
+// where it came from -- again without replacing -- and nothing is reported as
+// moved.
+//
+// It returns (true, nil) when the caller's file is now at toName in `into`;
+// (false, err) when nothing of the caller's moved, with err wrapping
+// fs.ErrNotExist when the name was already gone, ErrDestinationExists when
+// toName was taken, and ErrMutated when the entry was not the caller's file;
+// and (true, err) when the move happened and only flushing it afterwards
+// failed.
+func (d *Dir) MoveOwned(name string, expect Entry, into *Dir, toName string) (bool, error) {
+	if err := checkLeaf(name); err != nil {
+		return false, err
+	}
+	if err := checkLeaf(toName); err != nil {
+		return false, err
+	}
+	switch got, err := d.Identify(name); {
+	case err != nil:
+		return false, err
+	case !SameIdentity(got, expect):
+		return false, fmt.Errorf("%w: %s is not the file this caller identified", ErrMutated, name)
+	}
+
+	if err := renameatNoReplace(int(d.f.Fd()), name, int(into.f.Fd()), toName); err != nil {
+		if errors.Is(err, syscall.EEXIST) {
+			return false, fmt.Errorf("%w: %s", ErrDestinationExists, toName)
+		}
+		return false, &os.PathError{Op: "renameat2", Path: filepath.Join(d.root, name), Err: err}
+	}
+
+	// What actually moved. Anything but the caller's file goes back.
+	moved, ierr := into.Identify(toName)
+	if ierr != nil || !SameIdentity(moved, expect) {
+		why := "was replaced before it could be moved"
+		if ierr != nil {
+			// Not proof of a stranger, but not proof of ours either, and the
+			// one safe reading of "cannot tell" is to undo the move.
+			why = fmt.Sprintf("could not be identified after the move (%v)", ierr)
+		}
+		rerr := renameatNoReplace(int(into.f.Fd()), toName, int(d.f.Fd()), name)
+		switch {
+		case rerr == nil && ierr != nil:
+			return false, fmt.Errorf("%s %s; it was moved back", name, why)
+		case rerr == nil:
+			return false, fmt.Errorf("%w: %s %s; it was left where it was", ErrMutated, name, why)
+		case errors.Is(rerr, syscall.EEXIST):
+			return false, fmt.Errorf("%w: %s %s, and the name was taken again before it could be put back; it is intact at %s",
+				ErrMutated, name, why, filepath.Join(into.root, toName))
+		default:
+			return false, fmt.Errorf("%w: %s %s, and it could not be put back (it is now %s): %v",
+				ErrMutated, name, why, filepath.Join(into.root, toName), rerr)
+		}
+	}
+
+	// The move is done. Flushing both directories makes it survive a crash;
+	// a failure here is reported, never mistaken for a move that did not
+	// happen.
+	serr := into.f.Sync()
+	if err := d.f.Sync(); serr == nil {
+		serr = err
+	}
+	if serr != nil {
+		return true, fmt.Errorf("flush the directories after the move: %w", serr)
+	}
+	return true, nil
+}
+
 // CreateFrom creates a new entry, copies an open file into it, flushes it, and
 // returns it open together with its identity and content digest.
 //

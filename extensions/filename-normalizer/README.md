@@ -21,7 +21,7 @@ qualification are separate and unfinished.
 
 | Executable | Role |
 |---|---|
-| `fn-watcher` | Hosts three workers: **discovery** (registers eligible completed submissions from the incoming root, and reconciles work that arrived while the process was down), **dispatch** (publishes durable jobs with publisher confirms and returns stranded claims), and **completion accounting** (aggregates the ledger into the exposed metrics). |
+| `fn-watcher` | Hosts four workers: **discovery** (registers eligible completed submissions from the incoming root, and reconciles work that arrived while the process was down), **dispatch** (publishes durable jobs with publisher confirms and returns stranded claims), **completion accounting** (aggregates the ledger into the exposed metrics), and, when enabled, **archive** (moves each delivered original out of the incoming root into an archive directory inside it; nothing is ever deleted). |
 | `fn-renamer` | Consumes the work queue with manual acknowledgement and bounded concurrency, independently scalable. Owns normalization, destination reservation and publication: verified working copy, exclusive name reservation, publish intent, `link(2)` into the consume directory, durable receipt. |
 | `fnctl` | The gRPC inspection client, shipped as its own image. Read-only. |
 
@@ -80,6 +80,13 @@ RecordDelivered           receipt + state delivered, in one transaction,
         │                 committed BEFORE the acknowledgement
         ▼
 basic.ack
+        │
+        ▼
+watcher / archive         only when FN_ARCHIVE_ENABLED: the delivered original is
+                          moved into incoming/<archive dir>/ after its identity
+                          and content are checked again. Never replaced (a
+                          no-replace rename; a taken name gets the job id), never
+                          deleted; a changed original stays where it is
 ```
 
 Every branch that cannot reach a receipt ends in a durable, visible outcome
@@ -184,7 +191,7 @@ problem at once rather than one per restart.
 
 | Variable | Default | Watcher | Renamer |
 |---|---|---|---|
-| `FN_STORAGE_INCOMING` | `/var/lib/filename-normalizer/incoming` | read | read |
+| `FN_STORAGE_INCOMING` | `/var/lib/filename-normalizer/incoming` | read; **write** when archiving | read |
 | `FN_STORAGE_QUEUED` | `…/queued` | write | write |
 | `FN_STORAGE_STAGING` | `…/staging` | write | write |
 | `FN_STORAGE_CONSUME` | `…/consume` | **read** | write |
@@ -194,6 +201,10 @@ problem at once rather than one per restart.
 The consume role is read-only for the watcher on purpose: publication belongs
 to the renamer. The probe expects that split, so mounting consume writable for
 the watcher is a deployment error the application will not benefit from.
+
+Incoming is read-only for both applications unless the watcher archives
+(`FN_ARCHIVE_ENABLED`). Moving a delivered original out of the drop folder is a
+write, and it is the watcher's alone: the renamers still only read incoming.
 
 Each root is **probed**, never merely listed. A root that is missing, is not a
 directory, or cannot be read is reported with its own status, distinct from a
@@ -215,6 +226,10 @@ silently creating one would mask an incorrect mount.
 | `FN_WATCHER_DISPATCH_BATCH` | `32` | |
 | `FN_WATCHER_DISPATCH_CLAIM_MAX_AGE` | `60s` | After this, a stranded dispatch claim is returned to `pending_dispatch`. |
 | `FN_WATCHER_ACCOUNTING_INTERVAL` | `5s` | |
+| `FN_ARCHIVE_ENABLED` | `false` | Once a job is delivered, move its original out of the incoming root into the archive directory. Recorded on each job when it is registered, so a job is archived under the setting it was accepted with. Refused together with recursive discovery, which would register every archived original again. |
+| `FN_ARCHIVE_DIRECTORY` | `processed` | One directory name **inside** the incoming root. It must exist; it is never created. |
+| `FN_ARCHIVE_INTERVAL` | `10s` | How often delivered originals are looked for. A failed move is retried with a doubling wait, up to an hour. |
+| `FN_ARCHIVE_BATCH` | `50` | Originals dealt with per pass. |
 
 ### Renamer-specific
 
@@ -225,11 +240,33 @@ silently creating one would mask an incorrect mount.
 | `FN_RENAMER_MAX_DELIVERY_ATTEMPTS` | `5` | Bounds redelivery. Counted from the ledger's own durable counter, not from the broker message, which does not advance on a requeue. |
 | `FN_RENAMER_DRY_RUN` | `false` | Compute and record names; touch nothing. |
 
+### Archiving a delivered original
+
+With `FN_ARCHIVE_ENABLED=true` the drop folder holds only what has not been
+handled yet. For every delivered job the watcher looks at the original again
+and does exactly one of three things:
+
+- **moves it** into the archive directory, when it is still the file that was
+  registered and its content still hashes to what was delivered. The move is a
+  no-replace rename: an original archived earlier under the same name is never
+  touched, and the new one is archived as `name.<job-id-prefix>.ext` instead.
+- **records it absent**, when the name is gone or now holds a different file.
+  Nothing is moved; a different file is a new submission and discovery
+  registers it as one.
+- **leaves it where it is**, when it is the same file but changed after it was
+  delivered. The version in the drop folder is not the one Paperless has, and
+  the archive must not hide that.
+
+Originals of held and uncertain jobs are never touched: they are what the
+person resolving those jobs starts from. The outcome is recorded per job in
+`source_archivals` and as a `source_archived` history event.
+
 ### Refused on purpose
 
 `FN_CLEANUP_ENABLED=true` is a startup error. Source deletion and ledger
 purging are unresolved policy and are not implemented; accepting the flag
-would imply a behaviour that does not exist.
+would imply a behaviour that does not exist. Archiving moves an original; it
+never deletes one.
 
 ## Telemetry
 
@@ -256,7 +293,14 @@ Key series: `fn_build_info` (including a `source_digest` label),
 `fn_redeliveries_total`, `fn_deliveries_in_flight`,
 `fn_delivery_duration_seconds`, `fn_consumer_up`,
 `fn_renamer_concurrency_limit`, `fn_renamer_prefetch_limit`,
-`fn_broker_reconnects_total`, `fn_ledger_errors_total{error_kind}`.
+`fn_broker_reconnects_total`, `fn_ledger_errors_total{error_kind}`,
+`fn_source_archive_outcomes_total{outcome}`, `fn_source_archive_runs_total{outcome}`,
+`fn_source_archive_waiting`, `fn_source_archive_directory_available`.
+
+`fn_source_archive_waiting` counts delivered originals still in the drop
+folder. A value that only grows means documents are being delivered and never
+tidied away — a missing archive directory, or a share the watcher cannot
+write.
 
 The two `fn_renamer_*_limit` gauges publish this instance's configured bounds
 (0 on the watcher, which hosts no consumer). They exist so that an observer

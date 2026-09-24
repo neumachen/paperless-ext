@@ -105,6 +105,11 @@ type Storage struct {
 	Consume  string
 	Failed   string
 	Required bool
+	// ArchiveDir is the directory inside the incoming root that delivered
+	// originals are moved into, or "" when this process moves nothing. Only
+	// the watcher ever sets it, and setting it is what makes the watcher's
+	// incoming role writable.
+	ArchiveDir string
 }
 
 // RolesFor returns the configured roots with the access each application
@@ -114,12 +119,20 @@ type Storage struct {
 // the watcher must not be able to write into the consumer's directory, because
 // publication belongs to the renamer. The deployment mounts consume read-only
 // for the watcher, and the probe below expects exactly that.
+//
+// Incoming is read-only for both, except for a watcher that archives: moving a
+// delivered original out of the drop folder is a write, and it is the
+// watcher's alone. The renamers still only read it.
 func (s Storage) RolesFor(app Application) []Role {
 	write := func(name, path string) Role { return Role{Name: name, Path: path, WriteRequired: true} }
 	read := func(name, path string) Role { return Role{Name: name, Path: path} }
 
+	incoming := read("incoming", s.Incoming)
+	if app == AppWatcher && s.ArchiveDir != "" {
+		incoming = write("incoming", s.Incoming)
+	}
 	roles := []Role{
-		read("incoming", s.Incoming),
+		incoming,
 		write("queued", s.Queued),
 		write("staging", s.Staging),
 		write("failed", s.Failed),
@@ -153,6 +166,24 @@ type WatcherConfig struct {
 	// ReconcileOnStart re-examines the incoming root at startup so work that
 	// arrived while the watcher was down is picked up.
 	ReconcileOnStart bool
+	// Archive moves each delivered original out of the incoming root.
+	Archive Archive
+}
+
+// Archive is the compiled source-archival configuration.
+//
+// It is off unless a deployment turns it on. With it on, every submission the
+// watcher registers is accepted with a request to move its original into
+// Directory, inside the incoming root, once the job is delivered -- so a drop
+// folder holds only what has not been handled yet. Nothing is ever deleted: an
+// original is moved, left where it is, or found already gone.
+type Archive struct {
+	Enabled bool
+	// Directory is one directory name inside the incoming root. It must exist:
+	// it is never created, for the reason a root is never created.
+	Directory string
+	Interval  time.Duration
+	Batch     int
 }
 
 // RenamerConfig is the renamer application's configuration.
@@ -418,6 +449,10 @@ func LoadWatcher() (WatcherConfig, error) {
 	cfg.DispatchClaimMaxAge = l.duration("FN_WATCHER_DISPATCH_CLAIM_MAX_AGE", 60*time.Second, 5*time.Second, time.Hour)
 	cfg.AccountingInterval = l.duration("FN_WATCHER_ACCOUNTING_INTERVAL", 5*time.Second, time.Second, 5*time.Minute)
 	cfg.ReconcileOnStart = l.boolVal("FN_WATCHER_RECONCILE_ON_START", true)
+	cfg.Archive = compileArchive(l, cfg.Discovery)
+	if cfg.Archive.Enabled {
+		cfg.Storage.ArchiveDir = cfg.Archive.Directory
+	}
 
 	if len(l.problems) > 0 {
 		sort.Strings(l.problems)
@@ -471,6 +506,47 @@ func LoadRenamer() (RenamerConfig, error) {
 		return RenamerConfig{}, &ValidationError{Problems: dedupe(l.problems)}
 	}
 	return cfg, nil
+}
+
+// Source-archival defaults.
+const (
+	defaultArchiveDirectory = "processed"
+	defaultArchiveInterval  = 10 * time.Second
+	defaultArchiveBatch     = 50
+)
+
+// compileArchive reads the source-archival settings, which only the watcher
+// has.
+func compileArchive(l *loader, d Discovery) Archive {
+	a := Archive{
+		Enabled:   l.boolVal("FN_ARCHIVE_ENABLED", false),
+		Directory: l.str("FN_ARCHIVE_DIRECTORY", defaultArchiveDirectory),
+		Interval:  l.duration("FN_ARCHIVE_INTERVAL", defaultArchiveInterval, time.Second, time.Hour),
+		Batch:     l.intVal("FN_ARCHIVE_BATCH", defaultArchiveBatch, 1, 1000),
+	}
+	if !ValidArchiveDirectory(a.Directory) {
+		l.fail("FN_ARCHIVE_DIRECTORY must be one directory name inside the incoming root: not a path, not hidden, not . or ..")
+	}
+	// A recursive scan descends into the archive directory, and every
+	// original moved there would be registered and delivered again.
+	if a.Enabled && d.Recursive {
+		l.fail("FN_ARCHIVE_ENABLED cannot be combined with recursive discovery: " +
+			"the archive directory is inside the incoming root, so a recursive scan would register every archived original again")
+	}
+	return a
+}
+
+// ValidArchiveDirectory reports whether name can be the archive directory:
+// exactly one path component, visible, and not a reference to the root itself
+// or its parent.
+func ValidArchiveDirectory(name string) bool {
+	if name == "" || name == "." || name == ".." || len(name) > 255 {
+		return false
+	}
+	if strings.HasPrefix(name, ".") || strings.ContainsAny(name, "/\\\x00") {
+		return false
+	}
+	return strings.TrimSpace(name) == name
 }
 
 // dedupe removes repeated problems, which the two policy compilations can

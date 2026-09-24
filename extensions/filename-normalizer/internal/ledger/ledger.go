@@ -262,6 +262,11 @@ type RegisterInput struct {
 	SourceBirthTime *time.Time
 	// DestinationRoot is the consume root this submission is accepted for.
 	DestinationRoot string
+	// ArchiveDir, when set, asks for the original to be moved into this
+	// directory inside the source root once the job is delivered. It is
+	// recorded with the job, so the decision is the one the job was accepted
+	// under.
+	ArchiveDir string
 }
 
 // nullIfEmpty stores an unset destination as NULL rather than as the empty
@@ -297,6 +302,15 @@ func (l *Ledger) RegisterJob(ctx context.Context, in RegisterInput) (Job, error)
 		job, scanErr = scanJob(row)
 		if scanErr != nil {
 			return scanErr
+		}
+		// Written in the same transaction as the job, so no job exists whose
+		// archival was requested but not recorded.
+		if in.ArchiveDir != "" {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO source_archivals (job_id, archive_dir) VALUES ($1, $2)`,
+				id, in.ArchiveDir); err != nil {
+				return err
+			}
 		}
 		return l.appendEvent(ctx, tx, eventInput{
 			JobID:     id,
@@ -936,10 +950,12 @@ type scannable interface {
 	Scan(dest ...any) error
 }
 
-func scanJob(row scannable) (Job, error) {
+// scanJob reads the job columns, then any extra columns a query selected
+// after them, into extra.
+func scanJob(row scannable, extra ...any) (Job, error) {
 	var j Job
 	var state string
-	err := row.Scan(
+	dest := []any{
 		&j.JobID, &j.ContractVersion, &state, &j.SourceRoot, &j.SourceName,
 		&j.SizeBytes, &j.FingerprintAlgo, &j.Fingerprint, &j.PolicyVersion,
 		&j.NormalizedName, &j.ReservedName, &j.DispatchAttempts, &j.DeliveryAttempts,
@@ -947,7 +963,9 @@ func scanJob(row scannable) (Job, error) {
 		&j.DispatchedAt, &j.LastDeliveryAt, &j.TerminalAt,
 		&j.SourceInode, &j.SourceDevice, &j.SourceModifiedAt, &j.PublishAttemptedAt,
 		&j.DestinationRoot, &j.PublishClaimedBy, &j.PublishInode, &j.PublishDevice,
-		&j.DestinationRootUnknown, &j.SourceBirthTime)
+		&j.DestinationRootUnknown, &j.SourceBirthTime,
+	}
+	err := row.Scan(append(dest, extra...)...)
 	if err != nil {
 		return Job{}, err
 	}

@@ -74,6 +74,15 @@ type Metrics struct {
 	ConcurrencyLimit prometheus.Gauge
 	PrefetchLimit    prometheus.Gauge
 
+	// ArchiveOutcomes counts what happened to delivered originals, and
+	// ArchiveWaiting is how many delivered originals are still in the drop
+	// folder. A waiting count that only grows means originals are being
+	// delivered and never tidied away.
+	ArchiveOutcomes     *prometheus.CounterVec
+	ArchiveRuns         *prometheus.CounterVec
+	ArchiveWaiting      prometheus.Gauge
+	ArchiveDirAvailable prometheus.Gauge
+
 	BrokerReconnects prometheus.Counter
 	LedgerErrors     *prometheus.CounterVec
 }
@@ -252,9 +261,26 @@ func New(app, instance, policyIdentity string) *Metrics {
 		Name: "fn_discovery_last_run_timestamp_seconds",
 		Help: "Unix time of the last completed discovery scan. Stays at 0 until one completes.",
 	})
+	m.ArchiveOutcomes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "fn_source_archive_outcomes_total",
+		Help: "Delivered originals the watcher dealt with, by outcome. Nothing is ever deleted: an original is moved, found gone, or left where it is.",
+	}, []string{"outcome"})
+	m.ArchiveRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "fn_source_archive_runs_total",
+		Help: "Source-archival passes, by outcome.",
+	}, []string{"outcome"})
+	m.ArchiveWaiting = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "fn_source_archive_waiting",
+		Help: "Delivered originals still in the drop folder, waiting to be moved into the archive directory.",
+	})
+	m.ArchiveDirAvailable = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "fn_source_archive_directory_available",
+		Help: "1 when the archive directory inside the incoming root could be opened on the last pass that needed it.",
+	})
 	m.Registry.MustRegister(
 		m.Published, m.PublishedBytes, m.CollisionSuffixes,
 		m.Discovered, m.DiscoveryRuns, m.DiscoveryLastRun,
+		m.ArchiveOutcomes, m.ArchiveRuns, m.ArchiveWaiting, m.ArchiveDirAvailable,
 	)
 
 	m.preinitialise()
@@ -290,6 +316,14 @@ func (m *Metrics) preinitialise() {
 		m.Discovered.WithLabelValues(o)
 	}
 	m.DiscoveryLastRun.Set(0)
+	for _, o := range ArchiveOutcomes() {
+		m.ArchiveOutcomes.WithLabelValues(o)
+	}
+	for _, o := range []string{"ok", "error"} {
+		m.ArchiveRuns.WithLabelValues(o)
+	}
+	m.ArchiveWaiting.Set(0)
+	m.ArchiveDirAvailable.Set(0)
 	for _, k := range logging.ErrorKinds() {
 		m.LedgerErrors.WithLabelValues(k)
 	}
@@ -325,6 +359,22 @@ func DiscoveryOutcomes() []string {
 		"hidden_file", "symlink", "not_regular_file", "escapes_root",
 		"unsafe_name", "temporary_suffix", "excluded_by_pattern",
 		"not_included", "directory", "permission_denied", "storage_error",
+	}
+}
+
+// ArchiveOutcomes is the closed set of per-original archival results.
+//
+//   - archived: moved into the archive directory
+//   - already_archived: a previous pass moved it and stopped before saying so
+//   - source_absent: the name no longer holds this job's original
+//   - source_changed: the original changed after it was delivered, so it is
+//     left in the drop folder
+//   - deferred: a storage failure; tried again later, nothing decided
+//   - collision_exhausted: every archive name was taken; left in place
+func ArchiveOutcomes() []string {
+	return []string{
+		"archived", "already_archived", "source_absent", "source_changed",
+		"deferred", "collision_exhausted",
 	}
 }
 

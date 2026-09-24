@@ -410,3 +410,98 @@ func TestRolesForAppliesLeastPrivilege(t *testing.T) {
 		}
 	}
 }
+
+// Source archival is a write into the drop folder, so it is off unless a
+// deployment turns it on, and turning it on changes the watcher's incoming
+// role -- and only the watcher's.
+func TestArchiveIsOffByDefaultAndIncomingStaysReadOnly(t *testing.T) {
+	minimalEnv(t)
+	cfg, err := LoadWatcher()
+	if err != nil {
+		t.Fatalf("LoadWatcher: %v", err)
+	}
+	if cfg.Archive.Enabled {
+		t.Error("archival must default to disabled")
+	}
+	if cfg.Archive.Directory != "processed" || cfg.Archive.Interval != 10*time.Second || cfg.Archive.Batch != 50 {
+		t.Errorf("archive defaults: %+v", cfg.Archive)
+	}
+	if cfg.Storage.ArchiveDir != "" {
+		t.Errorf("a disabled archive set the archive directory %q", cfg.Storage.ArchiveDir)
+	}
+	for _, r := range cfg.Storage.RolesFor(AppWatcher) {
+		if r.Name == "incoming" && r.WriteRequired {
+			t.Error("the watcher requires write access to incoming with archival disabled")
+		}
+	}
+}
+
+func TestEnablingArchiveMakesIncomingWritableForTheWatcherOnly(t *testing.T) {
+	minimalEnv(t)
+	t.Setenv("FN_ARCHIVE_ENABLED", "true")
+	t.Setenv("FN_ARCHIVE_DIRECTORY", "done")
+	w, err := LoadWatcher()
+	if err != nil {
+		t.Fatalf("LoadWatcher: %v", err)
+	}
+	if !w.Archive.Enabled || w.Storage.ArchiveDir != "done" {
+		t.Fatalf("archive %+v, storage archive dir %q", w.Archive, w.Storage.ArchiveDir)
+	}
+	writes := map[string]bool{}
+	for _, r := range w.Storage.RolesFor(AppWatcher) {
+		writes[r.Name] = r.WriteRequired
+	}
+	if !writes["incoming"] {
+		t.Error("an archiving watcher must be able to write incoming")
+	}
+	if writes["consume"] {
+		t.Error("archival must not make consume writable for the watcher")
+	}
+	if got := w.Effective().Archive; got == nil || !got.Enabled || got.Directory != "done" {
+		t.Errorf("the effective configuration does not report the archive: %+v", got)
+	}
+
+	// The renamers read the same environment and never move anything.
+	r, err := LoadRenamer()
+	if err != nil {
+		t.Fatalf("LoadRenamer: %v", err)
+	}
+	if r.Storage.ArchiveDir != "" {
+		t.Errorf("the renamer picked up an archive directory %q", r.Storage.ArchiveDir)
+	}
+	for _, role := range r.Storage.RolesFor(AppRenamer) {
+		if role.Name == "incoming" && role.WriteRequired {
+			t.Error("the renamer must never require write access to incoming")
+		}
+	}
+}
+
+func TestArchiveDirectoryMustBeOneVisibleName(t *testing.T) {
+	for _, bad := range []string{"..", ".", ".processed", "a/b", "../up", `a\b`, " processed", "processed "} {
+		t.Run(bad, func(t *testing.T) {
+			minimalEnv(t)
+			t.Setenv("FN_ARCHIVE_ENABLED", "true")
+			t.Setenv("FN_ARCHIVE_DIRECTORY", bad)
+			if _, err := LoadWatcher(); err == nil || !strings.Contains(err.Error(), "FN_ARCHIVE_DIRECTORY") {
+				t.Errorf("FN_ARCHIVE_DIRECTORY=%q: %v, want a refusal naming it", bad, err)
+			}
+		})
+	}
+	for _, good := range []string{"processed", "Erledigt", "2026 archive"} {
+		if !ValidArchiveDirectory(good) {
+			t.Errorf("%q was refused", good)
+		}
+	}
+}
+
+// A recursive scan would descend into the archive directory and register
+// every archived original again.
+func TestArchiveRefusesRecursiveDiscovery(t *testing.T) {
+	minimalEnv(t)
+	writeConfig(t, `{"version": 1, "discovery": {"recursive": true}}`)
+	t.Setenv("FN_ARCHIVE_ENABLED", "true")
+	_, err := LoadWatcher()
+	if err == nil || !strings.Contains(err.Error(), "recursive") {
+		t.Fatalf("archive with recursive discovery: %v, want a refusal", err)
+	}
+}

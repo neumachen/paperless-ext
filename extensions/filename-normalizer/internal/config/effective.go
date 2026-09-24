@@ -38,6 +38,11 @@ type Effective struct {
 
 	Discovery *EffectiveDiscovery `json:"discovery,omitempty"`
 
+	// Archive is reported by the watcher, the only process that moves an
+	// original, whether it is enabled or not: "is anything going to move files
+	// out of the drop folder?" has to be answerable either way.
+	Archive *EffectiveArchive `json:"archive,omitempty"`
+
 	Processing *EffectiveProcessing `json:"processing,omitempty"`
 
 	Dependencies EffectiveDependencies `json:"dependencies"`
@@ -73,6 +78,15 @@ type EffectiveDiscovery struct {
 	Include           []string `json:"include"`
 	Exclude           []string `json:"exclude"`
 	TemporarySuffixes []string `json:"temporary_suffixes"`
+}
+
+// EffectiveArchive is the source-archival configuration in force.
+type EffectiveArchive struct {
+	Enabled bool `json:"enabled"`
+	// Directory is relative to the incoming root.
+	Directory       string  `json:"directory"`
+	IntervalSeconds float64 `json:"interval_seconds"`
+	Batch           int     `json:"batch"`
 }
 
 // EffectiveProcessing is the renamer's operational configuration.
@@ -171,6 +185,12 @@ func (c WatcherConfig) Effective() Effective {
 		TemporarySuffixes: nonNil(append([]string(nil), c.Discovery.Matcher.TemporarySuffixes...)),
 	}
 	sort.Strings(e.Discovery.TemporarySuffixes)
+	e.Archive = &EffectiveArchive{
+		Enabled:         c.Archive.Enabled,
+		Directory:       c.Archive.Directory,
+		IntervalSeconds: c.Archive.Interval.Seconds(),
+		Batch:           c.Archive.Batch,
+	}
 	return e
 }
 

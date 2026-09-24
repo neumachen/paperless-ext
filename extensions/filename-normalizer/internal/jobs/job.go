@@ -236,6 +236,11 @@ const (
 	// link definitely did not happen, so the next delivery is an ordinary
 	// attempt rather than a recovery.
 	EventPublishAbandoned EventType = "publish_abandoned"
+	// EventSourceArchived is written when the question of a delivered job's
+	// original is settled: moved into the archive directory, found gone, or
+	// left in place because it changed after it was delivered. The detail
+	// says which.
+	EventSourceArchived EventType = "source_archived"
 )
 
 // SafeIdentifier reports whether a string is safe to use as a metric label

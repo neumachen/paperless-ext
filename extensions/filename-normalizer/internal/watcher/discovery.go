@@ -347,6 +347,8 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 		// Recording it means a renamer configured with a different consume
 		// root refuses the job rather than silently redirecting it.
 		DestinationRoot: d.cfg.Storage.Consume,
+		// So is what happens to the original once it is delivered.
+		ArchiveDir: d.cfg.Storage.ArchiveDir,
 	})
 	if err != nil {
 		d.base.Metrics.Discovered.WithLabelValues("storage_error").Inc()

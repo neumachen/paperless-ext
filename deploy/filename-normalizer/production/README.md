@@ -59,7 +59,7 @@ silently adopt different arguments.
 
 | Role | Written by | Read by | Notes |
 |---|---|---|---|
-| `incoming` | your scanner/users | watcher | Sources are **never deleted** by this system. |
+| `incoming` | your scanner/users; the watcher when archiving | watcher, renamers | Sources are **never deleted** by this system. With `FN_ARCHIVE_ENABLED` the watcher moves each delivered original into the archive directory inside it (see below). |
 | `queued` | renamer | renamer | Claimed working files, kept out of ordinary discovery. |
 | `staging` | renamer | renamer | Incomplete transfer artifacts. **Must not be visible to Paperless.** |
 | `consume` | renamer | **Paperless** | Shared. See below. |
@@ -74,6 +74,25 @@ write and execute on the directory, not merely read on the file. Where the two
 run as different uids, give the directory a group both belong to, mode 2775
 (setgid so new files inherit the group). A consumer that cannot remove what it
 ingested will re-ingest it.
+
+### Archiving delivered originals out of `incoming`
+
+Off by default. With `FN_ARCHIVE_ENABLED=true` the watcher moves each
+delivered original into `FN_ARCHIVE_DIRECTORY` (default `processed`), a
+directory **inside** the incoming root, so the drop folder holds only what has
+not been handled yet. What it will and will not do:
+
+* The archive directory must exist; it is never created. Its absence shows as
+  `fn_source_archive_directory_available 0` and a growing
+  `fn_source_archive_waiting`.
+* The watcher, and only the watcher, then needs **write** on `incoming`. Mount
+  it read-write for the watcher and keep it read-only for the renamers.
+* Nothing is replaced and nothing is deleted. The move is a no-replace rename;
+  a name already taken in the archive gets the job id before the extension.
+* An original that changed after it was delivered stays in the drop folder,
+  and so do the originals of held and uncertain jobs.
+* Recursive discovery is refused with archiving on: it would descend into the
+  archive directory and register every archived original again.
 
 ### The consume directory has two users
 
@@ -348,6 +367,6 @@ belongs to Paperless and the Normalizer never touches it.
 | Alert receivers | **UNRESOLVED** — no notification target supplied |
 | Storage capacity alerting | **UNRESOLVED** — the application exports no free-space metric; must come from node-level monitoring |
 | Production naming acceptance | **OWNER DECISION** — the policy is a documented candidate |
-| Retention and cleanup policy | **OWNER DECISION** — deletion stays disabled and a flag requesting it is refused |
+| Retention and cleanup policy | **OWNER DECISION** — deletion stays disabled and a flag requesting it is refused. Moving delivered originals out of the drop folder is available (`FN_ARCHIVE_ENABLED`, off by default) and deletes nothing |
 | NAS/SMB qualification | **NOT DONE** — see §8 |
 | Automatic failover | **out of scope** — failover is manual and documented |
