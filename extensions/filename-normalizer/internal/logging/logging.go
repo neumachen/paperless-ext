@@ -53,6 +53,9 @@ func init() {
 		// those are document names.
 		"held_by", "fault_point", "content_matches", "removed",
 		"destination_already_absent",
+		// What the watcher does with a delivered original: "move" or
+		// "remove". A configured closed-set value, never a name.
+		"archive_action",
 	}
 	for _, k := range keys {
 		safeKeys[k] = struct{}{}

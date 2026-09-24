@@ -262,11 +262,13 @@ type RegisterInput struct {
 	SourceBirthTime *time.Time
 	// DestinationRoot is the consume root this submission is accepted for.
 	DestinationRoot string
-	// ArchiveDir, when set, asks for the original to be moved into this
-	// directory inside the source root once the job is delivered. It is
-	// recorded with the job, so the decision is the one the job was accepted
-	// under.
-	ArchiveDir string
+	// ArchiveAction, when set, asks for the original to be dealt with once
+	// the job is delivered: ArchiveMove into ArchiveDir, a directory inside
+	// the source root, or ArchiveRemove from the source root. It is recorded
+	// with the job, so the decision is the one the job was accepted under.
+	// An ArchiveDir without an action means a move.
+	ArchiveAction string
+	ArchiveDir    string
 }
 
 // nullIfEmpty stores an unset destination as NULL rather than as the empty
@@ -305,10 +307,14 @@ func (l *Ledger) RegisterJob(ctx context.Context, in RegisterInput) (Job, error)
 		}
 		// Written in the same transaction as the job, so no job exists whose
 		// archival was requested but not recorded.
-		if in.ArchiveDir != "" {
+		action := in.ArchiveAction
+		if action == "" && in.ArchiveDir != "" {
+			action = ArchiveMove
+		}
+		if action != "" {
 			if _, err := tx.Exec(ctx, `
-				INSERT INTO source_archivals (job_id, archive_dir) VALUES ($1, $2)`,
-				id, in.ArchiveDir); err != nil {
+				INSERT INTO source_archivals (job_id, archive_dir, action) VALUES ($1, $2, $3)`,
+				id, in.ArchiveDir, action); err != nil {
 				return err
 			}
 		}

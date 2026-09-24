@@ -1040,7 +1040,22 @@ func (d *Dir) LinkFromDescriptor(src *os.File, name string) error {
 // when the name was already gone, and (false, err) when the entry was not this
 // caller's, in which case the filesystem is left as it was found.
 func (d *Dir) RemoveOwned(name string, expect Entry) (bool, error) {
+	return d.RemoveOwnedVia(name, expect, tempPrefixRemoval+nonce16())
+}
+
+// RemoveOwnedVia is RemoveOwned with the private name chosen by the caller.
+//
+// A caller that must be able to find an interrupted removal again names it
+// deterministically: the rename leaves the file under `tomb` until the unlink,
+// and a process that dies in between leaves it there, hidden, holding bytes
+// nobody will ever look at. Knowing the name is what lets the next attempt
+// finish the job. The tomb must be a name nothing else uses; the rename refuses
+// to replace one that exists.
+func (d *Dir) RemoveOwnedVia(name string, expect Entry, tomb string) (bool, error) {
 	if err := checkLeaf(name); err != nil {
+		return false, err
+	}
+	if err := checkLeaf(tomb); err != nil {
 		return false, err
 	}
 	switch got, err := d.Identify(name); {
@@ -1055,10 +1070,12 @@ func (d *Dir) RemoveOwned(name string, expect Entry) (bool, error) {
 	// A name nothing else knows -- but "nothing else knows it" is an argument,
 	// not a guarantee, and this directory is writable by others. NOREPLACE
 	// turns the argument into a checked fact at no cost.
-	tomb := tempPrefixRemoval + nonce16()
 	if err := renameatNoReplace(int(d.f.Fd()), name, int(d.f.Fd()), tomb); err != nil {
-		if errors.Is(err, syscall.ENOENT) {
+		switch {
+		case errors.Is(err, syscall.ENOENT):
 			return false, nil
+		case errors.Is(err, syscall.EEXIST):
+			return false, fmt.Errorf("%w: %s", ErrDestinationExists, tomb)
 		}
 		return false, &os.PathError{Op: "renameat", Path: filepath.Join(d.root, name), Err: err}
 	}

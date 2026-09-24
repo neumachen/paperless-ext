@@ -181,3 +181,39 @@ func TestOpenSubdirNeverCreatesOrFollows(t *testing.T) {
 		t.Errorf("a path: %v, want ErrUnsafeName", err)
 	}
 }
+
+// RemoveOwnedVia removes through a name the caller chose, so an interrupted
+// removal can be found again -- and a name already in use is refused rather
+// than replaced.
+func TestRemoveOwnedViaUsesTheCallersPrivateName(t *testing.T) {
+	root, src, _ := archiveFixture(t)
+	writeFile(t, filepath.Join(root, "scan.pdf"), "delivered")
+	e, err := src.Identify("scan.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, filepath.Join(root, ".fn-removed-job-scan.pdf"), "somebody else's")
+	if removed, err := src.RemoveOwnedVia("scan.pdf", e, ".fn-removed-job-scan.pdf"); removed || !errors.Is(err, ErrDestinationExists) {
+		t.Fatalf("removed=%v err=%v, want ErrDestinationExists with the private name taken", removed, err)
+	}
+	if got := readBody(t, filepath.Join(root, ".fn-removed-job-scan.pdf")); got != "somebody else's" {
+		t.Errorf("the file at the private name was replaced: %q", got)
+	}
+	if got := readBody(t, filepath.Join(root, "scan.pdf")); got != "delivered" {
+		t.Errorf("the original was disturbed: %q", got)
+	}
+
+	if removed, err := src.RemoveOwnedVia("scan.pdf", e, ".fn-removed-job2-scan.pdf"); !removed || err != nil {
+		t.Fatalf("removed=%v err=%v, want the original removed", removed, err)
+	}
+	mustNotExistPath(t, filepath.Join(root, "scan.pdf"))
+	mustNotExistPath(t, filepath.Join(root, ".fn-removed-job2-scan.pdf"))
+}
+
+func mustNotExistPath(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("%s still exists (%v)", filepath.Base(path), err)
+	}
+}

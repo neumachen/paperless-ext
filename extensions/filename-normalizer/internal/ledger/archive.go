@@ -16,19 +16,32 @@ import (
 const (
 	ArchivalPending  = "pending"
 	ArchivalArchived = "archived"
+	ArchivalRemoved  = "removed"
 	ArchivalAbsent   = "absent"
 	ArchivalRefused  = "refused"
 )
 
-// Archival is one delivered job whose original is due to be moved.
+// What happens to a delivered original.
+const (
+	// ArchiveMove moves it into a directory inside its source root.
+	ArchiveMove = "move"
+	// ArchiveRemove removes it from its source root: the delivered copy is
+	// the same bytes, verified before it was published.
+	ArchiveRemove = "remove"
+)
+
+// Archival is one delivered job whose original is due to be dealt with.
 type Archival struct {
-	Job        Job
+	Job Job
+	// Action is ArchiveMove or ArchiveRemove, as the job was accepted with.
+	Action string
+	// ArchiveDir is where a move goes; empty for a removal.
 	ArchiveDir string
 	Attempts   int
 }
 
 // ArchivalsDue returns delivered jobs from one source root whose originals are
-// still to be moved, oldest request first.
+// still to be moved or removed, oldest request first.
 //
 // Only DELIVERED jobs. An original whose job was held or is uncertain stays in
 // the drop folder: it is what a person resolving that job starts from, and
@@ -40,7 +53,7 @@ type Archival struct {
 // different root is not the caller's to move.
 func (l *Ledger) ArchivalsDue(ctx context.Context, root string, limit int) ([]Archival, error) {
 	rows, err := l.primary.Query(ctx, `
-		SELECT `+prefixedJobColumns("j")+`, a.archive_dir, a.attempts
+		SELECT `+prefixedJobColumns("j")+`, a.archive_dir, a.attempts, a.action
 		  FROM source_archivals a
 		  JOIN jobs j ON j.job_id = a.job_id
 		 WHERE a.state = 'pending'
@@ -57,7 +70,7 @@ func (l *Ledger) ArchivalsDue(ctx context.Context, root string, limit int) ([]Ar
 	var out []Archival
 	for rows.Next() {
 		var a Archival
-		job, err := scanJob(rows, &a.ArchiveDir, &a.Attempts)
+		job, err := scanJob(rows, &a.ArchiveDir, &a.Attempts, &a.Action)
 		if err != nil {
 			return nil, err
 		}
@@ -78,7 +91,7 @@ var ErrArchivalSettled = errors.New("the archival already has an outcome")
 // must not overwrite what was recorded first.
 func (l *Ledger) SettleArchival(ctx context.Context, jobID, state, archivedName, category string) error {
 	switch state {
-	case ArchivalArchived, ArchivalAbsent, ArchivalRefused:
+	case ArchivalArchived, ArchivalRemoved, ArchivalAbsent, ArchivalRefused:
 	default:
 		return fmt.Errorf("refusing to settle an archival as %q", state)
 	}
@@ -156,9 +169,9 @@ func (l *Ledger) ArchivalFor(ctx context.Context, jobID string) (state, archived
 	return state, archivedName, category, nil
 }
 
-// ArchivalsWaiting counts delivered jobs whose originals have not been moved
-// yet. A number that keeps growing means the drop folder is filling with
-// documents that were delivered and never tidied away.
+// ArchivalsWaiting counts delivered jobs whose originals have not been moved or
+// removed yet. A number that keeps growing means the drop folder is filling
+// with documents that were delivered and never tidied away.
 func (l *Ledger) ArchivalsWaiting(ctx context.Context, root string) (int, error) {
 	var n int
 	err := l.primary.QueryRow(ctx, `

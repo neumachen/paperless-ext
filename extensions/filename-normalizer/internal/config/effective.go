@@ -83,7 +83,9 @@ type EffectiveDiscovery struct {
 // EffectiveArchive is the source-archival configuration in force.
 type EffectiveArchive struct {
 	Enabled bool `json:"enabled"`
-	// Directory is relative to the incoming root.
+	// Action is "move" or "remove".
+	Action string `json:"action"`
+	// Directory is relative to the incoming root, and used by a move.
 	Directory       string  `json:"directory"`
 	IntervalSeconds float64 `json:"interval_seconds"`
 	Batch           int     `json:"batch"`
@@ -187,6 +189,7 @@ func (c WatcherConfig) Effective() Effective {
 	sort.Strings(e.Discovery.TemporarySuffixes)
 	e.Archive = &EffectiveArchive{
 		Enabled:         c.Archive.Enabled,
+		Action:          c.Archive.Action,
 		Directory:       c.Archive.Directory,
 		IntervalSeconds: c.Archive.Interval.Seconds(),
 		Batch:           c.Archive.Batch,

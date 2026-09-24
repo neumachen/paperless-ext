@@ -105,11 +105,12 @@ type Storage struct {
 	Consume  string
 	Failed   string
 	Required bool
-	// ArchiveDir is the directory inside the incoming root that delivered
-	// originals are moved into, or "" when this process moves nothing. Only
-	// the watcher ever sets it, and setting it is what makes the watcher's
-	// incoming role writable.
-	ArchiveDir string
+	// ArchiveAction is what this process does with a delivered original:
+	// "" (nothing), "move" into ArchiveDir -- a directory inside the incoming
+	// root -- or "remove". Only the watcher ever sets it, and setting it is
+	// what makes the watcher's incoming role writable.
+	ArchiveAction string
+	ArchiveDir    string
 }
 
 // RolesFor returns the configured roots with the access each application
@@ -128,7 +129,7 @@ func (s Storage) RolesFor(app Application) []Role {
 	read := func(name, path string) Role { return Role{Name: name, Path: path} }
 
 	incoming := read("incoming", s.Incoming)
-	if app == AppWatcher && s.ArchiveDir != "" {
+	if app == AppWatcher && s.ArchiveAction != "" {
 		incoming = write("incoming", s.Incoming)
 	}
 	roles := []Role{
@@ -173,14 +174,26 @@ type WatcherConfig struct {
 // Archive is the compiled source-archival configuration.
 //
 // It is off unless a deployment turns it on. With it on, every submission the
-// watcher registers is accepted with a request to move its original into
-// Directory, inside the incoming root, once the job is delivered -- so a drop
-// folder holds only what has not been handled yet. Nothing is ever deleted: an
-// original is moved, left where it is, or found already gone.
+// watcher registers is accepted with a request to deal with its original once
+// the job is delivered -- so a drop folder holds only what has not been handled
+// yet. Action says how:
+//
+//   - "move" (the default) moves the original into Directory, inside the
+//     incoming root. Nothing is deleted.
+//   - "remove" removes it. The delivered copy is the same bytes -- verified
+//     before it was published, and verified against the original again before
+//     the original goes -- so a deployment that wants exactly two folders, the
+//     drop folder and the consumer's, has no third one filling up.
+//
+// Either way an original that changed after it was delivered is left where it
+// is, and originals of held and uncertain jobs are never touched.
 type Archive struct {
 	Enabled bool
-	// Directory is one directory name inside the incoming root. It must exist:
-	// it is never created, for the reason a root is never created.
+	// Action is "move" or "remove".
+	Action string
+	// Directory is one directory name inside the incoming root, used by a
+	// move. It must exist: it is never created, for the reason a root is never
+	// created.
 	Directory string
 	Interval  time.Duration
 	Batch     int
@@ -451,7 +464,10 @@ func LoadWatcher() (WatcherConfig, error) {
 	cfg.ReconcileOnStart = l.boolVal("FN_WATCHER_RECONCILE_ON_START", true)
 	cfg.Archive = compileArchive(l, cfg.Discovery)
 	if cfg.Archive.Enabled {
-		cfg.Storage.ArchiveDir = cfg.Archive.Directory
+		cfg.Storage.ArchiveAction = cfg.Archive.Action
+		if cfg.Archive.Action == ArchiveMove {
+			cfg.Storage.ArchiveDir = cfg.Archive.Directory
+		}
 	}
 
 	if len(l.problems) > 0 {
@@ -515,14 +531,27 @@ const (
 	defaultArchiveBatch     = 50
 )
 
+// The two things archival can do with a delivered original. They are the
+// values the ledger records, too.
+const (
+	ArchiveMove   = "move"
+	ArchiveRemove = "remove"
+)
+
 // compileArchive reads the source-archival settings, which only the watcher
 // has.
 func compileArchive(l *loader, d Discovery) Archive {
 	a := Archive{
 		Enabled:   l.boolVal("FN_ARCHIVE_ENABLED", false),
+		Action:    l.str("FN_ARCHIVE_ACTION", ArchiveMove),
 		Directory: l.str("FN_ARCHIVE_DIRECTORY", defaultArchiveDirectory),
 		Interval:  l.duration("FN_ARCHIVE_INTERVAL", defaultArchiveInterval, time.Second, time.Hour),
 		Batch:     l.intVal("FN_ARCHIVE_BATCH", defaultArchiveBatch, 1, 1000),
+	}
+	switch a.Action {
+	case ArchiveMove, ArchiveRemove:
+	default:
+		l.fail("FN_ARCHIVE_ACTION must be %q or %q", ArchiveMove, ArchiveRemove)
 	}
 	if !ValidArchiveDirectory(a.Directory) {
 		l.fail("FN_ARCHIVE_DIRECTORY must be one directory name inside the incoming root: not a path, not hidden, not . or ..")

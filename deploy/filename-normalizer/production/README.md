@@ -59,7 +59,7 @@ silently adopt different arguments.
 
 | Role | Written by | Read by | Notes |
 |---|---|---|---|
-| `incoming` | your scanner/users; the watcher when archiving | watcher, renamers | Sources are **never deleted** by this system. With `FN_ARCHIVE_ENABLED` the watcher moves each delivered original into the archive directory inside it (see below). |
+| `incoming` | your scanner/users; the watcher when archiving | watcher, renamers | Sources are left alone unless `FN_ARCHIVE_ENABLED`: then the watcher moves — or with `FN_ARCHIVE_ACTION=remove`, removes — each delivered original once it is verified (see below). |
 | `queued` | renamer | renamer | Claimed working files, kept out of ordinary discovery. |
 | `staging` | renamer | renamer | Incomplete transfer artifacts. **Must not be visible to Paperless.** |
 | `consume` | renamer | **Paperless** | Shared. See below. |
@@ -79,16 +79,21 @@ ingested will re-ingest it.
 
 Off by default. With `FN_ARCHIVE_ENABLED=true` the watcher moves each
 delivered original into `FN_ARCHIVE_DIRECTORY` (default `processed`), a
-directory **inside** the incoming root, so the drop folder holds only what has
-not been handled yet. What it will and will not do:
+directory **inside** the incoming root — or, with `FN_ARCHIVE_ACTION=remove`,
+removes it — so the drop folder holds only what has not been handled yet.
+What it will and will not do:
 
-* The archive directory must exist; it is never created. Its absence shows as
-  `fn_source_archive_directory_available 0` and a growing
+* For a move, the archive directory must exist; it is never created. Its
+  absence shows as `fn_source_archive_directory_available 0` and a growing
   `fn_source_archive_waiting`.
+* A removal happens only once the original is still the registered file and
+  still hashes to what was delivered, and it goes through a private name owned
+  by the job, so a document dropped under the same name meanwhile is left
+  alone. On a NAS with a recycle bin, removed originals land there.
 * The watcher, and only the watcher, then needs **write** on `incoming`. Mount
   it read-write for the watcher and keep it read-only for the renamers.
-* Nothing is replaced and nothing is deleted. The move is a no-replace rename;
-  a name already taken in the archive gets the job id before the extension.
+* Nothing is replaced. The move is a no-replace rename; a name already taken
+  in the archive gets the job id before the extension.
 * An original that changed after it was delivered stays in the drop folder,
   and so do the originals of held and uncertain jobs.
 * Recursive discovery is refused with archiving on: it would descend into the
@@ -367,6 +372,6 @@ belongs to Paperless and the Normalizer never touches it.
 | Alert receivers | **UNRESOLVED** — no notification target supplied |
 | Storage capacity alerting | **UNRESOLVED** — the application exports no free-space metric; must come from node-level monitoring |
 | Production naming acceptance | **OWNER DECISION** — the policy is a documented candidate |
-| Retention and cleanup policy | **OWNER DECISION** — deletion stays disabled and a flag requesting it is refused. Moving delivered originals out of the drop folder is available (`FN_ARCHIVE_ENABLED`, off by default) and deletes nothing |
+| Retention and cleanup policy | **OWNER DECISION** — deletion stays disabled and a flag requesting it is refused. Moving or removing verified delivered originals is available (`FN_ARCHIVE_ENABLED`, `FN_ARCHIVE_ACTION`, off by default); bulk deletion is not |
 | NAS/SMB qualification | **NOT DONE** — see §8 |
 | Automatic failover | **out of scope** — failover is manual and documented |

@@ -348,7 +348,8 @@ func (d *Discoverer) consider(ctx context.Context, root, name string) bool {
 		// root refuses the job rather than silently redirecting it.
 		DestinationRoot: d.cfg.Storage.Consume,
 		// So is what happens to the original once it is delivered.
-		ArchiveDir: d.cfg.Storage.ArchiveDir,
+		ArchiveAction: d.cfg.Storage.ArchiveAction,
+		ArchiveDir:    d.cfg.Storage.ArchiveDir,
 	})
 	if err != nil {
 		d.base.Metrics.Discovered.WithLabelValues("storage_error").Inc()

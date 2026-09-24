@@ -19,24 +19,29 @@ import (
 	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/telemetry"
 )
 
-// Archiver moves each delivered original out of the incoming root.
+// Archiver takes each delivered original out of the incoming root.
 //
 // # What it is for
 //
 // A drop folder that only ever grows is not usable day to day: every document
 // ever handled stays next to the ones still waiting, and nobody can tell them
 // apart. Once a job is delivered -- its receipt committed and the document in
-// the consumer's directory -- its original has done its work, and this moves it
-// into an archive directory inside the incoming root. Discovery does not
-// descend into directories, so an archived original is never registered again.
+// the consumer's directory -- its original has done its work, and this either
+// moves it into an archive directory inside the incoming root, which discovery
+// never descends into, or removes it, as the job was accepted with.
 //
 // # What it will not do
 //
-// Nothing is deleted, ever. For each delivered job the outcome is one of:
+// Nothing is removed that has not been shown to be what was delivered. For each
+// delivered job the outcome is one of:
 //
 //   - the original is moved, under its own name if that is free and with the
 //     job id added before the extension if it is not. Nothing is replaced: the
 //     move is a no-replace rename, and scanners reuse names every day.
+//   - or the original is removed: only once it is still the registered file
+//     and still hashes to the fingerprint the delivered copy was verified
+//     against, and only through a private name, so a new document dropped under
+//     the same name in the meantime is left alone.
 //   - the name no longer holds this job's original -- gone, or given to a
 //     different file -- and nothing is moved. A different file at the name is
 //     a new submission, and discovery registers it as one.
@@ -77,6 +82,7 @@ func (a *Archiver) Run(ctx context.Context) {
 	}
 	a.log.Info("source archival started",
 		slog.String("event", "archive_started"),
+		slog.String("archive_action", a.cfg.Archive.Action),
 		slog.Float64("interval_seconds", a.cfg.Archive.Interval.Seconds()))
 
 	t := time.NewTicker(a.cfg.Archive.Interval)
@@ -171,7 +177,9 @@ func (a *Archiver) Pass(ctx context.Context) (examined, moved int) {
 		dirs[name] = d
 		return d, nil
 	}
-	_, _ = open(a.cfg.Archive.Directory)
+	if a.cfg.Archive.Action == ledger.ArchiveMove {
+		_, _ = open(a.cfg.Archive.Directory)
+	}
 
 	due, err := a.led.ArchivalsDue(ctx, root, a.cfg.Archive.Batch)
 	if err != nil {
@@ -191,10 +199,14 @@ func (a *Archiver) Pass(ctx context.Context) (examined, moved int) {
 			break
 		}
 		examined++
-		dst, derr := open(due.ArchiveDir)
-		if derr != nil {
-			a.deferArchival(ctx, due, jobs.Category(storage.RejectionCategory(derr)))
-			continue
+		var dst *storage.Dir
+		if due.Action != ledger.ArchiveRemove {
+			d, derr := open(due.ArchiveDir)
+			if derr != nil {
+				a.deferArchival(ctx, due, jobs.Category(storage.RejectionCategory(derr)))
+				continue
+			}
+			dst = d
 		}
 		if a.archive(ctx, src, dst, due) {
 			moved++
@@ -211,24 +223,26 @@ func (a *Archiver) Pass(ctx context.Context) (examined, moved int) {
 	return examined, moved
 }
 
-// archive settles one delivered job's original and reports whether it moved.
+// archive settles one delivered job's original and reports whether it moved
+// or removed it.
 func (a *Archiver) archive(ctx context.Context, src, dst *storage.Dir, due ledger.Archival) bool {
 	job := due.Job
 	log := a.log.With(slog.String("job_id", job.JobID))
 	name := job.SourceName
-	candidates := archiveCandidates(name, job.JobID)
+	remove := due.Action == ledger.ArchiveRemove
+	var candidates []string
+	if !remove {
+		candidates = archiveCandidates(name, job.JobID)
+	}
+	tomb := removalTomb(job.JobID, name)
 
 	// What is at the name now?
 	got, err := src.Identify(name)
 	switch {
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, storage.ErrNotRegular):
-		// Not this job's original any more. A previous pass may have moved it
-		// and stopped before recording that; ask the archive before saying the
-		// original is gone.
-		if at, ok := findArchived(dst, job, candidates); ok {
-			return a.settle(ctx, log, job, ledger.ArchivalArchived, candidates[at], "", "already_archived", at)
-		}
-		return a.settle(ctx, log, job, ledger.ArchivalAbsent, "", jobs.CategorySourceAbsent, "source_absent", 0)
+		// Not this job's original any more. A previous pass may have dealt with
+		// it and stopped before recording that; look before saying it is gone.
+		return a.settleGone(ctx, log, src, dst, due, candidates, tomb)
 	case err != nil:
 		a.deferArchival(ctx, due, jobs.Category(storage.RejectionCategory(err)))
 		return false
@@ -237,11 +251,8 @@ func (a *Archiver) archive(ctx context.Context, src, dst *storage.Dir, due ledge
 	if !job.RegisteredFileIs(got) {
 		// A different file holds the name: a new submission under a reused
 		// name, which discovery registers on its own. This job's original may
-		// already be in the archive.
-		if at, ok := findArchived(dst, job, candidates); ok {
-			return a.settle(ctx, log, job, ledger.ArchivalArchived, candidates[at], "", "already_archived", at)
-		}
-		return a.settle(ctx, log, job, ledger.ArchivalAbsent, "", jobs.CategorySourceAbsent, "source_absent", 0)
+		// already have been dealt with.
+		return a.settleGone(ctx, log, src, dst, due, candidates, tomb)
 	}
 	if !job.RegisteredSourceIs(got) {
 		return a.settle(ctx, log, job, ledger.ArchivalRefused, "", jobs.CategorySourceMutated, "source_changed", 0)
@@ -267,6 +278,25 @@ func (a *Archiver) archive(ctx context.Context, src, dst *storage.Dir, due ledge
 	if (job.Fingerprint != nil && !bytes.Equal(sum, job.Fingerprint)) ||
 		(job.SizeBytes != nil && size != *job.SizeBytes) {
 		return a.settle(ctx, log, job, ledger.ArchivalRefused, "", jobs.CategorySourceMutated, "source_changed", 0)
+	}
+
+	if remove {
+		// Through a private name this job owns, so a document dropped under
+		// the same name in the meantime is never the one that goes, and an
+		// interrupted removal can be found and finished.
+		removed, rerr := src.RemoveOwnedVia(name, got, tomb)
+		switch {
+		case removed:
+			return a.settle(ctx, log, job, ledger.ArchivalRemoved, "", "", "removed", 0)
+		case rerr == nil, errors.Is(rerr, storage.ErrMutated):
+			log.Info("the original changed hands while it was being removed; looking again next pass",
+				slog.String("event", "archive_raced"),
+				slog.String("category", storage.RejectionCategory(rerr)))
+			return false
+		default:
+			a.deferArchival(ctx, due, jobs.Category(storage.RejectionCategory(rerr)))
+			return false
+		}
 	}
 
 	// Move it, never replacing anything.
@@ -333,12 +363,66 @@ func (a *Archiver) settle(ctx context.Context, log *slog.Logger, job ledger.Job,
 		attrs = append(attrs, slog.Int("collision_sequence", seq))
 		log.Info("a delivered original was moved into the archive directory", attrs...)
 		return outcome == "archived"
+	case ledger.ArchivalRemoved:
+		log.Info("a delivered original was removed from the drop folder", attrs...)
+		return true
 	case ledger.ArchivalRefused:
 		log.Warn("a delivered original was left in the drop folder", attrs...)
 	default:
 		log.Info("a delivered original is no longer in the drop folder; nothing was moved", attrs...)
 	}
 	return false
+}
+
+// settleGone records the outcome for a job whose original is no longer at its
+// name: dealt with by a pass that stopped before recording it, or gone.
+func (a *Archiver) settleGone(ctx context.Context, log *slog.Logger, src, dst *storage.Dir, due ledger.Archival, candidates []string, tomb string) bool {
+	job := due.Job
+	if due.Action == ledger.ArchiveRemove {
+		// An interrupted removal leaves the original under its private name.
+		// Finish it: the file there is this job's by identity, and its content
+		// was verified before it was renamed.
+		if e, err := src.Identify(tomb); err == nil && job.RegisteredFileIs(e) {
+			if removed, rerr := src.RemoveOwned(tomb, e); removed {
+				return a.settle(ctx, log, job, ledger.ArchivalRemoved, "", "", "removed", 0)
+			} else if rerr != nil {
+				a.deferArchival(ctx, due, jobs.Category(storage.RejectionCategory(rerr)))
+				return false
+			}
+		}
+		return a.settle(ctx, log, job, ledger.ArchivalAbsent, "", jobs.CategorySourceAbsent, "source_absent", 0)
+	}
+	if at, ok := findArchived(dst, job, candidates); ok {
+		return a.settle(ctx, log, job, ledger.ArchivalArchived, candidates[at], "", "already_archived", at)
+	}
+	return a.settle(ctx, log, job, ledger.ArchivalAbsent, "", jobs.CategorySourceAbsent, "source_absent", 0)
+}
+
+// removalTomb is the private name an original is renamed to on its way out.
+//
+// It is a dotfile, so discovery never takes it for a submission, and it is
+// deterministic -- the job id -- so a pass that stopped between the rename and
+// the unlink leaves something the next pass can find. It carries the original
+// name too: a NAS with a recycle bin keeps what is removed, and a person
+// looking there should recognise the document.
+func removalTomb(jobID, name string) string {
+	return fitName(".fn-removed-"+jobID+"-", name)
+}
+
+// fitName joins a prefix and a name, shortening the name on a character
+// boundary so the result fits in a directory entry.
+func fitName(prefix, name string) string {
+	if len(prefix)+len(name) <= maxArchiveName {
+		return prefix + name
+	}
+	cut := maxArchiveName - len(prefix)
+	if cut < 0 {
+		cut = 0
+	}
+	for cut > 0 && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return prefix + name[:cut]
 }
 
 // deferArchival leaves the archival pending and says when to look again.

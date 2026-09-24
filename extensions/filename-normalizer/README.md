@@ -83,10 +83,10 @@ basic.ack
         │
         ▼
 watcher / archive         only when FN_ARCHIVE_ENABLED: the delivered original is
-                          moved into incoming/<archive dir>/ after its identity
-                          and content are checked again. Never replaced (a
-                          no-replace rename; a taken name gets the job id), never
-                          deleted; a changed original stays where it is
+                          checked again (identity and content), then moved into
+                          incoming/<archive dir>/ (never replacing; a taken name
+                          gets the job id) or, with FN_ARCHIVE_ACTION=remove,
+                          removed. A changed original stays where it is
 ```
 
 Every branch that cannot reach a receipt ends in a durable, visible outcome
@@ -226,8 +226,9 @@ silently creating one would mask an incorrect mount.
 | `FN_WATCHER_DISPATCH_BATCH` | `32` | |
 | `FN_WATCHER_DISPATCH_CLAIM_MAX_AGE` | `60s` | After this, a stranded dispatch claim is returned to `pending_dispatch`. |
 | `FN_WATCHER_ACCOUNTING_INTERVAL` | `5s` | |
-| `FN_ARCHIVE_ENABLED` | `false` | Once a job is delivered, move its original out of the incoming root into the archive directory. Recorded on each job when it is registered, so a job is archived under the setting it was accepted with. Refused together with recursive discovery, which would register every archived original again. |
-| `FN_ARCHIVE_DIRECTORY` | `processed` | One directory name **inside** the incoming root. It must exist; it is never created. |
+| `FN_ARCHIVE_ENABLED` | `false` | Once a job is delivered, take its original out of the incoming root. Recorded on each job when it is registered, so a job is archived under the setting it was accepted with. Refused together with recursive discovery, which would register every archived original again. |
+| `FN_ARCHIVE_ACTION` | `move` | `move` into the archive directory, or `remove` — for a layout with exactly two folders, the drop folder and the consumer's. Either way the original must still be the registered file and still hash to what was delivered. |
+| `FN_ARCHIVE_DIRECTORY` | `processed` | For `move`: one directory name **inside** the incoming root. It must exist; it is never created. |
 | `FN_ARCHIVE_INTERVAL` | `10s` | How often delivered originals are looked for. A failed move is retried with a doubling wait, up to an hour. |
 | `FN_ARCHIVE_BATCH` | `50` | Originals dealt with per pass. |
 
@@ -246,10 +247,14 @@ With `FN_ARCHIVE_ENABLED=true` the drop folder holds only what has not been
 handled yet. For every delivered job the watcher looks at the original again
 and does exactly one of three things:
 
-- **moves it** into the archive directory, when it is still the file that was
-  registered and its content still hashes to what was delivered. The move is a
-  no-replace rename: an original archived earlier under the same name is never
-  touched, and the new one is archived as `name.<job-id-prefix>.ext` instead.
+- **moves it** into the archive directory — or, with `FN_ARCHIVE_ACTION=remove`,
+  **removes it** — when it is still the file that was registered and its
+  content still hashes to what was delivered. The move is a no-replace rename:
+  an original archived earlier under the same name is never touched, and the
+  new one is archived as `name.<job-id-prefix>.ext` instead. A removal goes
+  through a private name owned by the job (`.fn-removed-<job>-<name>`), so a
+  document dropped under the same name meanwhile is never the one removed, and
+  a removal interrupted halfway is finished on the next pass.
 - **records it absent**, when the name is gone or now holds a different file.
   Nothing is moved; a different file is a new submission and discovery
   registers it as one.
@@ -263,10 +268,11 @@ person resolving those jobs starts from. The outcome is recorded per job in
 
 ### Refused on purpose
 
-`FN_CLEANUP_ENABLED=true` is a startup error. Source deletion and ledger
+`FN_CLEANUP_ENABLED=true` is a startup error. Bulk source deletion and ledger
 purging are unresolved policy and are not implemented; accepting the flag
-would imply a behaviour that does not exist. Archiving moves an original; it
-never deletes one.
+would imply a behaviour that does not exist. `FN_ARCHIVE_ACTION=remove` is
+not that: it removes one delivered original at a time, only once it has been
+shown to be the bytes that were delivered, and never touches the ledger.
 
 ## Telemetry
 

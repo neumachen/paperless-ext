@@ -56,8 +56,14 @@ func newDropFolder(t *testing.T, e *Env, label string) dropFolder {
 }
 
 // drop writes one original into the drop folder and registers it as the
-// watcher would, with archival requested.
+// watcher would, with a move into the archive directory requested.
 func (d dropFolder) drop(t *testing.T, e *Env, led *ledger.Ledger, name string, content []byte) (ledger.Job, storage.Entry) {
+	t.Helper()
+	return d.dropFor(t, e, led, name, content, ledger.ArchiveMove)
+}
+
+// dropFor is drop with the archival action chosen.
+func (d dropFolder) dropFor(t *testing.T, e *Env, led *ledger.Ledger, name string, content []byte, action string) (ledger.Job, storage.Entry) {
 	t.Helper()
 	path := filepath.Join(d.root, name)
 	if err := os.WriteFile(path, content, 0o644); err != nil {
@@ -88,7 +94,8 @@ func (d dropFolder) drop(t *testing.T, e *Env, led *ledger.Ledger, name string, 
 		SourceInode:    &inode, SourceDevice: &device, SourceModifiedAt: &modified,
 		SourceBirthTime: birth,
 		DestinationRoot: e.Cfg.Storage.Consume,
-		ArchiveDir:      "processed",
+		ArchiveAction:   action,
+		ArchiveDir:      archiveDirFor(action),
 	})
 	if err != nil {
 		t.Fatalf("register the original: %v", err)
@@ -96,15 +103,24 @@ func (d dropFolder) drop(t *testing.T, e *Env, led *ledger.Ledger, name string, 
 	return job, entry
 }
 
+func archiveDirFor(action string) string {
+	if action == ledger.ArchiveRemove {
+		return ""
+	}
+	return "processed"
+}
+
 // archiver builds the archival worker for a private drop folder.
 func (d dropFolder) archiver(e *Env, led *ledger.Ledger) *watcher.Archiver {
 	cfg := config.WatcherConfig{
 		Common: e.Cfg.Common,
 		Archive: config.Archive{
-			Enabled: true, Directory: "processed", Interval: time.Second, Batch: 50,
+			Enabled: true, Action: config.ArchiveMove, Directory: "processed",
+			Interval: time.Second, Batch: 50,
 		},
 	}
 	cfg.Storage.Incoming = d.root
+	cfg.Storage.ArchiveAction = config.ArchiveMove
 	cfg.Storage.ArchiveDir = "processed"
 	m := telemetry.New("watcher", "archive-test", e.Cfg.Policy.Identity)
 	return watcher.NewArchiver(cfg, led, e.Log, m)
@@ -347,5 +363,107 @@ func TestArchiveDoesNotTouchAHeldJobsOriginal(t *testing.T) {
 	}
 	if state, _, _ := archivalOf(t, led, job.JobID); state != ledger.ArchivalPending {
 		t.Errorf("a held job's archival is %q, want it left pending", state)
+	}
+}
+
+// hiddenEntries lists the dotfiles left in a directory: a removal that stopped
+// halfway leaves its private name behind.
+func hiddenEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, en := range entries {
+		if strings.HasPrefix(en.Name(), ".") {
+			out = append(out, en.Name())
+		}
+	}
+	return out
+}
+
+// TestArchiveRemovesADeliveredOriginal is the two-folder layout: once the
+// delivered copy is in place, the original leaves the drop folder, and nothing
+// is left behind in it -- not even the private name it went out through.
+func TestArchiveRemovesADeliveredOriginal(t *testing.T) {
+	e := Suite()
+	e.OnlyIn(t, PhaseNormalization)
+	led := e.Ledger(t)
+	d := newDropFolder(t, e, "removes")
+
+	content := fmt.Sprintf("%%PDF-1.4 removed once delivered %s\n", e.RunID)
+	job, _ := d.dropFor(t, e, led, "Scan 0001.PDF", []byte(content), ledger.ArchiveRemove)
+	requireDelivered(t, led, job)
+	delivered := publishedPath(t, e, led, job)
+
+	if _, moved := d.pass(t, e, led); moved != 1 {
+		t.Fatalf("the original was not removed")
+	}
+	mustNotExist(t, filepath.Join(d.root, "Scan 0001.PDF"), "the original in the drop folder")
+	if left := hiddenEntries(t, d.root); len(left) != 0 {
+		t.Errorf("the removal left private names behind: %v", left)
+	}
+	// The document itself is where the consumer takes it from, byte for byte.
+	if got := mustRead(t, delivered); got != content {
+		t.Errorf("the delivered copy does not hold the original's bytes")
+	}
+	state, name, _ := archivalOf(t, led, job.JobID)
+	if state != ledger.ArchivalRemoved || name != "" {
+		t.Errorf("archival recorded %q under %q, want removed", state, name)
+	}
+}
+
+// TestArchiveRemoveLeavesAChangedOriginal: what sits in the drop folder is no
+// longer what was delivered, so it is not removed.
+func TestArchiveRemoveLeavesAChangedOriginal(t *testing.T) {
+	e := Suite()
+	e.OnlyIn(t, PhaseNormalization)
+	led := e.Ledger(t)
+	d := newDropFolder(t, e, "remove-changed")
+
+	job, _ := d.dropFor(t, e, led, "contract.pdf", []byte("%PDF-1.4 as delivered "+e.RunID+"\n"), ledger.ArchiveRemove)
+	requireDelivered(t, led, job)
+	f, err := os.OpenFile(filepath.Join(d.root, "contract.pdf"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("an edit made after delivery\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	if _, removed := d.pass(t, e, led); removed != 0 {
+		t.Fatalf("a changed original was removed")
+	}
+	if _, err := os.Lstat(filepath.Join(d.root, "contract.pdf")); err != nil {
+		t.Errorf("the changed original is gone: %v", err)
+	}
+	if state, _, category := archivalOf(t, led, job.JobID); state != ledger.ArchivalRefused || category != string(jobs.CategorySourceMutated) {
+		t.Errorf("archival recorded %q/%q, want refused/source_mutated", state, category)
+	}
+}
+
+// TestArchiveRemoveFinishesAnInterruptedRemoval: a watcher that renamed the
+// original to its private name and died before unlinking it. The next pass must
+// find it by that name and finish, not call the original gone and leave its
+// bytes hidden in the drop folder forever.
+func TestArchiveRemoveFinishesAnInterruptedRemoval(t *testing.T) {
+	e := Suite()
+	e.OnlyIn(t, PhaseNormalization)
+	led := e.Ledger(t)
+	d := newDropFolder(t, e, "remove-interrupted")
+
+	job, _ := d.dropFor(t, e, led, "letter.pdf", []byte("%PDF-1.4 interrupted removal "+e.RunID+"\n"), ledger.ArchiveRemove)
+	requireDelivered(t, led, job)
+	tomb := ".fn-removed-" + job.JobID + "-letter.pdf"
+	if err := os.Rename(filepath.Join(d.root, "letter.pdf"), filepath.Join(d.root, tomb)); err != nil {
+		t.Fatal(err)
+	}
+
+	d.pass(t, e, led)
+	mustNotExist(t, filepath.Join(d.root, tomb), "the interrupted removal's private name")
+	if state, _, _ := archivalOf(t, led, job.JobID); state != ledger.ArchivalRemoved {
+		t.Errorf("archival recorded %q, want the interrupted removal finished", state)
 	}
 }

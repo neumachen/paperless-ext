@@ -263,7 +263,7 @@ func New(app, instance, policyIdentity string) *Metrics {
 	})
 	m.ArchiveOutcomes = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "fn_source_archive_outcomes_total",
-		Help: "Delivered originals the watcher dealt with, by outcome. Nothing is ever deleted: an original is moved, found gone, or left where it is.",
+		Help: "Delivered originals the watcher dealt with, by outcome: moved or removed once verified, found gone, or left where it is.",
 	}, []string{"outcome"})
 	m.ArchiveRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "fn_source_archive_runs_total",
@@ -271,11 +271,11 @@ func New(app, instance, policyIdentity string) *Metrics {
 	}, []string{"outcome"})
 	m.ArchiveWaiting = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "fn_source_archive_waiting",
-		Help: "Delivered originals still in the drop folder, waiting to be moved into the archive directory.",
+		Help: "Delivered originals still in the drop folder, waiting to be moved or removed.",
 	})
 	m.ArchiveDirAvailable = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "fn_source_archive_directory_available",
-		Help: "1 when the archive directory inside the incoming root could be opened on the last pass that needed it.",
+		Help: "1 when the archive directory inside the incoming root could be opened on the last pass that needed it. Only a move uses one.",
 	})
 	m.Registry.MustRegister(
 		m.Published, m.PublishedBytes, m.CollisionSuffixes,
@@ -366,6 +366,7 @@ func DiscoveryOutcomes() []string {
 //
 //   - archived: moved into the archive directory
 //   - already_archived: a previous pass moved it and stopped before saying so
+//   - removed: verified to be what was delivered, and removed
 //   - source_absent: the name no longer holds this job's original
 //   - source_changed: the original changed after it was delivered, so it is
 //     left in the drop folder
@@ -373,7 +374,7 @@ func DiscoveryOutcomes() []string {
 //   - collision_exhausted: every archive name was taken; left in place
 func ArchiveOutcomes() []string {
 	return []string{
-		"archived", "already_archived", "source_absent", "source_changed",
+		"archived", "already_archived", "removed", "source_absent", "source_changed",
 		"deferred", "collision_exhausted",
 	}
 }

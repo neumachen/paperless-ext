@@ -5,6 +5,9 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/config"
+	"github.com/neumachen/paperless-ext/extensions/filename-normalizer/internal/ledger"
 )
 
 const testJobID = "3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b"
@@ -72,5 +75,27 @@ func TestArchiveBackoffDoublesUpToAnHour(t *testing.T) {
 		if got := archiveBackoff(10*time.Second, attempts); got != want {
 			t.Errorf("attempts %d: %s, want %s", attempts, got, want)
 		}
+	}
+}
+
+func TestRemovalTombIsHiddenDeterministicAndFits(t *testing.T) {
+	got := removalTomb(testJobID, "Scan 0001.PDF")
+	if got != ".fn-removed-"+testJobID+"-Scan 0001.PDF" {
+		t.Errorf("tomb %q", got)
+	}
+	if got != removalTomb(testJobID, "Scan 0001.PDF") {
+		t.Error("the tomb is not deterministic; an interrupted removal could not be found again")
+	}
+	long := removalTomb(testJobID, strings.Repeat("ü", 200)+".pdf")
+	if len(long) > maxArchiveName || !utf8.ValidString(long) || !strings.HasPrefix(long, ".fn-removed-"+testJobID) {
+		t.Errorf("a long name made an unusable tomb: %d bytes, valid UTF-8 %t", len(long), utf8.ValidString(long))
+	}
+}
+
+// The configuration and the ledger spell the two actions independently, and a
+// job accepted under one must be dealt with under the same one.
+func TestArchiveActionsAgreeBetweenConfigurationAndLedger(t *testing.T) {
+	if config.ArchiveMove != ledger.ArchiveMove || config.ArchiveRemove != ledger.ArchiveRemove {
+		t.Fatalf("config %q/%q, ledger %q/%q", config.ArchiveMove, config.ArchiveRemove, ledger.ArchiveMove, ledger.ArchiveRemove)
 	}
 }

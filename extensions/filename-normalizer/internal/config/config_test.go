@@ -505,3 +505,41 @@ func TestArchiveRefusesRecursiveDiscovery(t *testing.T) {
 		t.Fatalf("archive with recursive discovery: %v, want a refusal", err)
 	}
 }
+
+// Some deployments want exactly two folders: the drop folder and the
+// consumer's. "remove" is how they get it; the incoming role is written either
+// way, and a removal needs no archive directory.
+func TestArchiveActionMoveOrRemove(t *testing.T) {
+	minimalEnv(t)
+	t.Setenv("FN_ARCHIVE_ENABLED", "true")
+	t.Setenv("FN_ARCHIVE_ACTION", "remove")
+	w, err := LoadWatcher()
+	if err != nil {
+		t.Fatalf("LoadWatcher: %v", err)
+	}
+	if w.Storage.ArchiveAction != ArchiveRemove || w.Storage.ArchiveDir != "" {
+		t.Errorf("remove: storage action %q dir %q", w.Storage.ArchiveAction, w.Storage.ArchiveDir)
+	}
+	for _, r := range w.Storage.RolesFor(AppWatcher) {
+		if r.Name == "incoming" && !r.WriteRequired {
+			t.Error("a removing watcher must be able to write incoming")
+		}
+	}
+	if got := w.Effective().Archive; got == nil || got.Action != "remove" {
+		t.Errorf("the effective configuration does not report the action: %+v", got)
+	}
+
+	t.Setenv("FN_ARCHIVE_ACTION", "")
+	w, err = LoadWatcher()
+	if err != nil {
+		t.Fatalf("LoadWatcher: %v", err)
+	}
+	if w.Archive.Action != ArchiveMove || w.Storage.ArchiveDir != "processed" {
+		t.Errorf("default: action %q dir %q, want a move into processed", w.Archive.Action, w.Storage.ArchiveDir)
+	}
+
+	t.Setenv("FN_ARCHIVE_ACTION", "delete")
+	if _, err := LoadWatcher(); err == nil || !strings.Contains(err.Error(), "FN_ARCHIVE_ACTION") {
+		t.Errorf("an unknown action was accepted: %v", err)
+	}
+}
