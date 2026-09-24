@@ -25,10 +25,11 @@ import (
 // writing it. Two contracts are supported, and neither is described as proof:
 //
 //   - "stability" accepts a submission whose size and modification time have
-//     held still for the configured interval. This is a heuristic. A slow or
-//     stalled upload can satisfy it, which is why the renamer verifies the
-//     content fingerprint again before publishing and refuses a source that
-//     changed in between.
+//     held still for the configured interval, measured by this process
+//     watching it -- not inferred from the modification time alone. This is a
+//     heuristic. A slow or stalled upload can satisfy it, which is why the
+//     renamer verifies the content fingerprint again before publishing and
+//     refuses a source that changed in between.
 //   - "rename" additionally requires that the producer wrote a temporary name
 //     and renamed the finished file into place. The rename is the completion
 //     signal; files still carrying a recognized temporary suffix are never
@@ -39,10 +40,12 @@ import (
 //
 // Eligibility is derived from the filesystem and the ledger, never from
 // in-process memory alone. A submission that arrived while the watcher was
-// down is therefore picked up by the next scan: the ledger has no row for its
-// identity, and its modification time is already older than the stability
-// interval. That is what makes reconciliation after an outage work without a
-// separate catch-up path.
+// down is therefore picked up after it restarts: the ledger has no row for its
+// identity, and once it has been watched holding still for the stability
+// interval it is registered like any other. That is what makes reconciliation
+// after an outage work without a separate catch-up path; it costs one stability
+// interval after a restart, which is the price of not trusting the
+// modification time alone.
 //
 // # Distinct submissions stay distinct
 //
@@ -55,20 +58,30 @@ type Discoverer struct {
 	cfg  config.WatcherConfig
 	log  *slog.Logger
 
-	// seen remembers the previous observation of a path, so a file whose size
-	// changed without its modification time advancing is still treated as in
-	// flight. It is an optimisation over the modification-time gate, never the
-	// only gate, because it is lost on restart.
-	seen map[string]storage.Entry
+	// seen remembers how each path last looked and since when it has looked
+	// exactly like that. It is lost on restart, which only delays a
+	// registration by one stability interval: a file is never registered on
+	// the strength of a modification time this process did not watch hold.
+	seen map[string]observation
+	// clock is time.Now outside tests.
+	clock func() time.Time
+}
+
+// observation is what discovery last saw of an entry, and when it first saw
+// the entry look exactly like that.
+type observation struct {
+	entry storage.Entry
+	since time.Time
 }
 
 // NewDiscoverer builds the discovery worker.
 func NewDiscoverer(base *app.Base, cfg config.WatcherConfig) *Discoverer {
 	return &Discoverer{
-		base: base,
-		cfg:  cfg,
-		log:  base.Log.With(slog.String("component", "discovery")),
-		seen: map[string]storage.Entry{},
+		base:  base,
+		cfg:   cfg,
+		log:   base.Log.With(slog.String("component", "discovery")),
+		seen:  map[string]observation{},
+		clock: time.Now,
 	}
 }
 
@@ -368,26 +381,39 @@ func birthTime(e storage.Entry) *time.Time {
 }
 
 // complete applies the configured completion contract.
+//
+// Two gates, and a submission must pass both.
+//
+// The modification time must be older than the stability interval. It needs no
+// memory of a previous scan, so it holds across a restart, and a producer still
+// writing to a local filesystem keeps advancing it.
+//
+// And this process must have watched the entry hold still -- size, modification
+// time and identity unchanged -- for the whole interval. The first gate alone is
+// not enough, and on a NAS it is not even close: measured against the DS1517
+// over SMB, a file written slowly under its final name showed a modification
+// time that stopped advancing after its first write while its size kept
+// growing, and it did not move again at close. Its modification time was
+// therefore "old" while it was still being written, and the only check left
+// was that two consecutive scans -- one scan interval apart, five seconds in
+// production -- saw the same size. A producer that paused for longer than that
+// had its partial file registered, fingerprinted and delivered.
 func (d *Discoverer) complete(e storage.Entry) bool {
 	interval := d.cfg.Discovery.StabilityInterval
+	now := d.clock()
 
-	// The primary gate is the modification time, which needs no memory of a
-	// previous scan and therefore survives a restart. A producer still writing
-	// keeps advancing it.
-	if interval > 0 && time.Since(e.ModTime) < interval {
-		d.seen[e.Path] = e
+	obs, ok := d.seen[e.Path]
+	if !ok || !storage.SameFile(obs.entry, e) {
+		obs = observation{entry: e, since: now}
+		d.seen[e.Path] = obs
+	}
+	if interval <= 0 {
+		return true
+	}
+	if now.Sub(e.ModTime) < interval {
 		return false
 	}
-
-	// The secondary gate covers the case the first one cannot see: a writer
-	// that changes size without advancing the modification time. It only
-	// applies when this process already observed the file.
-	if prev, ok := d.seen[e.Path]; ok && !storage.SameFile(prev, e) {
-		d.seen[e.Path] = e
-		return false
-	}
-	d.seen[e.Path] = e
-	return true
+	return now.Sub(obs.since) >= interval
 }
 
 // storageCategory maps a root-level failure to a closed-set category.

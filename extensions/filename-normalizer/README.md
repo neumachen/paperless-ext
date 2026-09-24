@@ -41,7 +41,8 @@ incoming/                 a producer writes a temporary name and renames it into
         │
         ▼
 watcher / discovery       selection patterns decide eligibility (never transform a name)
-        │                 completion contract: stability heuristic, or rename
+        │                 completion contract: stability heuristic (watched for
+        │                 the whole interval), or rename
         │                 fingerprint + source identity: root+name+inode, and the
         │                 birth time where the filesystem reports one (the device
         │                 otherwise; it changes on every SMB remount)
@@ -205,7 +206,7 @@ silently creating one would mask an incorrect mount.
 |---|---|---|
 | `FN_DISCOVERY_ENABLED` | `false` | Enables the discovery worker. Off unless a deployment declares it: a watcher that starts scanning a root nobody configured is a surprise, not a default. |
 | `FN_DISCOVERY_INTERVAL` | `10s` | Scan interval. |
-| `FN_DISCOVERY_STABILITY_INTERVAL` | `30s` | How long size and modification time must hold still. A heuristic, not proof. |
+| `FN_DISCOVERY_STABILITY_INTERVAL` | `30s` | How long a submission must hold still — size, modification time and identity unchanged, as watched by the watcher itself — and how old its modification time must be. A heuristic, not proof. The modification time alone is not trusted: over SMB it can stop advancing while a file is still being written. After a restart, a waiting file is registered one interval later. |
 | `FN_DISCOVERY_BATCH` | `100` | Registrations per scan. |
 | `FN_WATCHER_RECONCILE_ON_START` | `true` | Scan immediately at startup, so work that arrived during an outage is not delayed by a whole interval. |
 | `FN_CONFIG_FILE` | *(unset)* | The declarative configuration file. Selection patterns, transform rules and the completion contract live only there. |
