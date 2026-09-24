@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // These tests run against the real filesystem in a temporary directory. No
@@ -197,10 +198,42 @@ func TestProbeLeavesNoArtefacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The write check must clean up after itself, or it would be indexed by a
-	// later discovery pass as a document.
+	// Anything left behind would be indexed by a later discovery pass as a
+	// document.
 	if len(entries) != 0 {
 		t.Errorf("the probe left %d entries behind: %v", len(entries), entries)
+	}
+}
+
+// TestProbeDoesNotWriteIntoAWritableRoot guards the consumer's intake.
+//
+// Leaving nothing behind is not enough. The consume root is watched by
+// Paperless, whose consumer only runs its stability check after five seconds
+// with no event in that directory. A probe that created and removed a file
+// there on every readiness check kept it awake indefinitely, and nothing was
+// consumed while the renamers ran. Creating or removing an entry updates the
+// directory's modification time, so a root whose time was set to a fixed past
+// value must still carry it after the probe.
+func TestProbeDoesNotWriteIntoAWritableRoot(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "consume")
+	mustMkdir(t, dir, 0o770)
+	past := time.Date(2001, 2, 3, 4, 5, 6, 0, time.UTC)
+	if err := os.Chtimes(dir, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	report := Probe([]Root{{Role: "consume", Path: dir, WriteRequired: true}})
+	if got := statusByRole(report)["consume"]; !got.Available() {
+		t.Fatalf("a writable root reported %q", got)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(past) {
+		t.Errorf("the probe wrote into the root: its modification time moved from %v to %v",
+			past, info.ModTime())
 	}
 }
 

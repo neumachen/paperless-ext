@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Status is a closed-set probe result. It is used as a metric label value.
@@ -172,15 +174,19 @@ func probeOne(root Root) Result {
 	return res
 }
 
-// writable checks the permission actually granted to this process rather than
-// inspecting mode bits, which do not account for ownership or the mount.
+// writable asks the kernel whether this process may create entries in dir,
+// without creating one.
+//
+// It used to answer by doing it: create a temporary file and remove it. One of
+// the roots probed here is the consumer's intake, and the readiness check runs
+// every few seconds. Paperless's consumer ignores the dotfiles, but every
+// create and delete still wakes its watcher, and it only runs its stability
+// check after five quiet seconds -- so while the renamers were up, nothing in
+// the consume directory was ever consumed.
+//
+// access(2) checks this process's own identity against the ownership, the
+// permission bits and a read-only mount, which is what the temporary file was
+// establishing, and it changes nothing.
 func writable(dir string) bool {
-	f, err := os.CreateTemp(dir, ".fn-probe-*")
-	if err != nil {
-		return false
-	}
-	name := f.Name()
-	_ = f.Close()
-	_ = os.Remove(name)
-	return true
+	return unix.Access(dir, unix.W_OK|unix.X_OK) == nil
 }
